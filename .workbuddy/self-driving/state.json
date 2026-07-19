@@ -1,7 +1,8 @@
 {
   "cycle": 3,
   "max_cycles": 10,
-  "paused": false,
+  "paused": true,
+  "pause_reason": "remaining high-value tasks (extend tests, add Makefile/CI) require a Go toolchain not installed in this env; per loop rule, do not submit unvalidated code. Re-run on a machine with Go (or install it) to continue; loop will resume from cycle 4.",
   "log": [
     {
       "task_id": "add_readme",
