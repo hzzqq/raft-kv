@@ -121,7 +121,11 @@ func (n *Network) Send(endname int, method string, args interface{}, reply inter
 	oid := e.owner        // 发送方
 	srv, exists := n.servers[sid]
 	enabledDst := n.enabled[sid]
-	enabledSrc := n.enabled[oid]
+	// 未注册的 owner（例如客户端/Clerk 端点）视为可达；只有显式 Enable(oid,false) 才不可达。
+	enabledSrc := true
+	if v, ok := n.enabled[oid]; ok {
+		enabledSrc = v
+	}
 	n.mu.Unlock()
 
 	if !exists || !enabledDst || !enabledSrc {
