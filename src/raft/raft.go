@@ -561,6 +561,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 2) 追加新日志（处理冲突）
 	newIdx := args.PrevLogIndex
+	changed := false
 	for _, entry := range args.Entries {
 		newIdx++
 		if newIdx <= rf.lastIncludedIndex {
@@ -569,12 +570,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		pos := newIdx - rf.lastIncludedIndex - 1
 		if pos < len(rf.log) && rf.log[pos].Term != entry.Term {
 			rf.log = rf.log[:pos] // 截断冲突部分
+			changed = true
 		}
 		if pos >= len(rf.log) {
 			rf.log = append(rf.log, entry)
+			changed = true
 		}
 	}
-	rf.persist()
+	// 仅当日志真正发生变化时才持久化；心跳（无新条目）无需重写整个状态。
+	if changed {
+		rf.persist()
+	}
 
 	// 3) 推进 commitIndex
 	if args.LeaderCommit > rf.commitIndex {

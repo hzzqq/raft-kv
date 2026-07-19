@@ -40,7 +40,16 @@ func (s *Server) loop(handler func(method string, args, reply interface{})) {
 			handler(m.method, m.args, m.reply)
 			close(m.done)
 		case <-s.done:
-			return
+			// 关闭时要排空尚未处理的 RPC：否则若有 Send 正阻塞在 <-m.done，
+			// 旧循环直接 return 会让发送方永久挂起（节点重启竞态）。
+			for {
+				select {
+				case m := <-s.ch:
+					close(m.done)
+				default:
+					return
+				}
+			}
 		}
 	}
 }
@@ -119,9 +128,15 @@ func (n *Network) Send(endname int, method string, args interface{}, reply inter
 		return false
 	}
 	m := &RpcMsg{method: method, args: args, reply: reply, done: make(chan struct{})}
-	srv.ch <- m
-	<-m.done
-	return true
+	// 若投递过程中该 server 被重启/关停（done 关闭），直接放弃本次 RPC，
+	// 让上层按"不可达"重试，避免阻塞在 <-m.done 造成死锁。
+	select {
+	case srv.ch <- m:
+		<-m.done
+		return true
+	case <-srv.done:
+		return false
+	}
 }
 
 // Cleanup 关闭所有 server 的循环。

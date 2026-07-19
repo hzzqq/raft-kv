@@ -49,7 +49,13 @@ go test ./src/raft/... ./src/kvraft/...
 ### 测试覆盖（当前全绿，重复运行稳定）
 
 - `raft`：`TestInitialElection` / `TestReElection`（2A 选举）、`TestBasicAgree` / `TestFailAgree` / `TestFailNoAgree` / `TestConcurrentStarts`（2B 复制）、`TestPersist1`（2C 持久化）、`TestSnapshot`（2D 快照）。
-- `kvraft`：`TestKVBasic` / `TestKVConcurrency` / `TestKVFail`（故障转移）/ `TestKVPersist`（掉电重启重放）。
+- `kvraft`：`TestKVBasic` / `TestKVConcurrency` / `TestKVFail`（故障转移）/ `TestKVPersist`（掉电重启重放）/ `TestKVSnapshot`（快照压缩：超过 `maxraftstate` 阈值主动快照、重启后从快照恢复）/ `TestKVSnapshotStress`（并发写入 + 周期性分区/重启抖动下快照路径不丢数据且 raft 状态有界）。
+
+### 工程健壮性要点
+
+- **`restart()` 每次使用全新的 `applyCh`**：被 Kill 的旧 KV/Raft applier 仍阻塞在旧 channel 上（不关闭），若复用同一 channel，新 applier 会与之竞争 `ApplyMsg`，导致 `notify` 信号被已死 applier 吞掉、客户端永久挂起。
+- **`labrpc` 关闭 server 时排空在途 RPC**：`Server.loop` 在 `done` 关闭后排空 `ch` 并关闭每条 pending 的 `m.done`；`Send` 通过 `select` 在 server 被关停时直接返回 `false`（按"不可达"重试），消除节点重启竞态导致的死锁。
+- **`AppendEntries` 仅在日志真正变化时才持久化**：心跳（无新条目）不再重写整个状态，避免每 110ms 一次的全量 gob 序列化。
 
 ## 说明
 
