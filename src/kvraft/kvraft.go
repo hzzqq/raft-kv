@@ -3,6 +3,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"encoding/gob"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,13 @@ type OpResult struct {
 type applyResult struct {
 	op     Op
 	result OpResult
+}
+
+// KVPersistState 是压缩进快照的状态机内容（不含 interface{}，gob 可直接编解码）。
+type KVPersistState struct {
+	Data       map[string]string
+	LastSeq    map[int64]int64
+	LastResult map[int64]string
 }
 
 type KVServer struct {
@@ -97,6 +105,11 @@ func (kv *KVServer) applier() {
 		if !ok {
 			return
 		}
+		if msg.SnapshotValid {
+			// 落后 follower 或重启节点通过快照追平状态机。
+			kv.installSnapshot(msg.Snapshot)
+			continue
+		}
 		if !msg.CommandValid {
 			continue
 		}
@@ -125,11 +138,47 @@ func (kv *KVServer) applier() {
 		idx := msg.CommandIndex
 		ch := kv.notify[idx]
 		delete(kv.notify, idx)
+		// maxraftstate > 0 且 Raft 状态超过阈值时主动压缩快照（Lab 2D ↔ KV 集成）。
+		if kv.maxraftstate > 0 && kv.rf.RaftStateSize() > kv.maxraftstate {
+			if snap := kv.encodeSnapshot(); snap != nil {
+				kv.rf.Snapshot(idx, snap)
+			}
+		}
 		kv.mu.Unlock()
 		if ch != nil {
 			ch <- applyResult{op: op, result: res}
 		}
 	}
+}
+
+// encodeSnapshot 把当前 KV 状态机（data/lastSeq/lastResult）压缩成字节，供 Raft 持久化。
+func (kv *KVServer) encodeSnapshot() []byte {
+	st := KVPersistState{
+		Data:       kv.data,
+		LastSeq:    kv.lastSeq,
+		LastResult: kv.lastResult,
+	}
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(st); err != nil {
+		return nil
+	}
+	return buf.Bytes()
+}
+
+// installSnapshot 从 Raft 快照恢复 KV 状态机（重启或落后 follower 追平时调用）。
+func (kv *KVServer) installSnapshot(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	var st KVPersistState
+	if err := gob.NewDecoder(bytes.NewBuffer(data)).Decode(&st); err != nil {
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.data = st.Data
+	kv.lastSeq = st.LastSeq
+	kv.lastResult = st.LastResult
 }
 
 // waitApplied 等待本服务器把 op 提交到状态机并返回结果。

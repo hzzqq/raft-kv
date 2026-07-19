@@ -219,6 +219,14 @@ func (rf *Raft) LastApplied() int {
 	return rf.lastApplied
 }
 
+// RaftStateSize 返回当前持久化 Raft 状态（日志等）的字节大小，
+// 供 KV 层判断何时需要快照压缩（Lab 2D ↔ KV 集成）。
+func (rf *Raft) RaftStateSize() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return len(rf.persister.ReadRaftState())
+}
+
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	rf.mu.Lock()

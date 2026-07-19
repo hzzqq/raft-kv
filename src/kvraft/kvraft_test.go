@@ -3,6 +3,7 @@ package kvraft
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,22 +12,27 @@ import (
 )
 
 type kvConfig struct {
-	mu         sync.Mutex
-	net        *raft.Network
-	kvs        []*KVServer
-	clerks     []*Clerk
-	rafts      [][]*raft.ClientEnd
-	kvEnds     []*raft.ClientEnd
-	persisters []*raft.Persister
-	applyCh    []chan raft.ApplyMsg
-	connected  []bool
-	n          int
-	t          *testing.T
+	mu           sync.Mutex
+	net          *raft.Network
+	kvs          []*KVServer
+	clerks       []*Clerk
+	rafts        [][]*raft.ClientEnd
+	kvEnds       []*raft.ClientEnd
+	persisters   []*raft.Persister
+	applyCh      []chan raft.ApplyMsg
+	connected    []bool
+	n            int
+	t            *testing.T
+	maxraftstate int
 }
 
-func makeKVConfig(t *testing.T, n int) *kvConfig {
+func makeKVConfig(t *testing.T, n int, maxraftstate ...int) *kvConfig {
+	mrs := 0
+	if len(maxraftstate) > 0 {
+		mrs = maxraftstate[0]
+	}
 	net := raft.MakeNetwork()
-	ck := &kvConfig{net: net, n: n, t: t}
+	ck := &kvConfig{net: net, n: n, t: t, maxraftstate: mrs}
 	ck.kvs = make([]*KVServer, n)
 	ck.clerks = make([]*Clerk, n)
 	ck.rafts = make([][]*raft.ClientEnd, n)
@@ -52,7 +58,7 @@ func makeKVConfig(t *testing.T, n int) *kvConfig {
 		ck.applyCh[i] = make(chan raft.ApplyMsg, 4000)
 		ck.persisters[i] = raft.MakeEmptyPersister()
 		rf := raft.Make(ck.rafts[i], i, ck.persisters[i], ck.applyCh[i])
-		kv := MakeKVServer(i, rf, ck.applyCh[i], 0)
+		kv := MakeKVServer(i, rf, ck.applyCh[i], mrs)
 		ck.kvs[i] = kv
 		ck.clerks[i] = MakeClerk(ck.kvEnds)
 
@@ -126,7 +132,7 @@ func (ck *kvConfig) restart(i int) {
 	ck.kvs[i].rf.Kill()
 	time.Sleep(60 * time.Millisecond)
 	rf := raft.Make(ck.rafts[i], i, ck.persisters[i], ck.applyCh[i])
-	kv := MakeKVServer(i, rf, ck.applyCh[i], 0)
+	kv := MakeKVServer(i, rf, ck.applyCh[i], ck.maxraftstate)
 	ck.kvs[i] = kv
 
 	rrf := rf
@@ -243,5 +249,42 @@ func TestKVPersist(t *testing.T) {
 	// 重启后第一次 Get 会以新任期提交，隐式把旧 put/append 一起提交并重放
 	if v := ck.clerks[0].Get("k"); v != "vz" {
 		t.Fatalf("after restart got %q want vz", v)
+	}
+}
+
+// 快照压缩：超过 maxraftstate 阈值后状态机主动快照，raft 状态大小保持有界；
+// 重启后从快照恢复，数据不丢且仍能继续写入（Lab 2D ↔ KV 集成）。
+func TestKVSnapshot(t *testing.T) {
+	const mrs = 1000
+	ck := makeKVConfig(t, 3, mrs)
+	defer ck.cleanup()
+
+	ck.clerks[0].Put("k", "")
+	n := 200
+	for i := 0; i < n; i++ {
+		ck.clerks[0].Append("k", "abcdefghij") // 每条 10 字节，使日志远超阈值
+	}
+	want := strings.Repeat("abcdefghij", n)
+	if v := ck.clerks[0].Get("k"); v != want {
+		t.Fatalf("after appends len=%d want %d", len(v), len(want))
+	}
+	// 快照后 raft 状态大小应有界，远小于不快照时的无限增长
+	for i := 0; i < ck.n; i++ {
+		sz := ck.kvs[i].rf.RaftStateSize()
+		if sz > mrs*4 {
+			t.Fatalf("server %d raft state size %d > bound %d (snapshot missing?)", i, sz, mrs*4)
+		}
+	}
+	// 全部重启后从快照恢复，数据不丢
+	for i := 0; i < ck.n; i++ {
+		ck.restart(i)
+	}
+	if v := ck.clerks[0].Get("k"); v != want {
+		t.Fatalf("after restart len=%d want %d", len(v), len(want))
+	}
+	// 重启后仍能继续写入（快照恢复的状态机可继续演进）
+	ck.clerks[0].Append("k", "END")
+	if v := ck.clerks[0].Get("k"); v != want+"END" {
+		t.Fatalf("after restart+append len=%d want %d", len(v), len(want)+3)
 	}
 }
