@@ -3,12 +3,19 @@
 package kvraft
 
 import (
+	"encoding/gob"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"raftkv/src/raft"
 )
+
+// Op 需要向 gob 注册：Raft 把日志以 interface{} 形式持久化，
+// 反序列化时必须知道具体类型，否则重启后日志变空（命令丢失）。
+func init() {
+	gob.Register(Op{})
+}
 
 // Op 是提交到 Raft 状态机的操作。ClientId+Seq 用于幂等去重。
 type Op struct {
@@ -93,7 +100,11 @@ func (kv *KVServer) applier() {
 		if !msg.CommandValid {
 			continue
 		}
-		op := msg.Command.(Op)
+		op, ok := msg.Command.(Op)
+		if !ok {
+			// no-op（leader 任期开始追加的空命令）：不更新状态机，直接跳过。
+			continue
+		}
 		kv.mu.Lock()
 		var res OpResult
 		if lastSeq, exists := kv.lastSeq[op.ClientId]; !exists || op.Seq > lastSeq {
@@ -202,6 +213,8 @@ func MakeKVServer(me int, rf *raft.Raft, applyCh chan raft.ApplyMsg, maxraftstat
 
 // ============================== 客户端 Clerk ==============================
 
+var clientSeq int64 // 全局原子计数器，保证每个 Clerk 的 clientId 全局唯一
+
 type Clerk struct {
 	servers   []*raft.ClientEnd
 	clientId  int64
@@ -212,7 +225,7 @@ type Clerk struct {
 func MakeClerk(servers []*raft.ClientEnd) *Clerk {
 	return &Clerk{
 		servers:  servers,
-		clientId: nrand(),
+		clientId: atomic.AddInt64(&clientSeq, 1),
 		seq:     0,
 	}
 }

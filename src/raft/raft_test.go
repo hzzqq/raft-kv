@@ -302,7 +302,7 @@ func TestFailAgree(t *testing.T) {
 	cfg.one(104, 3)
 }
 
-// Lab 2B：只剩 2/5 节点时无法形成多数，命令不应提交；恢复后提交。
+// Lab 2B：只剩 2/5 节点时无法形成多数，命令不应提交；恢复后集群能重新达成共识。
 func TestFailNoAgree(t *testing.T) {
 	cfg := makeConfig(t, 5)
 	defer cfg.cleanup()
@@ -322,13 +322,15 @@ func TestFailNoAgree(t *testing.T) {
 	if cfg.rafts[l].LastApplied() >= idx {
 		t.Fatalf("command %d committed with only 2/5 servers (no majority)", idx)
 	}
-	// 恢复全部节点，命令应当最终提交
+	// 恢复全部节点。注意：分区期间未形成多数的 102 只是"未提交"条目，
+	// Raft 只保证"已提交"条目在 leader 切换后不丢，所以 102 可能丢失是合法的。
+	// 正确做法是验证集群重新具备共识能力——提交一条新命令并扩散到全部 5 节点。
 	for i := 0; i < cfg.n; i++ {
 		if i != l {
 			cfg.connect(i)
 		}
 	}
-	cfg.wait(idx, 5, 102)
+	cfg.one(103, 5)
 }
 
 // Lab 2B：并发提交多条命令，顺序与内容一致。
@@ -352,14 +354,15 @@ func TestPersist1(t *testing.T) {
 	cfg.one(101, 3)
 	l := cfg.leader()
 	cfg.disconnect(l)
-	cfg.one(102, 2)
+	idx102 := cfg.one(102, 2) // 记录 102 的实际索引（no-op 会占用索引，不能写死）
 	// 全部掉电重启（同一份 persister 恢复）
 	for i := 0; i < cfg.n; i++ {
 		cfg.restart(i)
 	}
-	// 重启后 102 仍在（持久化生效）
-	cfg.wait(2, 3, 102)
+	// 重启后发一条新任期命令，会"隐式重提交"旧日志（含 102）
 	cfg.one(103, 3)
+	// 此时 102 已被重放并应用到全部 3 节点
+	cfg.wait(idx102, 3, 102)
 }
 
 // Lab 2D：日志压缩——定期快照后，落后节点能通过 InstallSnapshot 追平。
@@ -382,10 +385,11 @@ func TestSnapshot(t *testing.T) {
 	l := cfg.leader()
 	f := (l + 1) % cfg.n
 	cfg.disconnect(f)
+	var idxLast int
 	for i := 0; i < 10; i++ {
-		cfg.one(300+i, 2)
+		idxLast = cfg.one(300+i, 2)
 	}
 	cfg.connect(f)
 	// f 落后且已有快照，重连后应通过快照+增量追平到最终状态
-	cfg.wait(total+10, 3, 300+9)
+	cfg.wait(idxLast, 3, 300+9)
 }

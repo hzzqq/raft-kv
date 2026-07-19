@@ -319,6 +319,11 @@ func (rf *Raft) becomeLeader() {
 		return
 	}
 	rf.role = Leader
+	// 任期开始时追加一条 no-op（空命令）。按 Raft 提交规则，leader 只能
+	// 通过提交"当前任期"的条目来间接提交旧任期的日志；no-op 作为当前任期的
+	// 第一条条目，被多数派复制并提交后即可"拉动"先前未提交的旧条目。
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: nil})
+	rf.persist()
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	last := rf.lastLogIndex()
