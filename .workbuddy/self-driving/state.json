@@ -1,5 +1,5 @@
 {
-  "cycle": 1,
+  "cycle": 2,
   "max_cycles": 10,
   "paused": false,
   "log": [
@@ -10,9 +10,16 @@
       "note": "no go toolchain installed in this env, compile/test validation skipped",
       "score": 70,
       "time": "2026-07-19T21:15"
+    },
+    {
+      "task_id": "add_gitignore",
+      "files": [".gitignore"],
+      "validation": "file present; covers Go binaries/test artifacts/vendor/editor files",
+      "score": 55,
+      "time": "2026-07-19T21:17"
     }
   ],
-  "last_task_id": "add_readme",
+  "last_task_id": "add_gitignore",
   "repeat_count": 0,
-  "last_score": 70
+  "last_score": 55
 }
