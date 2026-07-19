@@ -1,0 +1,19 @@
+# 跨平台换行一致性
+# Go 工程在 Windows 上若开启 core.autocrlf，可能把 *.go 写成 CRLF，
+# 导致 gofmt / 远端 CI（ubuntu）报格式错误。统一锁定为 LF。
+* text=auto eol=lf
+
+*.go    text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+go.mod  text eol=lf
+go.sum  text eol=lf
+
+# 二进制文件不参与文本归一化
+*.exe   binary
+*.dll   binary
+*.so    binary
+*.png   binary
+*.jpg   binary
