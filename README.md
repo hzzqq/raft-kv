@@ -67,13 +67,30 @@ raft-kv/
 
 ## 构建与测试
 
-> 需要本地安装 Go 1.22+。本仓库未随附 Go 工具链。Windows 下 `GOCACHE`/`GOPATH` 必须用原生盘符绝对路径（如 `C:/Users/xxx/gocache`），否则报 "GOCACHE is not an absolute path"。
+> 需要本地安装 Go 1.22+。本仓库**未随附 Go 工具链**；本机可用的托管 Go 在
+> `C:/Users/Administrator/.workbuddy/binaries/go/go/bin/go.exe`。Windows 下
+> `GOCACHE`/`GOPATH` 必须用原生盘符绝对路径（如 `C:/Users/xxx/gocache`），否则报
+> "GOCACHE is not an absolute path"。
+
+**零配置跑测（推荐）**：仓库提供 `run-tests.sh`，已把托管 Go + 绝对路径 `GOCACHE`/`GOPATH`
+写死，Git Bash / WSL / Linux 下直接：
 
 ```bash
-# 进入模块根目录（含 go.mod 的 raft-kv/）
-go vet ./...
-go test ./src/raft/... ./src/kvraft/... ./src/shardmaster/... ./src/shardkv/...
-go test -race ./src/kvraft/...   # 竞态检测（可选，耗时更长）
+./run-tests.sh                 # 跑全部包
+./run-tests.sh shardkv         # 只跑 src/shardkv
+./run-tests.sh shardkv -run TestSKVConcurrent   # 带额外参数（如只跑某个用例）
+```
+
+手动等价命令（供参考，需自行设置绝对路径 GOPATH/GOCACHE）：
+
+```bash
+export GO="C:/Users/Administrator/.workbuddy/binaries/go/go/bin/go.exe"
+export GOCACHE="C:/Users/Administrator/.cache/go-raftkv"
+export GOPATH="C:/Users/Administrator/.cache/gopath-raftkv"
+export GO111MODULE=on
+"$GO" vet ./...
+"$GO" test ./src/raft/... ./src/kvraft/... ./src/shardmaster/... ./src/shardkv/...
+"$GO" test -race ./src/kvraft/...   # 竞态检测（可选，耗时更长；需 gcc）
 ```
 
 ### 测试覆盖（Labs 2–3 全绿，重复运行稳定）
@@ -83,7 +100,7 @@ go test -race ./src/kvraft/...   # 竞态检测（可选，耗时更长）
 - `shardkv`（Lab 4 数据面，设计细节见 `docs/lab4-shardkv-design.md`）：
   - `TestSKVBasic` 单组读写；`TestSKVMove` 单分片跨组迁移后可读；`TestSKVJoinLeave` 两组 Join/Leave 后数据不丢；`TestSKVGC` 旧 owner 回收、新 owner 持有（GC-after-ack）。
   - `TestSKVConcurrent` 多客户端并发写 + 后台 churn，线性一致；`TestSKVSnapshotChurn` 开启 `maxraftstate` 下并发 + churn（命中 `installSnapshot` 路径）；`TestSKVReMigration` 单分片 A→B→A 快速漂移（配置不冻结、迁移窗口内写不丢）；`TestSKVConfigProgress` 多轮 Move 下配置持续推进 + 数据完整。
-  - **已知风险**：3 个及以上 group 的「整体再平衡」式 churn 在极端压力下存在分片不可读的脆弱性，详见设计文档 §7；当前测试均走安全的「单分片 Move」路径。
+  - **已知风险**：3 个及以上 group 的「整体再平衡」式 churn 在极端压力下存在分片不可读的脆弱性（根因：异步迁移 + 配置变更快于单跳迁移，导致 fetch 侧无限重试 / orphan incoming 滞留），详见设计文档 §7；当前测试均走安全的「单分片 Move」路径。已落地 `reconcile` 周期兜底**部分缓解** orphan incoming 路径，但 fetch 侧卡死仍需 redesign，列为最高优先级专项修复。
 
 ### 工程健壮性要点
 - **`restart()` 每次使用全新的 `applyCh`**：被 Kill 的旧 KV/Raft applier 仍阻塞在旧 channel 上（不关闭），若复用同一 channel，新 applier 会与之竞争 `ApplyMsg`，导致 `notify` 信号被已死 applier 吞掉、客户端永久挂起。

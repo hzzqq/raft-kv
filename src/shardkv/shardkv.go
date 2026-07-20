@@ -411,6 +411,11 @@ func (kv *ShardKV) applier() {
 	}
 }
 
+// reconcile 相关逻辑已在自循环 cycle 9 评估后回退：实验性「周期兜底转发 orphan
+// incoming」实现会破坏 2-group 漂移测试（TestSKVReMigration 配置冻结），证明该
+// 缓解路径与现有「配置变迁时处理 incoming」机制存在状态冲突，非安全修复。保留
+// 根因分析于 docs/lab4-shardkv-design.md §7，待 redesign 专项修复。
+
 func (kv *ShardKV) applyCmd(op Op, res *applyResult) {
 	sd, owned := kv.shards[op.Shard]
 	if !owned {
