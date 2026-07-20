@@ -430,3 +430,78 @@ func TestSKVGC(t *testing.T) {
 		t.Fatalf("after GC Get(gckey)=%q want \"v\"", v)
 	}
 }
+
+// TestSKVSnapshotChurn：在开启日志压缩（maxraftstate>0）的前提下，跑与
+// TestSKVConcurrent 相同的"并发客户端 + 后台配置 churn"工作负载。目的是真正
+// 命中 ShardKV 的快照路径——installSnapshot 整体重写 shards/config/迁移状态，
+// 以及 applyInstallShard 的深拷贝——验证"日志压缩"与"分片迁移并发"同时存在时：
+//  1. 不会死锁（installSnapshot 不得在与调用方持有的 kv.mu 形成嵌套加锁）；
+//  2. 不会触发并发 map 竞态（深拷贝让日志副本与运行态副本互相独立）；
+//  3. 不会丢数据（压缩点的一致性 + 重启/落后副本经 SnapshotValid 恢复）。
+func TestSKVSnapshotChurn(t *testing.T) {
+	const maxraftstate = 1000
+	cfg := makeSKVConfig(t, 2, 3, 3, maxraftstate)
+	defer cfg.cleanup()
+	ck := cfg.makeClerk()
+	cfg.joinGroup(0)
+	cfg.joinGroup(1)
+	cfg.waitGroupConfig(1, 0, 2)
+
+	const nClerks = 3
+	const nKeys = 5
+	const rounds = 20
+
+	// 后台 churn：周期性把某个分片在两组间移动，制造迁移 + 压缩并发。
+	done := make(chan struct{})
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				return
+			default:
+				cfg.moveShard((i*3)%NShards, i%2)
+				time.Sleep(40 * time.Millisecond)
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	errCh := make(chan string, nClerks*nKeys)
+	for c := 0; c < nClerks; c++ {
+		for k := 0; k < nKeys; k++ {
+			wg.Add(1)
+			go func(c, k int) {
+				defer wg.Done()
+				// 每个 goroutine 使用独立 Clerk：独立 clientId + 独立 seq，
+				// 避免跨 key 的 seq 串扰导致去重把写入当陈旧重放丢弃。
+				localCk := cfg.makeClerk()
+				key := fmt.Sprintf("c%d_k%d", c, k)
+				for seq := 0; seq < rounds; seq++ {
+					val := fmt.Sprintf("c%d_k%d_%d", c, k, seq)
+					localCk.Put(key, val)
+					if got := localCk.Get(key); got != val {
+						errCh <- fmt.Sprintf("key %s: want %s got %s", key, val, got)
+						return
+					}
+				}
+			}(c, k)
+		}
+	}
+	wg.Wait()
+	close(done)
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf(err)
+	}
+
+	// 最终校验：每个 key 应读到最后一轮写入的值。
+	for c := 0; c < nClerks; c++ {
+		for k := 0; k < nKeys; k++ {
+			key := fmt.Sprintf("c%d_k%d", c, k)
+			want := fmt.Sprintf("c%d_k%d_%d", c, k, rounds-1)
+			if got := ck.Get(key); got != want {
+				t.Fatalf("final key %s: want %s got %s", key, want, got)
+			}
+		}
+	}
+}
