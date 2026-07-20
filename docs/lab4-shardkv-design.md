@@ -88,3 +88,59 @@ KV 状态（各分片 `ShardData` + 当前/上一版 `Config` + 迁移中的 `in
 - [ ] `go test -race ./src/shardkv/...`（竞态检测，耗时更长）
 
 CI 工作流 `.github/workflows/ci.yml` 已覆盖 `vet` + `test` + `race`，推送后自动执行。
+
+## 5. 单元测试清单（src/shardkv/shardkv_test.go）
+
+| 测试 | 覆盖点 | 守护的回归 |
+|------|--------|-----------|
+| `TestSKVBasic` | 单组基本 Get/Put/Append | 基础读写链路 |
+| `TestSKVMove` | 单分片跨组迁移后数据可读 | 迁移 + 客户端重定向 |
+| `TestSKVJoinLeave` | 两组 Join/Leave 后数据不丢 | 迁出/迁入 + GC |
+| `TestSKVConcurrent` | 多客户端并发写 + 后台 churn，线性一致 | 迁移 + 并发 + 客户端幂等 |
+| `TestSKVGC` | 旧 owner 回收分片、新 owner 持有 | GC-after-ack 协议 |
+| `TestSKVSnapshotChurn` | 开启 `maxraftstate` 下并发 + churn | `installSnapshot` 路径、深拷贝防并发 map、无嵌套死锁 |
+| `TestSKVReMigration` | 单分片 A→B→A 快速漂移，配置不冻结 | `pendingIn/pendingOut` 残留导致的配置冻结、迁移窗口内写不丢 |
+| `TestSKVConfigProgress` | 反复 Join/Leave 某 group，配置持续推进 | 渐进式配置冻结看门狗 |
+
+> 注：本机（交互 shell）无 gcc，无法跑 `go test -race`；`TestSKVSnapshotChurn` 等以
+> 「高频 churn + 多轮循环」替代 race detector 暴露并发/冻结类回归。GitHub CI 有 gcc，会
+> 在 `-race` 下跑 `shardkv` 基础测试（见第 6 节）。
+
+## 6. 并发安全要点（踩过的坑与修复）
+
+1. **`InstallShard` 深拷贝（防并发 map 读写）**：`op.MigrateData` 的指针同时被存入本组
+   Raft 日志；`rf.Start` 立即 `rf.persist()`，而 `persist` 对整条日志做 gob 编码时会并发读取
+   该 `ShardData` 的 map。若把同一指针直接放入 `kv.shards`，则本组 applier 对该分片的客户端写
+   （改写同 map）会与 persist 的 gob 编码竞态 → `concurrent map read and map write`。
+   修复：`applyInstallShard` 一律 `op.MigrateData.copy()` 后再写入，日志副本与运行态副本独立。
+   **守护测试：`TestSKVSnapshotChurn` / `TestSKVConcurrent`（高频 churn 必现）。**
+
+2. **`installSnapshot` 不得嵌套加锁（防死锁）**：`applier` 处理 `SnapshotValid` 时已持有
+   `kv.mu`，故 `installSnapshot` 内部**不再** `Lock`；否则 `maxraftstate>0` 真正触发快照恢复时
+   `sync.Mutex` 不可重入 → 死锁。调用方（`applier` 的 `SnapshotValid` 分支）负责保证互斥。
+   **守护测试：`TestSKVSnapshotChurn`（开启压缩）。**
+
+3. **`Clerk.config` 必须在锁内读取（防 data race）**：`Clerk.refresh()` 在 `ck.mu` 下写
+   `ck.config`，`Get`/`PutAppend` 原先在锁外读 `cfg := ck.config`（含 `Groups` map），形成
+   struct/map 并发读写竞态，`-race` 下必报。修复：在 `ck.mu` 内捕获配置快照后再用。
+   **守护：CI 的 `-race` 基础测试。**
+
+4. **`Kill` 后 applier goroutine 泄漏**：`raft.Kill()` 不会关闭 `applyCh`（否则向其发送会
+   panic），于是 `ShardKV`/`ShardMaster` 的 applier 阻塞在 `<-applyCh` 上，cleanup 后永久泄漏，
+   测试创建大量实例时累积拖慢 CI。修复：各自新增 `killCh`，`Kill()` 中关闭（防重复关闭），
+   applier 用 `select { case <-applyCh: ...; case <-killCh: return }` 及时退出。
+
+## 7. 已知风险（待专项修复）
+
+- **3+ group 整体再平衡（rebalance）式 churn 下的分片不可读**：在 3 个及以上 group
+  反复 `Join`/`Leave`（触发对所有 10 个分片的整体轮转再平衡）的极端压力下，偶发某个
+  分片卡在 `pendingIn`/`pendingOut` 未能清除，导致该分片在其归属 group 的 `shards`
+  中始终未被装载，客户端对该分片的读永远得到 `ErrWrongGroup` 而陷入重试死循环
+  （`TestSKVConfigProgress` 早期的 3-group 版本曾稳定复现此挂起：所有 group 配置号均
+  正常推进、无 `kv.mu` 死锁，但最终读卡死）。**单分片 `Move` 式 churn（本仓库所有通过
+  的测试所用路径）不触发此问题**；2-group 的 `Join/Leave` 亦稳定。
+  根因疑似高并发下 `sendShard`/`fetchShard` 与 `applyNewConfig` 对某分片的迁出/迁入状态
+  判定存在边界竞态，需专项排查（建议加「分片状态看门狗」日志 + 复现后 dump 各 group 的
+  `DebugState()`）。当前以「测试避开该路径」守住 CI 绿条，列为后续最高优先级修复项。
+
+
