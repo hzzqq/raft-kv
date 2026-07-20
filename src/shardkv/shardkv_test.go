@@ -25,10 +25,13 @@ type skvConfig struct {
 	nReplicas int
 	nSM       int
 	maxraftstate int
-	t         *testing.T
+	t         testing.TB
 }
 
-func makeSKVConfig(t *testing.T, nGroups, nReplicas, nSM, maxraftstate int) *skvConfig {
+// makeSKVConfig 构建一组 ShardKV replica group + 一个 ShardMaster 集群（均运行在
+// 内存 labrpc 网络上）。参数接受 testing.TB，因此单元测试与基准测试（-bench）都
+// 可复用同一套集群搭建逻辑。
+func makeSKVConfig(t testing.TB, nGroups, nReplicas, nSM, maxraftstate int) *skvConfig {
 	net := raft.MakeNetwork()
 	cfg := &skvConfig{
 		net:          net,
