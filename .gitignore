@@ -26,3 +26,9 @@ go.work.sum
 
 # WorkBuddy agent internal state (not part of the project)
 .workbuddy/
+
+# Local debug / scratch artifacts (never commit)
+tmp_*
+tmp_*.log
+tmp_*.txt
+tmp_*.sh
