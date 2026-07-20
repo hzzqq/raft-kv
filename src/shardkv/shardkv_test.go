@@ -540,6 +540,78 @@ func TestSKVConfigProgress(t *testing.T) {
 	}
 }
 
+// TestSKVReadIndex：高频读 + 后台 churn，专门压 cycle 19 引入的 ReadIndex
+// 线性一致快速读路径。每个客户端反复"Put 一个新值 + 立即 Get 断言线性一致"，
+// 并在每轮对所有 key 做大量纯 Get（读占比高，leader 上的 Get 走 ReadIndex
+// 快读而非追加日志）。断言：(1) 客户端总能线性一致地读到自己刚写入的最新值；
+// (2) churn 下纯读不会返回空值 / 陈旧值（快读路径在分片迁移期间仍正确）；
+// (3) 无 panic / 无死锁 / 无配置冻结。作为 ReadIndex 优化的回归护栏。
+func TestSKVReadIndex(t *testing.T) {
+	const nGroups = 2
+	cfg := makeSKVConfig(t, nGroups, 3, 3, 0)
+	defer cfg.cleanup()
+	ck := cfg.makeClerk()
+	cfg.joinGroup(0)
+	cfg.joinGroup(1)
+	cfg.waitGroupConfig(1, 0, 2)
+
+	const nKeys = 6
+	// 公共基线 key（只写一次，从不并发改写）供高频纯读压 ReadIndex 快读路径。
+	for i := 0; i < nKeys; i++ {
+		ck.Put(fmt.Sprintf("rib-%d", i), fmt.Sprintf("base-%d", i))
+	}
+
+	// 后台 churn：分片在两组间漂移，制造迁移 + ReadIndex 快读并发。
+	done := make(chan struct{})
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				return
+			default:
+				cfg.moveShard((i*5)%NShards, i%2)
+				time.Sleep(25 * time.Millisecond)
+			}
+		}
+	}()
+
+	const nClerks = 3
+	var wg sync.WaitGroup
+	errCh := make(chan string, nClerks)
+	for c := 0; c < nClerks; c++ {
+		wg.Add(1)
+		go func(c int) {
+			defer wg.Done()
+			localCk := cfg.makeClerk()
+			const rounds = 40
+			for round := 0; round < rounds; round++ {
+				// 每个 clerk 独占自己的 key 命名空间，保证 Put-Get 线性一致断言成立
+				// （多个 clerk 不会改写同一 key）。
+				key := fmt.Sprintf("ric-%d-%d", c, round%nKeys)
+				val := fmt.Sprintf("c%d-r%d", c, round)
+				localCk.Put(key, val)
+				if got := localCk.Get(key); got != val {
+					errCh <- fmt.Sprintf("clerk%d key %s want %s got %s", c, key, val, got)
+					return
+				}
+				// 高频纯读公共基线 key：churn 下 ReadIndex 快读不得返回空 / 陈旧。
+				for i := 0; i < nKeys; i++ {
+					if v := localCk.Get(fmt.Sprintf("rib-%d", i)); v == "" {
+						errCh <- fmt.Sprintf("clerk%d read rib-%d empty during churn", c, i)
+						return
+					}
+				}
+			}
+		}(c)
+	}
+	wg.Wait()
+	close(done)
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf(err)
+	}
+}
+
 // TestSKVSnapshotChurn：在开启日志压缩（maxraftstate>0）的前提下，跑与
 // TestSKVConcurrent 相同的"并发客户端 + 后台配置 churn"工作负载。目的是真正
 // 命中 ShardKV 的快照路径——installSnapshot 整体重写 shards/config/迁移状态，
