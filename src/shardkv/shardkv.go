@@ -733,7 +733,14 @@ func (ck *Clerk) Get(key string) string {
 	shard := key2shard(key)
 	for {
 		ck.refresh()
+		// 在锁内捕获配置快照：refresh() 在 ck.mu 下写入 ck.config，若不持锁读取，
+		// 会与另一 goroutine 的 refresh() 形成 struct/map 的并发读写竞态
+		// （Config 内含 Groups map，本机无 -race 时不崩，但 GitHub CI 的 -race
+		// 会报 data race）。捕获的是提交时刻的不可变快照（底层 map 不会被原地改写），
+		// 故下面的 cfg.Groups/cfg.Shards 读取是安全的。
+		ck.mu.Lock()
 		cfg := ck.config
+		ck.mu.Unlock()
 		if cfg.Num == 0 {
 			continue
 		}
@@ -771,7 +778,14 @@ func (ck *Clerk) PutAppend(key, value, opType string) {
 	shard := key2shard(key)
 	for {
 		ck.refresh()
+		// 在锁内捕获配置快照：refresh() 在 ck.mu 下写入 ck.config，若不持锁读取，
+		// 会与另一 goroutine 的 refresh() 形成 struct/map 的并发读写竞态
+		// （Config 内含 Groups map，本机无 -race 时不崩，但 GitHub CI 的 -race
+		// 会报 data race）。捕获的是提交时刻的不可变快照（底层 map 不会被原地改写），
+		// 故下面的 cfg.Groups/cfg.Shards 读取是安全的。
+		ck.mu.Lock()
 		cfg := ck.config
+		ck.mu.Unlock()
 		if cfg.Num == 0 {
 			continue
 		}
