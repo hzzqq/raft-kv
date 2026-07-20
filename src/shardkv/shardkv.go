@@ -160,6 +160,7 @@ type ShardKV struct {
 	pendingIn  map[int]bool       // 需要接收（失->我）且尚未收到
 	pendingOut map[int]bool       // 需要迁出（我->失）且尚未 GC
 	fetchEpoch map[int]int64      // 每个分片当前拉取任务的版本号：配置推进时自增，使为同一分片服务的旧 fetcher 协程及时退出
+	pendingSince time.Time       // 卡死看门狗：hasPending 首次为 true 的时间戳（零值=当前无未决迁移）
 
 	notified map[int64]chan applyResult
 	notifyId int64
@@ -231,6 +232,21 @@ func (kv *ShardKV) pollConfig() {
 		kv.mu.Lock()
 		cur := kv.config.Num
 		hasPending := len(kv.pendingIn) > 0 || len(kv.pendingOut) > 0
+		now := time.Now()
+		if !hasPending {
+			// 无未决迁移：重置看门狗计时，并允许推进到下一配置。
+			kv.pendingSince = time.Time{}
+		} else if kv.pendingSince.IsZero() {
+			// 刚进入未决状态：记录起点。
+			kv.pendingSince = now
+		} else if now.Sub(kv.pendingSince) > 3*time.Second {
+			// 卡死看门狗：迁移长时间（>3s）未完成，pendingIn/pendingOut 残留会冻结
+			// 配置推进、令客户端读挂死（3+ group 快速 churn / ReMigration 漂移的根因）。
+			// 对每个卡滞分片以最新 ShardMaster 配置重算 owner 并重拉取/重推送，bump
+			// fetchEpoch 让陈旧 fetcher/sender 自退。仅卡死时触发，正常快路径零开销。
+			kv.rekickStuckMigrations(latest)
+			kv.pendingSince = now // 限频：每 3s 最多重踢一次
+		}
 		kv.mu.Unlock()
 		if latest.Num <= cur {
 			continue
@@ -244,6 +260,36 @@ func (kv *ShardKV) pollConfig() {
 		}
 		kv.propose(Op{Kind: "NewConfig", Config: next})
 	}
+}
+
+// rekickStuckMigrations 仅由 pollConfig 看门狗在迁移卡死时调用（调用方持有 kv.mu）。
+// 对每个仍 pending 的分片：若最新配置下本组已是其 owner 或无主，清掉残留标记让配置
+// 继续推进；否则以最新配置的 owner 重拉取（pendingIn）/重推送（pendingOut），并 bump
+// 对应 epoch 使陈旧的后台协程自退。这是「配置推进快于单跳迁移」冻结的兜底自愈；同时
+// 自增 config_stalls 计数，由 /metrics 暴露以便观测卡滞频率。
+func (kv *ShardKV) rekickStuckMigrations(latest shardmaster.Config) {
+	for s := range kv.pendingIn {
+		owner := latest.Shards[s]
+		if owner == kv.gid || owner == 0 {
+			// 最新配置下本组已是 owner（或无主）：数据由 incoming / 后续配置装载负责，
+			// 残留 pendingIn 只冻结配置推进，清掉让 pollConfig 继续。
+			delete(kv.pendingIn, s)
+			continue
+		}
+		kv.fetchEpoch[s]++
+		servers := append([]string{}, latest.Groups[owner]...)
+		epoch := kv.fetchEpoch[s]
+		go kv.fetchShard(s, servers, epoch)
+	}
+	for s := range kv.pendingOut {
+		newG := kv.config.Shards[s]
+		if newG == kv.gid || newG == 0 {
+			delete(kv.pendingOut, s)
+			continue
+		}
+		go kv.sendShard(s, newG)
+	}
+	Metrics.Counter("config_stalls").Inc()
 }
 
 // ============================== 读取 RPC ==============================
@@ -690,11 +736,12 @@ func (kv *ShardKV) fetchShard(s int, oldServers []string, epoch int64) {
 			}
 		}
 		if !got {
-			// 自愈回源（cycle 27/33）：记录的旧 owner 不可达（快速再平衡下可能已
-			// 因更新的配置把该分片 GC 掉），回源 ShardMaster 取「当前 prevConfig
-			// 版本」的 owner 重新拉取；若当前配置下本组已是 owner，清掉残留
-			// pendingIn 让配置推进（否则 have==false 且 pendingIn 残留会永久卡死）。
-			if cur := kv.mck.Query(kv.prevConfig.Num); cur.Num == kv.prevConfig.Num {
+			// 自愈回源（cycle 27/33，本轮增强）：记录的旧 owner 不可达（快速再平衡下可能已
+			// 因更新的配置把该分片 GC 掉并转发给更靠后的 group），改回源 ShardMaster 取「最新」
+			// 配置的 owner 重新拉取——比仅查 prevConfig.Num 更 live，可跨多跳迁移链找回数据；
+			// 若最新配置下本组已是 owner 或无主，清掉残留 pendingIn 让配置推进（否则 have==false
+			// 且 pendingIn 残留会永久卡死）。
+			if cur := kv.mck.Query(-1); cur.Num > 0 {
 				curOwner := cur.Shards[s]
 				if curOwner != kv.gid && curOwner != 0 {
 					for _, srv := range cur.Groups[curOwner] {

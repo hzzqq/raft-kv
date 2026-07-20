@@ -2,7 +2,21 @@
 
 > 本文件由 agent 根据 `Handoff-raft-kv-20260719.md`（cycle 1–13 交接）自行制定，
 > 作为后续自主迭代（cycle 14+）的过程纪律。用户 2026-07-20 指令：
-> 「读取文件夹，根据交接文档，自己制定迭代过程的规则，自主迭代10轮，做完了把代码传到 GitHub」。
+> 「读取文件夹，根据交接文档，自己制定迭代过程的规则，自主迭代10轮，做完了把代码传到GitHub」。
+
+## 〇、本轮批次（cycle 39–48，2026-07-20 续跑）
+- 基线：cycle 38 已落地全栈（cluster/demo/gateway/kvcli/ReadIndex/metrics/docs/CI），全量
+  `go test ./...` 绿、覆盖率 74.2%，`origin/master` 同步于 tip `58e36a7`。
+- 本批 10 轮聚焦：
+  1. **3+ group / ReMigration 冻结根因自愈**（最高优先级）：加「卡死看门狗」重拉 + 可 skip 的
+     3-group churn 测试转为可追踪项；
+  2. 补 shardkv / kvcli 覆盖率缺口；
+  3. 扩展 CI `-race` 覆盖（Concurrent / SnapshotChurn）；
+  4. 打磨可观测性（卡滞计数 / `/debug/shards` 卡滞时长）；
+  5. 刷新 README + 交接文档；
+  6. 全量验收后按授权 `git push origin master`。
+- **push 授权已确认**：10 轮完成后执行普通快进 `git push origin master`（不 `--force`）。
+- 纪律延续 §一~§五；绿条优先——任何会破坏既有绿条的修复先回退换方向。
 
 ## 一、安全红线（不可逾越）
 1. 每次改动必须先 `go build ./...` + `go vet` + 相关包测试通过，方可提交；绝不把项目留在损坏/不编译状态。
@@ -18,6 +32,9 @@
 - `Kill()` 必须关闭 `killCh`，让 applier 及时退出，否则每实例泄漏一个 goroutine。
 - metrics 接入只做纯增量原子操作（`atomic.AddUint64`），不可在热路径加锁或分配，违背「零开销可观测性」。
 - 绿条纪律：绝不提交会破坏既有绿条的修复（cycle 9 的 reconcile、cycle 13 的 Clerk 缓存均因此回退）。
+- 迁移 liveness 看门狗（本轮新增）：`pollConfig` 在 `hasPending` 持续 > 阈值（3s）时，对每个卡滞分片
+  以最新 ShardMaster 配置重算 owner 并**重拉取（bump `fetchEpoch` 让陈旧 fetcher 自退）**；仅卡死时触发，
+  不扰正常快路径。看门狗每触发一次 `Metrics.Counter("config_stalls").Inc()`，由 `/metrics` 暴露。
 
 ## 三、本地环境约束
 - 工具链：`C:/Users/Administrator/.workbuddy/binaries/go/go/bin/go.exe`（go1.22.5），绝对 GOPATH/GOCACHE（见 `run-tests.sh`）。
@@ -31,5 +48,5 @@
 ## 五、每轮记录
 - 完成后 `cycle += 1`，向 `.workbuddy/self-driving/state.json` 的 `log` 追加 `{task_id, files, validation, score, ts}`。
 - 评分 `score` 0–100 为真实质量收益；连续两轮 <10 或同 `task_id` 连续 3 次无进展 → 自然收尾/换方向。
-- 提交信息格式：`self-driving dev [cycle N/23]: <task 简述>`。
+- 提交信息格式：`self-driving dev [cycle N/48]: <task 简述>`（N 为绝对轮次，本轮 39–48）。
 - 跨调用续跑：先读 `state.json`；若 `paused=true` 直接停下汇报。
