@@ -186,6 +186,23 @@ func (c *Cluster) WaitConfig(g, r, num int) {
 	}
 }
 
+// WaitAllConfigs 轮询直到所有 group 的配置都推进到 >= num（每 group 最多 ~5s）。
+func (c *Cluster) WaitAllConfigs(num int) {
+	for g := 0; g < c.nGroups; g++ {
+		c.WaitConfig(g, 0, num)
+	}
+}
+
+// Churn 在 groups 间做 rounds 轮分片漂移：每轮把第 (i*shardStep)%NShards 号分片迁到
+// 第 i%nGroups 组，轮间间隔 interval。制造可控的「多 group 迁移并发」，供测试断言
+// 配置持续推进、数据不丢。属于 Move 式 churn（非 Join/Leave 再平衡），是安全迁移路径。
+func (c *Cluster) Churn(rounds int, interval time.Duration, shardStep int) {
+	for i := 0; i < rounds; i++ {
+		c.Move((i*shardStep)%shardmaster.NShards, i%c.nGroups)
+		time.Sleep(interval)
+	}
+}
+
 // Cleanup 关闭所有 ShardKV / ShardMaster 并清理网络（回收 goroutine）。
 func (c *Cluster) Cleanup() {
 	for g := 0; g < c.nGroups; g++ {

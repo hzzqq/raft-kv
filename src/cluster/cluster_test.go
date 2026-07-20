@@ -2,6 +2,7 @@
 package cluster
 
 import (
+	"fmt"
 	"hash/fnv"
 	"testing"
 	"time"
@@ -44,5 +45,32 @@ func TestClusterSmoke(t *testing.T) {
 
 	if v := ck.Get("k1"); v != "v1x" {
 		t.Fatalf("after Move shard %d: got %q want \"v1x\"", shard, v)
+	}
+}
+
+// TestClusterChurn：2 group 集群下做可控的多 group 分片漂移（Move 式，安全路径），
+// 断言配置持续推进到最新且 churn 结束后数据仍完整可读。验证新增的 Churn/WaitAllConfigs
+// helper 可在 cluster 包内直接复用。3+ group 整体再平衡（Join/Leave）式 churn 的脆弱性
+// 见 docs/lab4-shardkv-design.md §7，不在此用例（安全路径）覆盖。
+func TestClusterChurn(t *testing.T) {
+	const nGroups = 2
+	c := StartCluster(nGroups, 3, 3, 0)
+	defer c.Cleanup()
+	ck := c.Clerk()
+	for g := 0; g < nGroups; g++ {
+		c.Join(g)
+		c.WaitConfig(g, 0, g+1)
+	}
+	for i := 0; i < 10; i++ {
+		ck.Put(fmt.Sprintf("cc-%d", i), fmt.Sprintf("ccv-%d", i))
+	}
+
+	c.Churn(12, 80*time.Millisecond, 1)
+	c.WaitAllConfigs(2 + 12)
+
+	for i := 0; i < 10; i++ {
+		if v := ck.Get(fmt.Sprintf("cc-%d", i)); v != fmt.Sprintf("ccv-%d", i) {
+			t.Fatalf("after churn Get(cc-%d)=%q want ccv-%d", i, v, i)
+		}
 	}
 }
