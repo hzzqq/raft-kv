@@ -26,11 +26,33 @@ jobs:
       - name: Test with race detector (kvraft + shardmaster)
         run: go test -race ./src/kvraft/ ./src/shardmaster/ -count=1 -timeout 600s
 
-      - name: Test ShardKV with race detector (basic + move)
+      - name: Test ShardKV with race detector (basic + move + concurrent + readindex)
         # GitHub runners have gcc, so -race runs here. The local managed Go env has
         # no gcc, so shardkv's concurrency is instead guarded by the high-frequency
         # churn-loop tests (TestSKVConcurrent/SnapshotChurn/ReMigration/ConfigProgress).
-        # Only the low-concurrency basic/move paths are raced here to keep CI fast and
-        # stable while still exercising the migration goroutines (sendShard/fetchShard)
-        # under the race detector.
-        run: go test -race ./src/shardkv/ -run 'TestSKVBasic|TestSKVMove' -count=1 -timeout 600s
+        # Here we race the single/multi-group migration goroutines (sendShard/fetchShard)
+        # AND the concurrent + ReadIndex fast-path workloads to catch data races in the
+        # migration state machine and the appliedIndex/ReadIndex read path.
+        # (SnapshotChurn at maxraftstate>0 is heavier; kept out to limit CI time.)
+        run: go test -race ./src/shardkv/ -run 'TestSKVBasic|TestSKVMove|TestSKVConcurrent|TestSKVReadIndex' -count=1 -timeout 600s
+
+  fullstack-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build binaries (gateway / kvcli / demo)
+        run: |
+          mkdir -p bin
+          go build -o bin/gateway ./src/gateway
+          go build -o bin/kvcli   ./src/kvcli
+          go build -o bin/demo    ./src/demo
+
+      - name: Run demo (cluster -> HTTP gateway -> client full stack)
+        run: go run ./src/demo
