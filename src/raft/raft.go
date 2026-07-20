@@ -218,6 +218,15 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.currentTerm, rf.role == Leader
 }
 
+// ReadIndex 返回 leader 当前的 commitIndex 与是否仍为主。
+// 供上层（ShardKV）实现线性一致读优化：以 commitIndex 为一致性点，等待本组
+// 状态机 apply 到该索引后直接读本地状态，省去一次日志追加。
+func (rf *Raft) ReadIndex() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.commitIndex, rf.role == Leader
+}
+
 // LastApplied 返回已应用到状态机的最后索引（测试用，用于断言未达多数时不提交）。
 func (rf *Raft) LastApplied() int {
 	rf.mu.Lock()

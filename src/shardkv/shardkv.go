@@ -163,6 +163,12 @@ type ShardKV struct {
 	notified map[int64]chan applyResult
 	notifyId int64
 
+	// appliedIndex 是本组状态机已应用的最后一条日志的绝对索引（与 raft 的
+	// commitIndex/lastApplied 同尺度）。ReadIndex 线性一致读用它判断"是否已 apply
+	// 到一致性点"——必须是一个绝对索引，因此由 applier 在每条消息处理后置为
+	// msg.CommandIndex / msg.SnapshotIndex（而非简单自增计数器）。
+	appliedIndex int
+
 	dead         int32
 	maxraftstate int
 	killCh       chan struct{} // 关闭即通知 applier 退出（raft 不会关 applyCh，否则向其发送会 panic）
@@ -240,21 +246,68 @@ func (kv *ShardKV) pollConfig() {
 
 // ============================== 读取 RPC ==============================
 
+// waitApplied 等待本组状态机 apply 到绝对索引 idx（ReadIndex 读路径用）。
+// 期间若失去领导权或超时，返回 false，由调用方回退到常规 propose（日志追加，
+// 绝对正确且线性一致）。绝不死等，避免卡住客户端。
+func (kv *ShardKV) waitApplied(idx int) bool {
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		kv.mu.Lock()
+		done := kv.appliedIndex >= idx
+		kv.mu.Unlock()
+		if done {
+			return true
+		}
+		if _, isLeader := kv.rf.GetState(); !isLeader {
+			return false
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	shard := key2shard(args.Key)
-		if kv.config.Shards[shard] != kv.gid {
-			kv.mu.Unlock()
-			reply.Err = ErrWrongGroup
-			return
-		}
-		if _, owned := kv.shards[shard]; !owned {
-			kv.mu.Unlock()
-			reply.Err = ErrWrongGroup
-			return
-		}
+	if kv.config.Shards[shard] != kv.gid {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongGroup
+		return
+	}
+	if _, owned := kv.shards[shard]; !owned {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongGroup
+		return
+	}
 	kv.mu.Unlock()
 
+	// 线性一致读优化（ReadIndex）：leader 上直接读本地状态机，省去一次日志追加。
+	// 一致性点 = leader 当前 commitIndex；等待本组状态机 apply 到该索引后，本地
+	// 状态即反映所有已提交写，等价于一次线性一致读。等待期间若失去领导权或超时，
+	// 回退到常规 propose 路径（同样线性一致，只是多一次日志追加）。
+	if idx, ok := kv.rf.ReadIndex(); ok {
+		if kv.waitApplied(idx) {
+			kv.mu.Lock()
+			// 等待期间配置可能把分片迁走，需重新校验归属，否则读到的不是本组数据。
+			if kv.config.Shards[shard] == kv.gid {
+				if sd, ok2 := kv.shards[shard]; ok2 {
+					val := sd.Data[args.Key]
+					kv.mu.Unlock()
+					reply.Err = OK
+					reply.Value = val
+					start := time.Now()
+					Metrics.Histogram("op_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
+					Metrics.Counter("ops_total").Inc()
+					return
+				}
+			}
+			kv.mu.Unlock()
+		}
+	}
+
+	// 兜底：走常规 propose（日志追加，绝对正确且线性一致）。
 	start := time.Now()
 	op := Op{Kind: "Cmd", ClientId: args.ClientId, Seq: args.Seq, Shard: shard, Key: args.Key, OpType: "Get"}
 	res := kv.propose(op)
@@ -384,6 +437,7 @@ func (kv *ShardKV) applier() {
 			// 与客户端读/配置推进并发会触发数据竞争（maxraftstate>0 时必现）。
 			kv.mu.Lock()
 			kv.installSnapshot(msg.Snapshot)
+			kv.appliedIndex = msg.SnapshotIndex
 			kv.mu.Unlock()
 			Metrics.Counter("snapshots_installed").Inc()
 			continue
@@ -393,8 +447,14 @@ func (kv *ShardKV) applier() {
 		}
 		Metrics.Counter("entries_applied").Inc()
 		op, isOp := msg.Command.(Op)
+		idx := msg.CommandIndex
 		if !isOp {
-			continue // no-op
+			// no-op 条目（如 leader 任期开始的空命令）：也要更新 appliedIndex，
+			// 保持与 raft.lastApplied 同尺度（绝对索引），否则 ReadIndex 读路径会误判。
+			kv.mu.Lock()
+			kv.appliedIndex = idx
+			kv.mu.Unlock()
+			continue
 		}
 		kv.mu.Lock()
 		var res applyResult
@@ -414,6 +474,7 @@ func (kv *ShardKV) applier() {
 		nid := op.NotifyId
 		ch := kv.notified[nid]
 		delete(kv.notified, nid)
+		kv.appliedIndex = idx
 		kv.mu.Unlock()
 
 		if ch != nil {
