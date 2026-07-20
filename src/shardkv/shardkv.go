@@ -671,6 +671,35 @@ func (kv *ShardKV) fetchShard(s int, oldServers []string) {
 				break
 			}
 		}
+		if !got {
+			// 自愈回源（3-group 再平衡修复，cycle 27）：记录的旧 owner 已全部不可达
+			// （在 3+ group 快速再平衡下，旧 owner 可能已因更新的配置把该分片 GC 掉），
+			// 不回源则 pendingIn 永久卡死、配置冻结。此时回源 ShardMaster 取该分片
+			// 的「当前」owner 重新拉取。
+			if cur := kv.mck.Query(-1); cur.Num > 0 {
+				curOwner := cur.Shards[s]
+				if curOwner != kv.gid && curOwner != 0 {
+					// 当前 owner 是别的 group：向它拉取（它可能持有该分片数据）。
+					for _, srv := range cur.Groups[curOwner] {
+						end := kv.make_end(srv)
+						reply := &GetShardReply{}
+						if end.Call("ShardKV.GetShard", &GetShardArgs{Shard: s}, reply) && reply.Err == OK && reply.Data != nil {
+							kv.propose(Op{Kind: "InstallShard", MigrateShard: s, MigrateData: reply.Data})
+							got = true
+							break
+						}
+					}
+				} else if curOwner == kv.gid {
+					// 当前配置下本组就是 owner：残留的 pendingIn 只是冻结了配置推进，
+					// 清掉标记让 pollConfig 继续推进（更新的 NewConfig 会负责把分片
+					// 真正装载进来）。否则 have==false 且 pendingIn 残留会永久卡死。
+					kv.mu.Lock()
+					delete(kv.pendingIn, s)
+					kv.mu.Unlock()
+					return
+				}
+			}
+		}
 		if got {
 			return
 		}
