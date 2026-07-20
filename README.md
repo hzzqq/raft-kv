@@ -80,7 +80,10 @@ go test -race ./src/kvraft/...   # 竞态检测（可选，耗时更长）
 - `raft`：`TestInitialElection` / `TestReElection`（2A 选举）、`TestBasicAgree` / `TestFailAgree` / `TestFailNoAgree` / `TestConcurrentStarts`（2B 复制）、`TestPersist1`（2C 持久化）、`TestSnapshot`（2D 快照）。
 - `kvraft`：`TestKVBasic` / `TestKVConcurrency` / `TestKVFail`（故障转移）/ `TestKVPersist`（掉电重启重放）/ `TestKVSnapshot`（快照压缩：超过 `maxraftstate` 阈值主动快照、重启后从快照恢复）/ `TestKVSnapshotStress`（并发写入 + 周期性分区/重启抖动下快照路径不丢数据且 raft 状态有界）。
 - `shardmaster`：Join / Leave / Move / Query 及其组合下的配置正确性与线性一致。
-- `shardkv`：单组读写、多组迁移、并发迁移下的线性一致与无数据丢失。
+- `shardkv`（Lab 4 数据面，设计细节见 `docs/lab4-shardkv-design.md`）：
+  - `TestSKVBasic` 单组读写；`TestSKVMove` 单分片跨组迁移后可读；`TestSKVJoinLeave` 两组 Join/Leave 后数据不丢；`TestSKVGC` 旧 owner 回收、新 owner 持有（GC-after-ack）。
+  - `TestSKVConcurrent` 多客户端并发写 + 后台 churn，线性一致；`TestSKVSnapshotChurn` 开启 `maxraftstate` 下并发 + churn（命中 `installSnapshot` 路径）；`TestSKVReMigration` 单分片 A→B→A 快速漂移（配置不冻结、迁移窗口内写不丢）；`TestSKVConfigProgress` 多轮 Move 下配置持续推进 + 数据完整。
+  - **已知风险**：3 个及以上 group 的「整体再平衡」式 churn 在极端压力下存在分片不可读的脆弱性，详见设计文档 §7；当前测试均走安全的「单分片 Move」路径。
 
 ### 工程健壮性要点
 - **`restart()` 每次使用全新的 `applyCh`**：被 Kill 的旧 KV/Raft applier 仍阻塞在旧 channel 上（不关闭），若复用同一 channel，新 applier 会与之竞争 `ApplyMsg`，导致 `notify` 信号被已死 applier 吞掉、客户端永久挂起。
@@ -88,8 +91,9 @@ go test -race ./src/kvraft/...   # 竞态检测（可选，耗时更长）
 - **`AppendEntries` 仅在日志真正变化时才持久化**：心跳（无新条目）不再重写整个状态，避免每 110ms 一次的全量 gob 序列化。
 
 ## 验证状态说明
-- 固态的 Labs 2–3 与 `shardmaster` 已通过 `go vet` + `go test` 验证，并纳入 GitHub Actions CI（`vet` + `test` + `race`）。
-- `src/shardkv/` 已实现，但若当前执行环境**缺少 Go 工具链**，则无法在此本地编译/运行其测试——此时仅做文档与工程化自检，**不会**提交未经 `go test` 验证的代码。请在装有 Go 1.22+ 的环境中跑 `go test ./src/shardkv/...` 完成最终验证，CI 亦会在推送时自动覆盖。
+- Labs 2–3、`shardmaster`、`shardkv` 均已在本地 Go 1.22.5 下通过 `go vet` + `go test`（含 `-count=1`）验证，并纳入 GitHub Actions CI（`vet` + `test` + `race`）。
+- 本机交互 shell 默认无 `go`，但仓库随附的托管 Go 工具链（`C:/Users/Administrator/.workbuddy/binaries/go/go/bin/go.exe`）可用于本地验证；该环境**无 gcc**，故 `go test -race` 仅能在 CI（GitHub ubuntu + gcc）侧运行，`shardkv` 的并发/冻结类回归以「高频 churn + 多轮循环」测试替代 race detector 来暴露。
+- 自动化纪律：每次改动本地提交、**不 push、不 --force、不 rm -rf**；验收不过绝不提交（见 `docs/lab4-shardkv-design.md` 与 `.workbuddy/self-driving/state.json`）。
 
 ## 说明
 - 这是面向学习的实验性实现，重点在正确性与可读性，非生产级部署。
