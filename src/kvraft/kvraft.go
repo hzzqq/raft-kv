@@ -9,8 +9,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"raftkv/src/metrics"
 	"raftkv/src/raft"
 )
+
+// Metrics 是 KV 组件的可观测性指标（best-effort 进程级聚合）。
+var Metrics = metrics.NewRegistry()
 
 // Op 需要向 gob 注册：Raft 把日志以 interface{} 形式持久化，
 // 反序列化时必须知道具体类型，否则重启后日志变空（命令丢失）。
@@ -108,11 +112,13 @@ func (kv *KVServer) applier() {
 		if msg.SnapshotValid {
 			// 落后 follower 或重启节点通过快照追平状态机。
 			kv.installSnapshot(msg.Snapshot)
+			Metrics.Counter("snapshots_installed").Inc()
 			continue
 		}
 		if !msg.CommandValid {
 			continue
 		}
+		Metrics.Counter("entries_applied").Inc()
 		op, ok := msg.Command.(Op)
 		if !ok {
 			// no-op（leader 任期开始追加的空命令）：不更新状态机，直接跳过。
@@ -214,33 +220,47 @@ func (kv *KVServer) startOp(op Op) (int, bool) {
 // ============================== 对外 RPC ==============================
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	start := time.Now()
 	op := Op{Key: args.Key, OpType: "Get", ClientId: args.ClientId, Seq: args.Seq}
 	index, ok := kv.startOp(op)
 	if !ok {
 		reply.WrongLeader = true
+		Metrics.Counter("ops_total").Inc()
+		Metrics.Counter("ops_errors").Inc()
 		return
 	}
 	res := kv.waitApplied(op, index)
 	if res.Err != "" {
 		reply.WrongLeader = true
+		Metrics.Counter("ops_total").Inc()
+		Metrics.Counter("ops_errors").Inc()
 		return
 	}
 	reply.Value = res.Value
+	Metrics.Counter("ops_total").Inc()
+	Metrics.Histogram("op_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	start := time.Now()
 	op := Op{Key: args.Key, Value: args.Value, OpType: args.Op, ClientId: args.ClientId, Seq: args.Seq}
 	index, ok := kv.startOp(op)
 	if !ok {
 		reply.WrongLeader = true
+		Metrics.Counter("ops_total").Inc()
+		Metrics.Counter("ops_errors").Inc()
 		return
 	}
 	res := kv.waitApplied(op, index)
 	if res.Err != "" {
 		reply.WrongLeader = true
+		Metrics.Counter("ops_total").Inc()
+		Metrics.Counter("ops_errors").Inc()
 		return
 	}
 	reply.Err = res.Err
+	Metrics.Counter("ops_total").Inc()
+	Metrics.Histogram("op_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
 }
 
 // ============================== 构造 ==============================

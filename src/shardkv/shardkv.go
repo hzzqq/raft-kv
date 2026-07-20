@@ -14,9 +14,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"raftkv/src/metrics"
 	"raftkv/src/raft"
 	"raftkv/src/shardmaster"
 )
+
+// Metrics 是本进程内 ShardKV 组件的可观测性指标（best-effort 聚合，跨 group 共享）。
+// 网关 / 演示程序可读取 shardkv.Metrics.Snapshot() 展示实时吞吐、延迟与错误率。
+var Metrics = metrics.NewRegistry()
 
 // ============================== 常量与类型 ==============================
 
@@ -250,8 +255,14 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		}
 	kv.mu.Unlock()
 
+	start := time.Now()
 	op := Op{Kind: "Cmd", ClientId: args.ClientId, Seq: args.Seq, Shard: shard, Key: args.Key, OpType: "Get"}
 	res := kv.propose(op)
+	Metrics.Histogram("op_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
+	Metrics.Counter("ops_total").Inc()
+	if res.err != OK {
+		Metrics.Counter("ops_errors").Inc()
+	}
 	reply.Err = res.err
 	reply.Value = res.value
 }
@@ -271,9 +282,15 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	kv.mu.Unlock()
 
+	start := time.Now()
 	op := Op{Kind: "Cmd", ClientId: args.ClientId, Seq: args.Seq, Shard: shard,
 		Key: args.Key, Value: args.Value, OpType: args.OpType}
 	res := kv.propose(op)
+	Metrics.Histogram("op_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
+	Metrics.Counter("ops_total").Inc()
+	if res.err != OK {
+		Metrics.Counter("ops_errors").Inc()
+	}
 	reply.Err = res.err
 }
 
@@ -368,11 +385,13 @@ func (kv *ShardKV) applier() {
 			kv.mu.Lock()
 			kv.installSnapshot(msg.Snapshot)
 			kv.mu.Unlock()
+			Metrics.Counter("snapshots_installed").Inc()
 			continue
 		}
 		if !msg.CommandValid {
 			continue
 		}
+		Metrics.Counter("entries_applied").Inc()
 		op, isOp := msg.Command.(Op)
 		if !isOp {
 			continue // no-op
@@ -407,6 +426,7 @@ func (kv *ShardKV) applier() {
 			idx := msg.CommandIndex
 			kv.mu.Unlock()
 			kv.rf.Snapshot(idx, data)
+			Metrics.Counter("snapshots_taken").Inc()
 		}
 	}
 }

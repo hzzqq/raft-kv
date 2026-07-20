@@ -10,7 +10,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"raftkv/src/metrics"
 )
+
+// Metrics 是 Raft 组件的可观测性指标（best-effort 进程级聚合）。
+// 网关 / 演示程序可读取 raft.Metrics.Snapshot() 查看领导者变更、日志应用等。
+var Metrics = metrics.NewRegistry()
 
 // ============================== 常量与类型 ==============================
 
@@ -327,6 +333,7 @@ func (rf *Raft) becomeLeader() {
 		return
 	}
 	rf.role = Leader
+	Metrics.Counter("leader_changes").Inc()
 	// 任期开始时追加一条 no-op（空命令）。按 Raft 提交规则，leader 只能
 	// 通过提交"当前任期"的条目来间接提交旧任期的日志；no-op 作为当前任期的
 	// 第一条条目，被多数派复制并提交后即可"拉动"先前未提交的旧条目。
@@ -717,6 +724,7 @@ func (rf *Raft) applier() {
 				SnapshotTerm:  rf.lastIncludedTerm,
 				SnapshotIndex: rf.lastIncludedIndex,
 			}
+			Metrics.Counter("snapshots_installed").Inc()
 		} else {
 			pos := idx - rf.lastIncludedIndex - 1
 			msg = ApplyMsg{
@@ -724,6 +732,7 @@ func (rf *Raft) applier() {
 				Command:      rf.log[pos].Command,
 				CommandIndex: idx,
 			}
+			Metrics.Counter("log_applied").Inc()
 		}
 		rf.mu.Unlock()
 		rf.applyCh <- msg
