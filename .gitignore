@@ -32,3 +32,6 @@ tmp_*
 tmp_*.log
 tmp_*.txt
 tmp_*.sh
+
+# Build output (make build-binaries / start scripts)
+bin/

@@ -18,5 +18,16 @@ test:
 test-race:
 	$(GO) test ./src/shardkv/... -race -count=1 -timeout 300s
 
+# 构建三个可执行：gateway / kvcli / demo（输出到 bin/）。
+build-binaries:
+	mkdir -p bin
+	$(GO) build -o bin/gateway ./src/gateway
+	$(GO) build -o bin/kvcli   ./src/kvcli
+	$(GO) build -o bin/demo    ./src/demo
+
+# 全栈冒烟：直接跑 demo（cluster -> HTTP 网关 -> HTTP 客户端）。
+demo: build-binaries
+	$(GO) run ./src/demo
+
 clean:
 	$(GO) clean ./...

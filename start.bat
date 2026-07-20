@@ -12,3 +12,12 @@ go vet ./...
 
 echo == go test: Lab4 ShardKV ==
 go test ./src/shardkv/... -count=1 -timeout 300s
+
+echo == build binaries (gateway / kvcli / demo) ==
+if not exist bin mkdir bin
+go build -o bin/gateway.exe ./src/gateway
+go build -o bin/kvcli.exe   ./src/kvcli
+go build -o bin/demo.exe    ./src/demo
+
+echo == full-stack smoke: run demo (cluster -^> HTTP gateway -^> client) ==
+go run ./src/demo
