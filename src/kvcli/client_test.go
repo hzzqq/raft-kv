@@ -53,3 +53,33 @@ func TestClientAgainstCluster(t *testing.T) {
 		t.Fatalf("Get(foo) after append=%q want bar-baz", v)
 	}
 }
+
+func TestClientBench(t *testing.T) {
+	c := cluster.StartCluster(2, 3, 3, 0)
+	defer c.Cleanup()
+	for g := 0; g < 2; g++ {
+		c.Join(g)
+		c.WaitConfig(g, 0, g+1)
+	}
+	ts := httptest.NewServer(testHandler(c))
+	defer ts.Close()
+
+	cl := NewClient(ts.URL)
+	res := cl.Bench(60, 3, "mixed", 64)
+	if res.Ops != 60 {
+		t.Fatalf("Bench Ops = %d, want 60", res.Ops)
+	}
+	if res.Workers != 3 {
+		t.Fatalf("Bench Workers = %d, want 3", res.Workers)
+	}
+	if res.Errors != 0 {
+		t.Fatalf("Bench Errors = %d, want 0", res.Errors)
+	}
+	if res.OpsPerSec <= 0 {
+		t.Fatalf("Bench OpsPerSec = %.1f, want > 0", res.OpsPerSec)
+	}
+	if res.LatP50 <= 0 || res.LatP95 <= 0 || res.LatP99 <= 0 {
+		t.Fatalf("Bench latencies not all positive: p50=%.2f p95=%.2f p99=%.2f",
+			res.LatP50, res.LatP95, res.LatP99)
+	}
+}
