@@ -796,7 +796,7 @@ func (ck *Clerk) Get(key string) string {
 		for _, srv := range servers {
 			end := ck.make_end(srv)
 			reply := &GetReply{}
-			if end.Call("ShardKV.Get", &GetArgs{Key: key, ClientId: ck.clientId, Seq: seq}, reply) {
+			if ck.callWithTimeout(end, "ShardKV.Get", &GetArgs{Key: key, ClientId: ck.clientId, Seq: seq}, reply) {
 				if reply.Err == OK {
 					return reply.Value
 				}
@@ -841,7 +841,7 @@ func (ck *Clerk) PutAppend(key, value, opType string) {
 		for _, srv := range servers {
 			end := ck.make_end(srv)
 			reply := &PutAppendReply{}
-			if end.Call("ShardKV.PutAppend", &PutAppendArgs{Key: key, Value: value, OpType: opType, ClientId: ck.clientId, Seq: seq}, reply) {
+			if ck.callWithTimeout(end, "ShardKV.PutAppend", &PutAppendArgs{Key: key, Value: value, OpType: opType, ClientId: ck.clientId, Seq: seq}, reply) {
 				if reply.Err == OK {
 					return
 				}
@@ -860,6 +860,25 @@ func (ck *Clerk) PutAppend(key, value, opType string) {
 
 func (ck *Clerk) Put(key, value string)   { ck.PutAppend(key, value, "Put") }
 func (ck *Clerk) Append(key, value string) { ck.PutAppend(key, value, "Append") }
+
+// callWithTimeout 在单 RPC 上施加超时，避免副本网络层挂起拖死客户端
+// （交接文档 §6 的开放问题：当前无超时，副本网络层挂起会拖慢客户端）。
+// 超时即视为不可达，交由上层重试循环处理；safe-by-construction：
+// 仅当 goroutine 通过 done channel 返回 ok 时才读取 reply（channel 收发建立
+// happens-before，reply 写入对主协程可见），超时分支不读 reply，无数据竞争。
+func (ck *Clerk) callWithTimeout(end *raft.ClientEnd, method string, args, reply interface{}) bool {
+	const timeout = 1 * time.Second
+	done := make(chan bool, 1)
+	go func() {
+		done <- end.Call(method, args, reply)
+	}()
+	select {
+	case ok := <-done:
+		return ok
+	case <-time.After(timeout):
+		return false
+	}
+}
 
 func nrand() int64 {
 	return rand.Int63()
