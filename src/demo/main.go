@@ -16,10 +16,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"raftkv/src/cluster"
+	"raftkv/src/metrics"
 	"raftkv/src/shardkv"
 	"raftkv/src/shardmaster"
 )
@@ -61,6 +63,13 @@ func RunDemo() string {
 	c := cluster.StartCluster(2, 3, 3, 0)
 	defer c.Cleanup()
 	ck := c.Clerk()
+
+	// 定期把指标快照 dump 到 stderr，演示 metrics 的周期性可观测能力（cycle 26）。
+	// 从集群启动起就开启，覆盖整段演示，期间会触发多次 dump。
+	stopReporter := make(chan struct{})
+	metrics.StartPeriodicReporter(shardkv.Metrics, 400*time.Millisecond, os.Stderr, stopReporter)
+	defer close(stopReporter)
+
 	c.Join(0)
 	c.WaitConfig(0, 0, 1)
 	c.Join(1)

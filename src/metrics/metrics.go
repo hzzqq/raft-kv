@@ -11,10 +11,13 @@
 package metrics
 
 import (
+	"encoding/json"
+	"io"
 	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Counter 是并发安全的单调递增计数器。
@@ -176,4 +179,31 @@ func (r *Registry) Reset() {
 	defer r.mu.Unlock()
 	r.counters = map[string]*Counter{}
 	r.histograms = map[string]*Histogram{}
+}
+
+// DumpJSON 把当前快照序列化为 JSON 字节，便于网关 / 演示程序直接输出。
+func (r *Registry) DumpJSON() ([]byte, error) {
+	return json.Marshal(r.Snapshot())
+}
+
+// StartPeriodicReporter 起一个后台 goroutine，每隔 interval 把快照 JSON 写入 w，
+// 直到 stop 被关闭。调用方负责关闭 stop 以回收 goroutine（否则会泄漏）。
+// 纯工具函数，不影响任何指标采集路径。
+func StartPeriodicReporter(r *Registry, interval time.Duration, w io.Writer, stop <-chan struct{}) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				b, err := r.DumpJSON()
+				if err != nil {
+					continue
+				}
+				_, _ = w.Write(append(b, '\n'))
+			}
+		}
+	}()
 }

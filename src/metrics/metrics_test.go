@@ -1,6 +1,11 @@
 package metrics
 
-import "testing"
+import (
+	"bytes"
+	"encoding/json"
+	"testing"
+	"time"
+)
 
 func TestCounter(t *testing.T) {
 	c := NewRegistry().Counter("x")
@@ -61,5 +66,43 @@ func TestRegistrySnapshot(t *testing.T) {
 	}
 	if hists["lat"].Count != 1 {
 		t.Fatalf("want lat count=1 got %v", hists["lat"].Count)
+	}
+}
+
+func TestDumpJSON(t *testing.T) {
+	r := NewRegistry()
+	r.Counter("ops").Inc()
+	r.Histogram("lat").Record(2.0)
+	b, err := r.DumpJSON()
+	if err != nil {
+		t.Fatalf("DumpJSON error: %v", err)
+	}
+	var snap map[string]interface{}
+	if err := json.Unmarshal(b, &snap); err != nil {
+		t.Fatalf("DumpJSON not valid JSON: %v (body=%s)", err, string(b))
+	}
+	if _, ok := snap["counters"]; !ok {
+		t.Fatalf("DumpJSON missing counters")
+	}
+}
+
+func TestPeriodicReporter(t *testing.T) {
+	r := NewRegistry()
+	r.Counter("ops").Inc()
+	var buf bytes.Buffer
+	stop := make(chan struct{})
+	StartPeriodicReporter(r, 20*time.Millisecond, &buf, stop)
+	time.Sleep(120 * time.Millisecond) // 应触发 >=1 次 dump
+	close(stop)
+	time.Sleep(40 * time.Millisecond) // 等 goroutine 退出
+
+	if buf.Len() == 0 {
+		t.Fatalf("periodic reporter wrote nothing")
+	}
+	// 关闭后应停止写入：再等一段时间，长度不应继续增长。
+	lenAfterStop := buf.Len()
+	time.Sleep(80 * time.Millisecond)
+	if buf.Len() != lenAfterStop {
+		t.Fatalf("reporter kept writing after stop: %d -> %d", lenAfterStop, buf.Len())
 	}
 }
