@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"raftkv/src/cluster"
 )
@@ -114,5 +115,49 @@ func TestGatewayHTTP(t *testing.T) {
 	}
 	if !foundApplied {
 		t.Fatalf("GET /debug/shards: no replica has applied a config: %s", string(dsb))
+	}
+}
+
+// TestGatewayFailFast：杀掉集群所有副本后，网关应在有界重试后快速失败（返回 5xx）
+// 而非无限挂起。验证 Clerk 的 GetE 有界重试 + 网关的错误->HTTP 状态码映射在集群
+// 不可达时生效（否则遇到 3-group 再平衡冻结会让 HTTP 请求永久挂死）。
+func TestGatewayFailFast(t *testing.T) {
+	c := cluster.StartCluster(2, 3, 3, 0)
+	defer c.Cleanup()
+	s := NewServer(c)
+	s.Init(2)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	// 先写入一个值，确保配置已应用、集群健康。
+	putReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/kv/fast", strings.NewReader("v"))
+	if pr, err := http.DefaultClient.Do(putReq); err != nil {
+		t.Fatal(err)
+	} else {
+		pr.Body.Close()
+	}
+
+	// 通过 labrpc 网络把每个 KV 副本标记为不可达：调用在 callWithTimeout 内超时，
+	// Clerk 有界重试 5s 后返回 ErrTimeout -> 网关 504，快速失败而非挂起。
+	for g := range c.KVs {
+		for r := range c.KVs[g] {
+			c.Net.Enable(1000+g*100+r, false)
+		}
+	}
+
+	start := time.Now()
+	g, err := http.Get(ts.URL + "/kv/fast")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := g.StatusCode
+	g.Body.Close()
+	elapsed := time.Since(start)
+
+	if code != http.StatusServiceUnavailable && code != http.StatusGatewayTimeout {
+		t.Fatalf("GET after killing cluster = %d, want 503 or 504", code)
+	}
+	if elapsed > 8*time.Second {
+		t.Fatalf("gateway did not fail fast: took %v (want < 8s)", elapsed)
 	}
 }

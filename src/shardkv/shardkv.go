@@ -951,6 +951,116 @@ func (ck *Clerk) PutAppend(key, value, opType string) {
 func (ck *Clerk) Put(key, value string)   { ck.PutAppend(key, value, "Put") }
 func (ck *Clerk) Append(key, value string) { ck.PutAppend(key, value, "Append") }
 
+// clerkBoundedRetries 是有界重试窗口：GetE/PutE/AppendE 在此窗口内重试，超时即
+// 返回最后的错误（而非无限阻塞）。供网关把错误映射成 HTTP 状态码——集群不可达时
+// 网关快速失败（5xx）而非挂起，否则遇到 3-group 再平衡冻结会令 HTTP 请求永久挂死。
+const clerkBoundedRetries = 5 * time.Second
+
+// GetE 是 Get 的有界重试版本：成功返回 (value, OK)；窗口内始终未成功则返回最后的
+// Err（通常是 ErrWrongLeader/ErrTimeout）。ErrWrongGroup 视为"分片已迁走"，会继续
+// 重新查配置重试，不会当成终态错误。
+func (ck *Clerk) GetE(key string) (string, Err) {
+	ck.mu.Lock()
+	ck.seq++
+	seq := ck.seq
+	ck.mu.Unlock()
+	shard := key2shard(key)
+	deadline := time.Now().Add(clerkBoundedRetries)
+	for {
+		if time.Now().After(deadline) {
+			return "", ErrTimeout
+		}
+		ck.refresh()
+		ck.mu.Lock()
+		cfg := ck.config
+		ck.mu.Unlock()
+		if cfg.Num == 0 {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		gid := cfg.Shards[shard]
+		servers := cfg.Groups[gid]
+		if len(servers) == 0 {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		wrongGroup := false
+		for _, srv := range servers {
+			end := ck.make_end(srv)
+			reply := &GetReply{}
+			if ck.callWithTimeout(end, "ShardKV.Get", &GetArgs{Key: key, ClientId: ck.clientId, Seq: seq}, reply) {
+				if reply.Err == OK {
+					return reply.Value, OK
+				}
+				if reply.Err == ErrWrongGroup {
+					wrongGroup = true
+					break
+				}
+			}
+		}
+		if wrongGroup {
+			continue // 分片已迁走，重新查配置
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// PutE 是 Put 的有界重试版本，语义同 GetE。
+func (ck *Clerk) PutE(key, value string) Err {
+	return ck.putAppendE(key, value, "Put")
+}
+
+// AppendE 是 Append 的有界重试版本，语义同 GetE。
+func (ck *Clerk) AppendE(key, value string) Err {
+	return ck.putAppendE(key, value, "Append")
+}
+
+func (ck *Clerk) putAppendE(key, value, opType string) Err {
+	ck.mu.Lock()
+	ck.seq++
+	seq := ck.seq
+	ck.mu.Unlock()
+	shard := key2shard(key)
+	deadline := time.Now().Add(clerkBoundedRetries)
+	for {
+		if time.Now().After(deadline) {
+			return ErrTimeout
+		}
+		ck.refresh()
+		ck.mu.Lock()
+		cfg := ck.config
+		ck.mu.Unlock()
+		if cfg.Num == 0 {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		gid := cfg.Shards[shard]
+		servers := cfg.Groups[gid]
+		if len(servers) == 0 {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		wrongGroup := false
+		for _, srv := range servers {
+			end := ck.make_end(srv)
+			reply := &PutAppendReply{}
+			if ck.callWithTimeout(end, "ShardKV.PutAppend", &PutAppendArgs{Key: key, Value: value, OpType: opType, ClientId: ck.clientId, Seq: seq}, reply) {
+				if reply.Err == OK {
+					return OK
+				}
+				if reply.Err == ErrWrongGroup {
+					wrongGroup = true
+					break
+				}
+			}
+		}
+		if wrongGroup {
+			continue
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // callWithTimeout 在单 RPC 上施加超时，避免副本网络层挂起拖死客户端
 // （交接文档 §6 的开放问题：当前无超时，副本网络层挂起会拖慢客户端）。
 // 超时即视为不可达，交由上层重试循环处理；safe-by-construction：

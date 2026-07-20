@@ -92,9 +92,29 @@ func (s *Server) handleDebugShards(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// statusForErr 把 ShardKV 错误映射成恰当的 HTTP 状态码，使 REST 语义正确：
+// 分片不归本组（含迁移中）-> 409 Conflict；非 leader（瞬态）-> 503；
+// 超时/不可达 -> 504；其它 -> 500。
+func statusForErr(e shardkv.Err) int {
+	switch e {
+	case shardkv.ErrWrongGroup:
+		return http.StatusConflict
+	case shardkv.ErrWrongLeader:
+		return http.StatusServiceUnavailable
+	case shardkv.ErrTimeout:
+		return http.StatusGatewayTimeout
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	v := s.clerk.Get(key)
+	v, err := s.clerk.GetE(key)
+	if err != shardkv.OK {
+		http.Error(w, string(err), statusForErr(err))
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, v)
@@ -103,13 +123,19 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	val, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	s.clerk.Put(key, string(val))
+	if err := s.clerk.PutE(key, string(val)); err != shardkv.OK {
+		http.Error(w, string(err), statusForErr(err))
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	val, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	s.clerk.Append(key, string(val))
+	if err := s.clerk.AppendE(key, string(val)); err != shardkv.OK {
+		http.Error(w, string(err), statusForErr(err))
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
