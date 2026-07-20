@@ -10,6 +10,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 
@@ -45,7 +46,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	// 可观测性：把进程内 ShardKV 的 Metrics 注册表 JSON 序列化暴露出来。
+	// 指标由 cycle 11 的 metrics 包在热路径上以纯原子操作累计，零行为影响。
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	return mux
+}
+
+// handleMetrics 返回 shardkv.Metrics 的 JSON 快照（counters + histograms 分位数）。
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	snap := shardkv.Metrics.Snapshot()
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(snap); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {

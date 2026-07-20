@@ -2,6 +2,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -65,4 +66,25 @@ func TestGatewayHTTP(t *testing.T) {
 		t.Fatalf("GET /healthz = %d, want 200", h.StatusCode)
 	}
 	h.Body.Close()
+
+	// GET /metrics -> 200 + valid JSON containing "counters"
+	m, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.StatusCode != http.StatusOK {
+		t.Fatalf("GET /metrics = %d, want 200", m.StatusCode)
+	}
+	mb, _ := io.ReadAll(m.Body)
+	m.Body.Close()
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(mb, &parsed); err != nil {
+		t.Fatalf("GET /metrics body is not valid JSON: %v (body=%s)", err, string(mb))
+	}
+	if _, ok := parsed["counters"]; !ok {
+		t.Fatalf("GET /metrics JSON missing \"counters\" key: %s", string(mb))
+	}
+	if _, ok := parsed["histograms"]; !ok {
+		t.Fatalf("GET /metrics JSON missing \"histograms\" key: %s", string(mb))
+	}
 }
