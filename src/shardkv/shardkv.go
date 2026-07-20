@@ -159,6 +159,7 @@ type ShardKV struct {
 	incoming   map[int]*ShardData // 收到但尚未生效（配置尚未推进到拥有它）
 	pendingIn  map[int]bool       // 需要接收（失->我）且尚未收到
 	pendingOut map[int]bool       // 需要迁出（我->失）且尚未 GC
+	fetchEpoch map[int]int64      // 每个分片当前拉取任务的版本号：配置推进时自增，使为同一分片服务的旧 fetcher 协程及时退出
 
 	notified map[int64]chan applyResult
 	notifyId int64
@@ -195,6 +196,7 @@ func MakeShardKV(gid int, masters []string, make_end func(string) *raft.ClientEn
 		incoming:     map[int]*ShardData{},
 		pendingIn:    map[int]bool{},
 		pendingOut:   map[int]bool{},
+		fetchEpoch:   map[int]int64{},
 		notified:     map[int64]chan applyResult{},
 		maxraftstate: maxraftstate,
 		killCh:       make(chan struct{}),
@@ -558,7 +560,9 @@ func (kv *ShardKV) applyNewConfig(cfg shardmaster.Config) {
 					// 既未持有也未在 incoming 中缓冲：从上一版配置记录的旧 owner 拉取。
 					kv.pendingIn[s] = true
 					oldServers := append([]string{}, kv.prevConfig.Groups[oldG]...)
-					go kv.fetchShard(s, oldServers)
+					kv.fetchEpoch[s]++
+					epoch := kv.fetchEpoch[s]
+					go kv.fetchShard(s, oldServers, epoch)
 				}
 				// have==true：分片已在上一轮迁移中到位，无需动作。
 			}
@@ -647,19 +651,33 @@ func (kv *ShardKV) mergeShardData(s int, incoming *ShardData) {
 	}
 }
 
-func (kv *ShardKV) fetchShard(s int, oldServers []string) {
+func (kv *ShardKV) fetchShard(s int, oldServers []string, epoch int64) {
 	for !kv.killed() {
 		kv.mu.Lock()
 		if !kv.pendingIn[s] {
 			kv.mu.Unlock()
 			return
 		}
+		// 若有更新的拉取任务（配置已再次推进）取代本协程，立即退出：避免多个
+		// fetcher 为同一分片「抢来源」而彼此干扰——3-group 快速 churn 下这正是
+		// pendingIn 冻结、配置停滞的根因之一（旧 fetcher 用过期来源空转，新
+		// 配置所需的拉取被拖死）。
+		if kv.fetchEpoch[s] != epoch {
+			kv.mu.Unlock()
+			return
+		}
+		// 每次循环重新计算「上一版配置」的 owner：配置推进后 prevConfig 会随之
+		// 更新，本组需要的数据始终由「当前 prevConfig 的 owner」提供。
+		oldG := kv.prevConfig.Shards[s]
 		kv.mu.Unlock()
-		if len(oldServers) == 0 {
-			// 无旧 owner 可拉取（理论上不该发生：oldG!=0 时旧 owner 必然存在），
-			// 退化为等待对端推送（InstallShard），避免空转死循环。
-			time.Sleep(50 * time.Millisecond)
-			continue
+		if oldG == kv.gid || oldG == 0 {
+			// prevConfig 已不含该分片的旧 owner：无需拉取。若当前配置下本组就是
+			// owner，残留的 pendingIn 只会冻结配置推进，清掉让 pollConfig 继续
+			// （分片数据由 incoming 或后续配置装载负责）。否则同样清除以免冻结。
+			kv.mu.Lock()
+			delete(kv.pendingIn, s)
+			kv.mu.Unlock()
+			return
 		}
 		got := false
 		for _, srv := range oldServers {
@@ -672,14 +690,13 @@ func (kv *ShardKV) fetchShard(s int, oldServers []string) {
 			}
 		}
 		if !got {
-			// 自愈回源（3-group 再平衡修复，cycle 27）：记录的旧 owner 已全部不可达
-			// （在 3+ group 快速再平衡下，旧 owner 可能已因更新的配置把该分片 GC 掉），
-			// 不回源则 pendingIn 永久卡死、配置冻结。此时回源 ShardMaster 取该分片
-			// 的「当前」owner 重新拉取。
-			if cur := kv.mck.Query(-1); cur.Num > 0 {
+			// 自愈回源（cycle 27/33）：记录的旧 owner 不可达（快速再平衡下可能已
+			// 因更新的配置把该分片 GC 掉），回源 ShardMaster 取「当前 prevConfig
+			// 版本」的 owner 重新拉取；若当前配置下本组已是 owner，清掉残留
+			// pendingIn 让配置推进（否则 have==false 且 pendingIn 残留会永久卡死）。
+			if cur := kv.mck.Query(kv.prevConfig.Num); cur.Num == kv.prevConfig.Num {
 				curOwner := cur.Shards[s]
 				if curOwner != kv.gid && curOwner != 0 {
-					// 当前 owner 是别的 group：向它拉取（它可能持有该分片数据）。
 					for _, srv := range cur.Groups[curOwner] {
 						end := kv.make_end(srv)
 						reply := &GetShardReply{}
@@ -690,9 +707,6 @@ func (kv *ShardKV) fetchShard(s int, oldServers []string) {
 						}
 					}
 				} else if curOwner == kv.gid {
-					// 当前配置下本组就是 owner：残留的 pendingIn 只是冻结了配置推进，
-					// 清掉标记让 pollConfig 继续推进（更新的 NewConfig 会负责把分片
-					// 真正装载进来）。否则 have==false 且 pendingIn 残留会永久卡死。
 					kv.mu.Lock()
 					delete(kv.pendingIn, s)
 					kv.mu.Unlock()
