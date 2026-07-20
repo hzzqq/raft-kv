@@ -51,6 +51,7 @@ raft-kv/
 - 维护 `NShards = 10` 个分片到 replica group 的映射，并通过 Raft 复制每一次配置变更，保证配置序列的线性一致。
 - **接口**：`Join`（新增 group）/ `Leave`（移除 group）/ `Move`（手工迁移单分片）/ `Query`（读取最新或历史配置）。
 - **确定性再平衡** `rebalance`：对当前所有 `gid` 排序后轮转分配 10 个分片，保证同一份初始配置下结果唯一、可复现。
+- **Move 只改一个分片**：新配置从上一版**继承完整分片映射**，仅覆盖被 `Move` 的目标分片，其余分片归属不变。若从全零数组开始只写一个分片，会让其余 9 个分片被清零成「未分配(gid 0)」，replica group 集体丢失分片所有权而卡死——这是 `Apply` 路径里最隐蔽的一类 bug。
 - **幂等去重**：`Op` 携带 `CkId` + `Seq`，applier 仅当 `Seq > lastSeq[CkId]` 才应用；`Query` 为只读（不加 Raft，直接返回已提交的最新配置）。
 - **消除丢失唤醒竞态**：调用方在 `rf.Start` **之前**就分配并注册 `NotifyId`，applier 据此唤醒等待者，避免"先 Start 拿 index 再注册 channel"造成的丢失唤醒。
 - **关键接线**：测试框架用同一 `server id` 同时承载"配置服务 RPC"与"Raft 内部 RPC"，因此 `ShardMaster.RaftRPC` 负责把 `RequestVote` / `AppendEntries` / `InstallSnapshot` 派发给底层 `rf`；缺少这一转发则集群永远选不出 leader。
@@ -61,6 +62,7 @@ raft-kv/
 - **串行推进配置**：`pollConfig` 仅在「本组无未决迁移」且「最新配置恰好比当前领先 1 步」时才推进 `NewConfig`，避免迁移重叠引发的竞态。
 - **`applyNewConfig` 边界**：新归属分片若上一版未分配（哨兵 `gid == 0`）则直接初始化空 `ShardData`；否则从 `prevConfig` 中记录的旧 owner 名单拉取（本版配置里该 gid 可能已被 `Leave` 移除，故必须取上一版）。
 - **跨迁移客户端幂等**：每个分片的 `ShardData` 独立保存 `LastSeq` / `LastResult`，保证迁移前后客户端命令不重复执行。
+- **迁移期「合并而非覆盖」**：新 owner 在分片正式归属前就可能已直接收到客户端写；此时若旧 owner 的迁移快照到达，必须**合并**（只补充旧 owner 快照里多出来的 key，并取较大的 `LastSeq`/`LastResult`）而非整体覆盖，否则会把新 owner 在迁移窗口内已写入的数据冲掉，造成迁移丢数据。此逻辑同时作用于 `applyInstallShard`（已持有分片时）与 `applyNewConfig`（incoming 缓冲在配置推进时落地）两个入口。
 - **快照压缩**：KV 状态（各分片数据 + 当前/上一版配置 + 迁移中的 incoming/pending）被 gob 压进 Raft 快照；`installSnapshot` 在重启/落后追赶时一次性恢复。
 
 ## 构建与测试

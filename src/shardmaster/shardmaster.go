@@ -171,7 +171,10 @@ func (sm *ShardMaster) applier() {
 // applyOp 把一条配置变更应用到内存中的 configs 历史（已加锁上下文）。
 func (sm *ShardMaster) applyOp(op Op) {
 	last := sm.configs[len(sm.configs)-1]
-	newCfg := Config{Num: last.Num + 1, Groups: copyGroups(last.Groups)}
+	// 从上一版配置继承分片映射：Join/Leave 随后会用 rebalance 整体重写，
+	// 而 Move 只改一个分片、其余必须保留——否则 Move 后的新配置里其余分片
+	// 会被清零成"未分配(0)"，导致所有 replica group 丢失分片所有权而卡死。
+	newCfg := Config{Num: last.Num + 1, Groups: copyGroups(last.Groups), Shards: last.Shards}
 	switch op.Kind {
 	case "Join":
 		for gid, srvs := range op.Servers {
