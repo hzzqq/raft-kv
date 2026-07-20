@@ -36,6 +36,13 @@ jobs:
         # (SnapshotChurn at maxraftstate>0 is heavier; kept out to limit CI time.)
         run: go test -race ./src/shardkv/ -run 'TestSKVBasic|TestSKVMove|TestSKVConcurrent|TestSKVReadIndex' -count=1 -timeout 600s
 
+      - name: Test ShardKV SnapshotChurn with race detector (best-effort)
+        # SnapshotChurn 走 maxraftstate>0 的快照压缩 + churn 路径，是 installSnapshot /
+        # 快照恢复竞态的高价值目标。本地无 gcc 无法跑 -race，故放 CI 侧；标记为
+        # continue-on-error：若暴露竞态则上报但不阻断流水线（避免未知竞态卡死 CI）。
+        continue-on-error: true
+        run: go test -race ./src/shardkv/ -run 'TestSKVSnapshotChurn' -count=1 -timeout 600s
+
   fullstack-smoke:
     runs-on: ubuntu-latest
     steps:
