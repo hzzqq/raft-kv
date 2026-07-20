@@ -160,6 +160,7 @@ type ShardKV struct {
 
 	dead         int32
 	maxraftstate int
+	killCh       chan struct{} // 关闭即通知 applier 退出（raft 不会关 applyCh，否则向其发送会 panic）
 }
 
 type applyResult struct {
@@ -185,6 +186,7 @@ func MakeShardKV(gid int, masters []string, make_end func(string) *raft.ClientEn
 		pendingOut:   map[int]bool{},
 		notified:     map[int64]chan applyResult{},
 		maxraftstate: maxraftstate,
+		killCh:       make(chan struct{}),
 	}
 	// 初始：拉取最新配置（可能已有 group）
 	go kv.pollConfig()
@@ -195,6 +197,13 @@ func MakeShardKV(gid int, masters []string, make_end func(string) *raft.ClientEn
 func (kv *ShardKV) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
+	// 关闭 killCh 唤醒阻塞在 <-applyCh 的 applier，使其随 cleanup 及时退出，
+	// 避免每个实例泄漏一个 goroutine（测试会创建大量实例，累积泄漏会拖慢/拖垮 CI）。
+	select {
+	case <-kv.killCh:
+	default:
+		close(kv.killCh)
+	}
 }
 func (kv *ShardKV) killed() bool { return atomic.LoadInt32(&kv.dead) == 1 }
 
@@ -339,8 +348,17 @@ func (kv *ShardKV) propose(op Op) applyResult {
 
 func (kv *ShardKV) applier() {
 	for !kv.killed() {
-		msg, ok := <-kv.applyCh
-		if !ok {
+		// 经 killCh 退出：raft.Kill() 不会关闭 applyCh（否则向已关闭 channel 发送
+		// 会 panic），故 ShardKV 自带 killCh，避免 cleanup 后 applier 永久阻塞在
+		// <-applyCh 上造成 goroutine 泄漏（每个实例泄漏一个）。
+		var msg raft.ApplyMsg
+		select {
+		case m, ok := <-kv.applyCh:
+			if !ok {
+				return
+			}
+			msg = m
+		case <-kv.killCh:
 			return
 		}
 		if msg.SnapshotValid {

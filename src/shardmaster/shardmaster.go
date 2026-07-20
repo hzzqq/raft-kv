@@ -97,6 +97,7 @@ type ShardMaster struct {
 	lastSeq  map[int64]int64
 	notified map[int64]chan struct{}
 	notifyId int64
+	killCh   chan struct{} // 关闭即通知 applier 退出
 }
 
 // ============================== 构造 ==============================
@@ -108,6 +109,7 @@ func Make(peers []*raft.ClientEnd, me int, persister *raft.Persister) *ShardMast
 		configs:  make([]Config, 1),
 		lastSeq:  make(map[int64]int64),
 		notified: make(map[int64]chan struct{}),
+		killCh:   make(chan struct{}),
 	}
 	sm.configs[0] = Config{Num: 0, Groups: map[int][]string{}}
 	sm.rf = raft.Make(peers, me, persister, sm.applyCh)
@@ -118,6 +120,12 @@ func Make(peers []*raft.ClientEnd, me int, persister *raft.Persister) *ShardMast
 func (sm *ShardMaster) Kill() {
 	atomic.StoreInt32(&sm.dead, 1)
 	sm.rf.Kill()
+	// 关闭 killCh 唤醒阻塞在 <-applyCh 的 applier，避免实例 cleanup 后泄漏 goroutine。
+	select {
+	case <-sm.killCh:
+	default:
+		close(sm.killCh)
+	}
 }
 
 // RaftRPC 把网络层转发的 Raft 内部 RPC（RequestVote/AppendEntries/InstallSnapshot）
@@ -139,8 +147,15 @@ func (sm *ShardMaster) killed() bool { return atomic.LoadInt32(&sm.dead) == 1 }
 
 func (sm *ShardMaster) applier() {
 	for !sm.killed() {
-		msg, ok := <-sm.applyCh
-		if !ok {
+		// 经 killCh 退出：raft 不会关闭 applyCh，故自带 killCh 避免 cleanup 后泄漏。
+		var msg raft.ApplyMsg
+		select {
+		case m, ok := <-sm.applyCh:
+			if !ok {
+				return
+			}
+			msg = m
+		case <-sm.killCh:
 			return
 		}
 		if !msg.CommandValid {
