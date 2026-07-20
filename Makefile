@@ -2,7 +2,7 @@
 GO ?= go
 export PATH := $(PATH):/c/Users/Administrator/.workbuddy/binaries/go/go/bin
 
-.PHONY: build vet test test-race clean
+.PHONY: build vet test test-race clean lint cover test-cover
 
 build:
 	$(GO) build ./...
@@ -31,3 +31,18 @@ demo: build-binaries
 
 clean:
 	$(GO) clean ./...
+
+# 静态检查（需先安装 golangci-lint：https://golangci-lint.run/install/）。
+# 配置见 .golangci.yml。本地无 gcc 不影响 lint（它是纯静态分析）。
+lint:
+	golangci-lint run ./...
+
+# 覆盖率：跑全量测试并生成 cover.out，再打印「总覆盖率」一行概览。
+# 注意：shardkv 的 churn 用例较重（单次 ~100s+），整体跑完需数分钟，已给足 timeout。
+cover:
+	$(GO) test ./... -count=1 -timeout 900s -coverprofile=cover.out -covermode=atomic
+	$(GO) tool cover -func=cover.out | tail -1
+	@echo "HTML 报告：go tool cover -html=cover.out"
+
+# 与 cover 同义，方便记忆。
+test-cover: cover

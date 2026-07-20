@@ -1,0 +1,35 @@
+# golangci-lint 配置（CI 中由 golangci/golangci-lint-action 自动安装）。
+# 策略：默认禁用全部 linter，仅开启「低风险、低误报」的一套，避免对 6.824 起始代码
+# （src/raft、src/kvraft、src/shardmaster 含大量历史遗留写法）产生大量噪声。
+# CI 的 lint job 设为 continue-on-error，报告但不阻断流水线；如需更严格，可在此增删。
+run:
+  timeout: 5m
+  tests: true
+  # 不跳过任何目录：核心与测试都纳入检查。
+
+linters:
+  disable-all: true
+  enable:
+    - govet          # 内置 go vet 的超集（含 printf、影子变量等）
+    - ineffassign    # 无效赋值
+    - unused         # 未使用的常量/变量/函数/字段
+    - misspell       # 拼写错误（含代码注释）
+    - gosimple       # 可简化的写法
+    - staticcheck    # 静态检查（nil 比较、不可达代码等）
+
+linters-settings:
+  misspell:
+    locale: US
+
+issues:
+  # 测试文件放宽 staticcheck/gosimple（测试里常见冗余但可读的写法）。
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - staticcheck
+        - gosimple
+  # 不限制单 linter 的问题数，全部暴露出来。
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  # 重复问题只报一次。
+  exclude-dupes: true

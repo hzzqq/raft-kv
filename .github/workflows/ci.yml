@@ -56,3 +56,47 @@ jobs:
 
       - name: Run demo (cluster -> HTTP gateway -> client full stack)
         run: go run ./src/demo
+
+  # 静态检查：报告但不阻断流水线（continue-on-error）。
+  # 对 6.824 起始代码里的历史写法保持宽容；想更严格就调 .golangci.yml。
+  lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout 5m
+
+  # 覆盖率：跑全量测试，生成 cover.out 并上传为 artifact。
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Test with coverage
+        run: go test ./... -count=1 -timeout 900s -coverprofile=cover.out -covermode=atomic
+
+      - name: Coverage summary
+        run: go tool cover -func=cover.out | tail -1
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: cover.out
