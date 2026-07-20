@@ -1006,3 +1006,46 @@ func (kv *ShardKV) DebugState() string {
 	return fmt.Sprintf("gid=%d leader=%v configNum=%d owned=%v incoming=%v pendingIn=%v pendingOut=%v",
 		kv.gid, isLeader, kv.config.Num, owned, incoming, pendIn, pendOut)
 }
+
+// ShardDebug 是 DebugState 的机器可读版本：返回本副本迁移/配置状态的结构化副本，
+// 供网关 /debug/shards 等观测端点直接 JSON 序列化（无需解析 DebugState 的文本）。
+type ShardDebug struct {
+	GID        int
+	Leader     bool
+	ConfigNum  int
+	Owned      []int
+	Incoming   []int
+	PendingIn  []int
+	PendingOut []int
+}
+
+func (kv *ShardKV) ShardDebug() ShardDebug {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	_, isLeader := kv.rf.GetState()
+	owned := []int{}
+	for s := range kv.shards {
+		owned = append(owned, s)
+	}
+	incoming := []int{}
+	for s := range kv.incoming {
+		incoming = append(incoming, s)
+	}
+	pendIn := []int{}
+	for s := range kv.pendingIn {
+		pendIn = append(pendIn, s)
+	}
+	pendOut := []int{}
+	for s := range kv.pendingOut {
+		pendOut = append(pendOut, s)
+	}
+	return ShardDebug{
+		GID:        kv.gid,
+		Leader:     isLeader,
+		ConfigNum:  kv.config.Num,
+		Owned:      owned,
+		Incoming:   incoming,
+		PendingIn:  pendIn,
+		PendingOut: pendOut,
+	}
+}

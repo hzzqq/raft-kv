@@ -49,6 +49,9 @@ func (s *Server) Handler() http.Handler {
 	// 可观测性：把进程内 ShardKV 的 Metrics 注册表 JSON 序列化暴露出来。
 	// 指标由 cycle 11 的 metrics 包在热路径上以纯原子操作累计，零行为影响。
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	// 诊断：暴露每个 group/副本的「分片归属 + 待接收/待迁出」状态，便于定位
+	// 3-group 再平衡卡死等迁移问题（pendingIn/pendingOut 残留会冻结配置推进）。
+	mux.HandleFunc("GET /debug/shards", s.handleDebugShards)
 	return mux
 }
 
@@ -58,6 +61,33 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(snap); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// ShardDebugView 把集群中某个 group/副本的 ShardDebug 与其坐标打包，便于 JSON 输出。
+type ShardDebugView struct {
+	Group   int
+	Replica int
+	shardkv.ShardDebug
+}
+
+// handleDebugShards 返回集群所有 group 所有副本的分片归属与迁移状态（JSON 数组），
+// 用于诊断 3-group 再平衡卡死等迁移问题（pendingIn/pendingOut 残留会冻结配置推进）。
+func (s *Server) handleDebugShards(w http.ResponseWriter, r *http.Request) {
+	var out []ShardDebugView
+	for g := range s.c.KVs {
+		for r := range s.c.KVs[g] {
+			out = append(out, ShardDebugView{
+				Group:      g,
+				Replica:    r,
+				ShardDebug: s.c.KVs[g][r].ShardDebug(),
+			})
+		}
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(out); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }

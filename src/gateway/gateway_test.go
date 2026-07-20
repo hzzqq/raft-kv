@@ -87,4 +87,32 @@ func TestGatewayHTTP(t *testing.T) {
 	if _, ok := parsed["histograms"]; !ok {
 		t.Fatalf("GET /metrics JSON missing \"histograms\" key: %s", string(mb))
 	}
+
+	// GET /debug/shards -> 200 + valid JSON array of per-replica shard state.
+	ds, err := http.Get(ts.URL + "/debug/shards")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ds.StatusCode != http.StatusOK {
+		t.Fatalf("GET /debug/shards = %d, want 200", ds.StatusCode)
+	}
+	dsb, _ := io.ReadAll(ds.Body)
+	ds.Body.Close()
+	var views []ShardDebugView
+	if err := json.Unmarshal(dsb, &views); err != nil {
+		t.Fatalf("GET /debug/shards body is not valid JSON: %v (body=%s)", err, string(dsb))
+	}
+	if len(views) == 0 {
+		t.Fatalf("GET /debug/shards returned empty array")
+	}
+	// Init 后配置应已应用：至少一个副本 ConfigNum >= 1。
+	foundApplied := false
+	for _, v := range views {
+		if v.ConfigNum >= 1 {
+			foundApplied = true
+		}
+	}
+	if !foundApplied {
+		t.Fatalf("GET /debug/shards: no replica has applied a config: %s", string(dsb))
+	}
 }
