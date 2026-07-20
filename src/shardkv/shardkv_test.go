@@ -22,6 +22,7 @@ type skvConfig struct {
 	make_end  func(string) *raft.ClientEnd
 	groups    [][]*ShardKV
 	groupNames [][]string
+	kvPersist [][]*raft.Persister // 每个副本的持久化器（崩溃恢复测试用：重启时复用同一 persister 恢复状态）
 	nGroups   int
 	nReplicas int
 	nSM       int
@@ -40,6 +41,7 @@ func makeSKVConfig(t testing.TB, nGroups, nReplicas, nSM, maxraftstate int) *skv
 		cache:        map[string]*raft.ClientEnd{},
 		groups:       make([][]*ShardKV, nGroups),
 		groupNames:   make([][]string, nGroups),
+		kvPersist:    make([][]*raft.Persister, nGroups),
 		nGroups:      nGroups,
 		nReplicas:    nReplicas,
 		nSM:          nSM,
@@ -110,11 +112,12 @@ func makeSKVConfig(t testing.TB, nGroups, nReplicas, nSM, maxraftstate int) *skv
 				net.Connect(id*nReplicas+r2, 1000+g*100+r2)
 				peers[r2] = e
 			}
-			applyCh := make(chan raft.ApplyMsg, 4000)
-			p := raft.MakeEmptyPersister()
-			rf := raft.Make(peers, r, p, applyCh)
-			kv := MakeShardKV(g+1, cfg.smNames, make_end, rf, applyCh, maxraftstate)
-			cfg.groups[g] = append(cfg.groups[g], kv)
+		applyCh := make(chan raft.ApplyMsg, 4000)
+		p := raft.MakeEmptyPersister()
+		rf := raft.Make(peers, r, p, applyCh)
+		kv := MakeShardKV(g+1, cfg.smNames, make_end, rf, applyCh, maxraftstate)
+		cfg.groups[g] = append(cfg.groups[g], kv)
+		cfg.kvPersist[g] = append(cfg.kvPersist[g], p)
 
 			net.AddServer(id, func(method string, args, reply interface{}) {
 				switch method {
@@ -154,6 +157,45 @@ func (cfg *skvConfig) joinGroup(g int) {
 func (cfg *skvConfig) leaveGroup(g int) {
 	ck := shardmaster.MakeClerk(cfg.smNames, cfg.make_end)
 	ck.Leave([]int{g + 1})
+}
+
+// restartReplica 杀掉第 g 组第 r 个副本，并用「同一 persister」重建 Raft + ShardKV，
+// 模拟该副本崩溃后从持久化状态恢复（而非凭空新建）。网络 handler 通过 AddServer
+// 重新注册到新实例（旧循环会被关闭）。用于验证崩溃恢复后状态机/日志能从 persister 还原。
+func (cfg *skvConfig) restartReplica(g, r int) {
+	cfg.groups[g][r].Kill()
+	id := 1000 + g*100 + r
+	p := cfg.kvPersist[g][r]
+	peers := make([]*raft.ClientEnd, cfg.nReplicas)
+	for r2 := 0; r2 < cfg.nReplicas; r2++ {
+		e := cfg.net.MakeEnd(id*cfg.nReplicas+r2, id)
+		cfg.net.Connect(id*cfg.nReplicas+r2, 1000+g*cfg.nReplicas+r2)
+		peers[r2] = e
+	}
+	applyCh := make(chan raft.ApplyMsg, 4000)
+	rf := raft.Make(peers, r, p, applyCh)
+	kv := MakeShardKV(g+1, cfg.smNames, cfg.make_end, rf, applyCh, cfg.maxraftstate)
+	cfg.groups[g][r] = kv
+	cfg.net.AddServer(id, func(method string, args, reply interface{}) {
+		switch method {
+		case "RequestVote":
+			rf.RequestVote(args.(*raft.RequestVoteArgs), reply.(*raft.RequestVoteReply))
+		case "AppendEntries":
+			rf.AppendEntries(args.(*raft.AppendEntriesArgs), reply.(*raft.AppendEntriesReply))
+		case "InstallSnapshot":
+			rf.InstallSnapshot(args.(*raft.InstallSnapshotArgs), reply.(*raft.InstallSnapshotReply))
+		case "ShardKV.Get":
+			kv.Get(args.(*GetArgs), reply.(*GetReply))
+		case "ShardKV.PutAppend":
+			kv.PutAppend(args.(*PutAppendArgs), reply.(*PutAppendReply))
+		case "ShardKV.SendShard":
+			kv.SendShard(args.(*SendShardArgs), reply.(*SendShardReply))
+		case "ShardKV.GetShard":
+			kv.GetShard(args.(*GetShardArgs), reply.(*GetShardReply))
+		default:
+			cfg.t.Fatalf("g%d-%d restart unexpected method %s", g, r, method)
+		}
+	})
 }
 func (cfg *skvConfig) moveShard(shard, g int) {
 	ck := shardmaster.MakeClerk(cfg.smNames, cfg.make_end)
@@ -683,6 +725,39 @@ func TestSKVLinearizableAppend(t *testing.T) {
 		if got := ck.Get(key); got != expected.String() {
 			t.Fatalf("final key %s: want %q got %q", key, expected.String(), got)
 		}
+	}
+}
+
+// TestSKVPersistRestart：写入数据后，杀掉并重启（用同一 persister 恢复）整个 group 的
+// 全部副本，模拟「整组崩溃」；验证 Raft 日志 + KV 状态机能从持久化状态还原，重启后
+// 数据仍可读且可继续写入。这是快照压缩（TestSKVSnapshotChurn）之外的另一条恢复路径。
+func TestSKVPersistRestart(t *testing.T) {
+	cfg := makeSKVConfig(t, 1, 3, 3, 0)
+	defer cfg.cleanup()
+	ck := cfg.makeClerk()
+	cfg.joinGroup(0)
+	cfg.waitGroupConfig(0, 0, 1)
+
+	for i := 0; i < 10; i++ {
+		ck.Put(fmt.Sprintf("rk-%d", i), fmt.Sprintf("rv-%d", i))
+	}
+
+	// 杀掉并重启 group0 的全部 3 个副本（同一 persister 恢复）。
+	for r := 0; r < cfg.nReplicas; r++ {
+		cfg.restartReplica(0, r)
+	}
+	// 给 Raft 重新选主 + 状态机恢复留出时间。
+	time.Sleep(3 * time.Second)
+
+	for i := 0; i < 10; i++ {
+		if v := ck.Get(fmt.Sprintf("rk-%d", i)); v != fmt.Sprintf("rv-%d", i) {
+			t.Fatalf("after restart Get(rk-%d)=%q want rv-%d", i, v, i)
+		}
+	}
+	// 重启后仍能继续写入并读回。
+	ck.Put("rk-new", "newval")
+	if v := ck.Get("rk-new"); v != "newval" {
+		t.Fatalf("after restart Put/Get rk-new=%q want newval", v)
 	}
 }
 
