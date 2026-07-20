@@ -431,6 +431,66 @@ func TestSKVGC(t *testing.T) {
 	}
 }
 
+// TestSKVReMigration：把一个分片在两组之间快速来回迁移（A->B->A->B...），
+// 同时单个客户端持续对该分片内的 key 做 Put+Get。重点验证：
+//  1. 分片在两组间漂移时（A->B->A），pendingIn/pendingOut 不会残留为 true，
+//     否则 pollConfig 会永久认为"有未决迁移"而冻结配置，客户端读到空/陈旧分片；
+//  2. 迁移窗口内本组直接接收的客户端写不会被覆盖/丢弃（合并而非覆盖）；
+//  3. 客户端始终能线性一致地读到自己刚写入的值。
+// 最后硬断言两组配置都推进到很高版本号——若配置冻结则此断言失败（而非静默超时）。
+func TestSKVReMigration(t *testing.T) {
+	cfg := makeSKVConfig(t, 2, 3, 3, 0)
+	defer cfg.cleanup()
+	ck := cfg.makeClerk()
+	cfg.joinGroup(0)
+	cfg.joinGroup(1)
+	cfg.waitGroupConfig(1, 0, 2)
+
+	shard := key2shard("drift")
+	const rounds = 40
+
+	// 后台快速来回迁移该分片
+	done := make(chan struct{})
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				return
+			default:
+				cfg.moveShard(shard, i%2)
+				time.Sleep(30 * time.Millisecond)
+			}
+		}
+	}()
+
+	// 单个客户端对该分片内的 key 持续写入并读回，断言线性一致。
+	key := "drift-key"
+	for seq := 0; seq < rounds; seq++ {
+		val := fmt.Sprintf("drift-%d", seq)
+		ck.Put(key, val)
+		if got := ck.Get(key); got != val {
+			close(done)
+			t.Fatalf("re-migration: after Put(%q)=%q, Get=%q want %q", key, val, got, val)
+		}
+	}
+	close(done)
+
+	// 硬断言：两组配置都必须推进到最新（约 2+rounds 个版本），否则视为冻结。
+	const wantNum = 40
+	cfg.waitGroupConfig(0, 0, wantNum)
+	cfg.waitGroupConfig(1, 0, wantNum)
+	if n := cfg.groupConfigNum(0, 0); n < wantNum {
+		t.Fatalf("group0 config froze at %d (want >=%d): %s", n, wantNum, cfg.groups[0][0].DebugState())
+	}
+	if n := cfg.groupConfigNum(1, 0); n < wantNum {
+		t.Fatalf("group1 config froze at %d (want >=%d): %s", n, wantNum, cfg.groups[1][0].DebugState())
+	}
+	// 最终值仍可读且正确
+	if v := ck.Get(key); v != fmt.Sprintf("drift-%d", rounds-1) {
+		t.Fatalf("after re-migration Get(%q)=%q want %q", key, v, fmt.Sprintf("drift-%d", rounds-1))
+	}
+}
+
 // TestSKVSnapshotChurn：在开启日志压缩（maxraftstate>0）的前提下，跑与
 // TestSKVConcurrent 相同的"并发客户端 + 后台配置 churn"工作负载。目的是真正
 // 命中 ShardKV 的快照路径——installSnapshot 整体重写 shards/config/迁移状态，
