@@ -884,6 +884,14 @@ func nrand() int64 {
 	return rand.Int63()
 }
 
+// ConfigNum 返回本副本当前生效的配置版本号（供 cluster 包等外部调用者读取，
+// 避免暴露未导出的 config 字段）。
+func (kv *ShardKV) ConfigNum() int {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	return kv.config.Num
+}
+
 // DebugState 返回本副本的迁移/配置状态，供测试 watchdog 诊断卡死原因。
 func (kv *ShardKV) DebugState() string {
 	kv.mu.Lock()
