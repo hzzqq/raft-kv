@@ -3,6 +3,7 @@ package shardkv
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -609,6 +610,79 @@ func TestSKVReadIndex(t *testing.T) {
 	close(errCh)
 	for err := range errCh {
 		t.Fatalf(err)
+	}
+}
+
+// TestSKVLinearizableAppend：多个客户端对各自独占的 key 持续 Append（顺序敏感），
+// 后台分片在两组间 churn。每个客户端维护「迄今为止本地追加序列的完整拼接」，每次
+// Append 后立即 Get 并断言返回值 == 该拼接——因为 Append 是读-改-写且依赖顺序，
+// 任何一次迁移「丢更新 / 乱序 / 覆盖」都会在「最新追加是否按序就位」上暴露。
+// 这是对 Put-Get 类测试覆盖不到的「Append 丢失/乱序」迁移缺陷的更强护栏。
+func TestSKVLinearizableAppend(t *testing.T) {
+	const nGroups = 2
+	cfg := makeSKVConfig(t, nGroups, 3, 3, 0)
+	defer cfg.cleanup()
+	ck := cfg.makeClerk()
+	cfg.joinGroup(0)
+	cfg.joinGroup(1)
+	cfg.waitGroupConfig(1, 0, 2)
+
+	const nClerks = 3
+	const rounds = 40
+
+	// 后台 churn：分片在两组间漂移，制造迁移 + Append 并发。
+	done := make(chan struct{})
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				return
+			default:
+				cfg.moveShard((i*5)%NShards, i%2)
+				time.Sleep(25 * time.Millisecond)
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	errCh := make(chan string, nClerks)
+	for c := 0; c < nClerks; c++ {
+		wg.Add(1)
+		go func(c int) {
+			defer wg.Done()
+			// 每个 clerk 独占一个 key，避免跨 key 的 seq 串扰（见 TestSKVConcurrent 注释）。
+			localCk := cfg.makeClerk()
+			key := fmt.Sprintf("apc-%d", c)
+			var expected strings.Builder
+			for round := 0; round < rounds; round++ {
+				val := fmt.Sprintf("c%d-r%d|", c, round)
+				localCk.Append(key, val)
+				got := localCk.Get(key)
+				expected.WriteString(val)
+				if got != expected.String() {
+					errCh <- fmt.Sprintf("clerk%d key %s: after append want %q got %q", c, key, expected.String(), got)
+					return
+				}
+			}
+		}(c)
+	}
+	wg.Wait()
+	close(done)
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf(err)
+	}
+
+	// 最终校验：每客户端 key 应等于完整拼接序列。
+	for c := 0; c < nClerks; c++ {
+		key := fmt.Sprintf("apc-%d", c)
+		var expected strings.Builder
+		for round := 0; round < rounds; round++ {
+			expected.WriteString(fmt.Sprintf("c%d-r%d|", c, round))
+		}
+		if got := ck.Get(key); got != expected.String() {
+			t.Fatalf("final key %s: want %q got %q", key, expected.String(), got)
+		}
 	}
 }
 
