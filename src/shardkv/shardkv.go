@@ -160,7 +160,8 @@ type ShardKV struct {
 	pendingIn  map[int]bool       // 需要接收（失->我）且尚未收到
 	pendingOut map[int]bool       // 需要迁出（我->失）且尚未 GC
 	fetchEpoch map[int]int64      // 每个分片当前拉取任务的版本号：配置推进时自增，使为同一分片服务的旧 fetcher 协程及时退出
-	pendingSince time.Time       // 卡死看门狗：hasPending 首次为 true 的时间戳（零值=当前无未决迁移）
+	pendingInSince  map[int]time.Time // 卡死看门狗：每个 pendingIn 分片首次进入未决态的时间戳（用于 /debug/shards 暴露卡滞时长 + 驱动 rekick）
+	pendingOutSince map[int]time.Time // 同上，针对 pendingOut
 
 	notified map[int64]chan applyResult
 	notifyId int64
@@ -197,6 +198,8 @@ func MakeShardKV(gid int, masters []string, make_end func(string) *raft.ClientEn
 		incoming:     map[int]*ShardData{},
 		pendingIn:    map[int]bool{},
 		pendingOut:   map[int]bool{},
+		pendingInSince:  map[int]time.Time{},
+		pendingOutSince: map[int]time.Time{},
 		fetchEpoch:   map[int]int64{},
 		notified:     map[int64]chan applyResult{},
 		maxraftstate: maxraftstate,
@@ -235,17 +238,60 @@ func (kv *ShardKV) pollConfig() {
 		now := time.Now()
 		if !hasPending {
 			// 无未决迁移：重置看门狗计时，并允许推进到下一配置。
-			kv.pendingSince = time.Time{}
-		} else if kv.pendingSince.IsZero() {
-			// 刚进入未决状态：记录起点。
-			kv.pendingSince = now
-		} else if now.Sub(kv.pendingSince) > 3*time.Second {
-			// 卡死看门狗：迁移长时间（>3s）未完成，pendingIn/pendingOut 残留会冻结
-			// 配置推进、令客户端读挂死（3+ group 快速 churn / ReMigration 漂移的根因）。
-			// 对每个卡滞分片以最新 ShardMaster 配置重算 owner 并重拉取/重推送，bump
-			// fetchEpoch 让陈旧 fetcher/sender 自退。仅卡死时触发，正常快路径零开销。
-			kv.rekickStuckMigrations(latest)
-			kv.pendingSince = now // 限频：每 3s 最多重踢一次
+			kv.pendingInSince = map[int]time.Time{}
+			kv.pendingOutSince = map[int]time.Time{}
+		} else {
+			// 维护每个 pending 分片首次进入未决态的时间戳，并清理已不再 pending 的记录。
+			for s := range kv.pendingIn {
+				if _, ok := kv.pendingInSince[s]; !ok {
+					kv.pendingInSince[s] = now
+				}
+			}
+			for s := range kv.pendingOut {
+				if _, ok := kv.pendingOutSince[s]; !ok {
+					kv.pendingOutSince[s] = now
+				}
+			}
+			for s := range kv.pendingInSince {
+				if _, ok := kv.pendingIn[s]; !ok {
+					delete(kv.pendingInSince, s)
+				}
+			}
+			for s := range kv.pendingOutSince {
+				if _, ok := kv.pendingOut[s]; !ok {
+					delete(kv.pendingOutSince, s)
+				}
+			}
+			// 卡死检测：任一 pending 分片卡 >3s 即触发看门狗。
+			stalled := false
+			for s := range kv.pendingIn {
+				if t, ok := kv.pendingInSince[s]; ok && now.Sub(t) > 3*time.Second {
+					stalled = true
+					break
+				}
+			}
+			if !stalled {
+				for s := range kv.pendingOut {
+					if t, ok := kv.pendingOutSince[s]; ok && now.Sub(t) > 3*time.Second {
+						stalled = true
+						break
+					}
+				}
+			}
+			if stalled {
+				// 卡死看门狗：迁移长时间（>3s）未完成，pendingIn/pendingOut 残留会冻结
+				// 配置推进、令客户端读挂死（3+ group 快速 churn / ReMigration 漂移的根因）。
+				// 对每个卡滞分片以最新 ShardMaster 配置重算 owner 并重拉取/重推送，bump
+				// fetchEpoch 让陈旧 fetcher/sender 自退。仅卡死时触发，正常快路径零开销。
+				kv.rekickStuckMigrations(latest)
+				// 重置计时，限频：每 3s 最多重踢一次。
+				for s := range kv.pendingInSince {
+					kv.pendingInSince[s] = now
+				}
+				for s := range kv.pendingOutSince {
+					kv.pendingOutSince[s] = now
+				}
+			}
 		}
 		kv.mu.Unlock()
 		if latest.Num <= cur {
@@ -274,6 +320,7 @@ func (kv *ShardKV) rekickStuckMigrations(latest shardmaster.Config) {
 			// 最新配置下本组已是 owner（或无主）：数据由 incoming / 后续配置装载负责，
 			// 残留 pendingIn 只冻结配置推进，清掉让 pollConfig 继续。
 			delete(kv.pendingIn, s)
+			delete(kv.pendingInSince, s)
 			continue
 		}
 		kv.fetchEpoch[s]++
@@ -285,6 +332,7 @@ func (kv *ShardKV) rekickStuckMigrations(latest shardmaster.Config) {
 		newG := kv.config.Shards[s]
 		if newG == kv.gid || newG == 0 {
 			delete(kv.pendingOut, s)
+			delete(kv.pendingOutSince, s)
 			continue
 		}
 		go kv.sendShard(s, newG)
@@ -1188,6 +1236,11 @@ type ShardDebug struct {
 	Incoming   []int
 	PendingIn  []int
 	PendingOut []int
+	// 卡滞观测：每个 pending 分片首次进入未决态的 RFC3339 时间戳，以及当前最大卡滞秒数。
+	// 复现 3-group / ReMigration 冻结时，curl /debug/shards 即可看到哪些分片卡了多久。
+	PendingInSince  map[int]string `json:",omitempty"`
+	PendingOutSince map[int]string `json:",omitempty"`
+	StallSeconds    float64        `json:",omitempty"`
 }
 
 func (kv *ShardKV) ShardDebug() ShardDebug {
@@ -1210,13 +1263,31 @@ func (kv *ShardKV) ShardDebug() ShardDebug {
 	for s := range kv.pendingOut {
 		pendOut = append(pendOut, s)
 	}
+	inSince := map[int]string{}
+	var maxStall float64
+	for s, t := range kv.pendingInSince {
+		inSince[s] = t.Format(time.RFC3339)
+		if d := time.Since(t).Seconds(); d > maxStall {
+			maxStall = d
+		}
+	}
+	outSince := map[int]string{}
+	for s, t := range kv.pendingOutSince {
+		outSince[s] = t.Format(time.RFC3339)
+		if d := time.Since(t).Seconds(); d > maxStall {
+			maxStall = d
+		}
+	}
 	return ShardDebug{
-		GID:        kv.gid,
-		Leader:     isLeader,
-		ConfigNum:  kv.config.Num,
-		Owned:      owned,
-		Incoming:   incoming,
-		PendingIn:  pendIn,
-		PendingOut: pendOut,
+		GID:             kv.gid,
+		Leader:          isLeader,
+		ConfigNum:       kv.config.Num,
+		Owned:           owned,
+		Incoming:        incoming,
+		PendingIn:       pendIn,
+		PendingOut:      pendOut,
+		PendingInSince:  inSince,
+		PendingOutSince: outSince,
+		StallSeconds:    maxStall,
 	}
 }
