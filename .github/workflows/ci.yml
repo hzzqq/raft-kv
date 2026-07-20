@@ -23,5 +23,14 @@ jobs:
       - name: Test
         run: go test ./... -count=1 -timeout 600s
 
-      - name: Test with race detector
-        run: go test -race ./src/kvraft/ -count=1 -timeout 600s
+      - name: Test with race detector (kvraft + shardmaster)
+        run: go test -race ./src/kvraft/ ./src/shardmaster/ -count=1 -timeout 600s
+
+      - name: Test ShardKV with race detector (basic + move)
+        # GitHub runners have gcc, so -race runs here. The local managed Go env has
+        # no gcc, so shardkv's concurrency is instead guarded by the high-frequency
+        # churn-loop tests (TestSKVConcurrent/SnapshotChurn/ReMigration/ConfigProgress).
+        # Only the low-concurrency basic/move paths are raced here to keep CI fast and
+        # stable while still exercising the migration goroutines (sendShard/fetchShard)
+        # under the race detector.
+        run: go test -race ./src/shardkv/ -run 'TestSKVBasic|TestSKVMove' -count=1 -timeout 600s
