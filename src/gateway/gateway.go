@@ -51,7 +51,15 @@ type Server struct {
 	accessMu  sync.Mutex
 	accessLog []accessEntry
 	accessCap int
+
+	// 单请求最大处理时长（I16）。后端 Raft 操作在迁移抖动/leader 切换下可能偶发
+	// 长时间不返回；超出该上限即由 http.TimeoutHandler 返回 503，避免 HTTP 连接
+	// 无限挂起（显式兜底，与 Clerk 自身的有界重试互补）。默认 30s，零正常影响。
+	requestTimeout time.Duration
 }
+
+// SetRequestTimeout 仅供单测覆盖默认单请求超时（生产不可用）。
+func (s *Server) SetRequestTimeout(d time.Duration) { s.requestTimeout = d }
 
 // accessEntry 是 /debug/accesslog 中单条请求记录。
 type accessEntry struct {
@@ -91,7 +99,7 @@ func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 
 // NewServer 用给定集群构造网关（不立即加入 group，需先 Init）。
 func NewServer(c *cluster.Cluster) *Server {
-	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256}
+	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, requestTimeout: 30 * time.Second}
 }
 
 // Init 依次加入 nGroups 个 replica group，使分片可写。
@@ -128,7 +136,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /debug/groups", s.wrap(s.handleDebugGroups))
 	// 进程内访问日志（I15）：最近 N 条 HTTP 请求的方法/路径/状态码/延迟，便于审计排障。
 	mux.HandleFunc("GET /debug/accesslog", s.wrap(s.handleDebugAccessLog))
-	return mux
+	// I16：以 http.TimeoutHandler 兜底单请求最大时长，避免后端 Raft 操作在迁移抖动
+	// 下长时间不返回时 HTTP 连接无限挂起。超时返回 503；内层 handler 仍在后台跑完
+	// （其写入被丢弃），不会破坏状态机，与 Clerk 有界重试互补。requestTimeout 默认 30s。
+	return http.TimeoutHandler(mux, s.requestTimeout, "request timed out")
 }
 
 // wrap 给每个 handler 套上并发限制（I12）与在途请求计数（I13 优雅关闭用）。

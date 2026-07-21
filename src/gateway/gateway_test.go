@@ -248,6 +248,35 @@ func TestGatewayAccessLog(t *testing.T) {
 	}
 }
 
+// TestGatewayRequestTimeout：验证 I16 的单请求超时兜底——后端操作（经 testDelay 人为
+// 拉长）超过 requestTimeout 时，网关立即返回 503 而非让 HTTP 连接无限挂起。
+func TestGatewayRequestTimeout(t *testing.T) {
+	c := cluster.StartCluster(2, 3, 3, 0)
+	defer c.Cleanup()
+	s := NewServer(c)
+	s.Init(2)
+	s.SetRequestTimeout(200 * time.Millisecond)
+	s.SetTestDelay(2 * time.Second) // 强制 handler 远超超时上限
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	start := time.Now()
+	resp, err := http.Get(ts.URL + "/kv/timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := resp.StatusCode
+	resp.Body.Close()
+	elapsed := time.Since(start)
+
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("GET exceeding timeout = %d, want 503", code)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("gateway did not time out promptly: took %v (want < 2s)", elapsed)
+	}
+}
+
 // TestGatewayObservability：验证新增的 /status（集群健康 JSON）与 /debug/migrate
 // （迁移进度文本）端点可用且返回预期结构。
 func TestGatewayObservability(t *testing.T) {
