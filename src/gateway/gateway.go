@@ -67,13 +67,16 @@ type Server struct {
 
 	// I49：每客户端令牌桶限流（在全局并发 429 之上更细粒度保护）。按客户端标识
 	// （X-Client-ID 或 RemoteAddr IP）限流，超限返回 429 + Retry-After。
-	limitMu       sync.Mutex
+	limitMu        sync.Mutex
 	clientLimiters map[string]*tokenBucket
 	clientRate     float64 // 每客户端每秒补充令牌数（<=0 表示关闭限流）
 	clientBurst    float64 // 每客户端桶容量（突发上限）
 
 	// I50：CORS 配置（可空，空表示允许所有源 "*"）。供浏览器前端直连网关。
 	corsOrigins []string
+
+	// I52：当前生效配置快照（由 Apply 写入），供 /debug/config 展示排障。
+	curCfg GatewayConfig
 }
 
 // tokenBucket 是单客户端的令牌桶：按时间补充令牌，桶满截断；取用时需至少 1 枚令牌。
@@ -186,12 +189,12 @@ func (s *Server) allowClient(r *http.Request) bool {
 
 // accessEntry 是 /debug/accesslog 中单条请求记录。
 type accessEntry struct {
-	TS         time.Time `json:"ts"`
-	Method     string    `json:"method"`
-	Path       string    `json:"path"`
-	Status     int       `json:"status"`
-	LatencyMs  float64   `json:"latency_ms"`
-	RequestID  string    `json:"request_id,omitempty"`
+	TS        time.Time `json:"ts"`
+	Method    string    `json:"method"`
+	Path      string    `json:"path"`
+	Status    int       `json:"status"`
+	LatencyMs float64   `json:"latency_ms"`
+	RequestID string    `json:"request_id,omitempty"`
 }
 
 // genRequestID 生成一个随机请求 ID（16 位 hex）。用于 X-Request-ID 透传，便于跨服务
@@ -335,6 +338,8 @@ func (s *Server) Handler() http.Handler {
 	// 分级结构化日志（I47）：最近 N 条带级别（debug/info/warn/error）的日志，
 	// 可按 ?level= 过滤最低级别、?limit= 控制条数，统一排障入口。
 	mux.HandleFunc("GET /debug/log", s.wrap(s.handleDebugLog))
+	// 当前生效配置（I52）：返回网关实际生效的配置快照（脱敏），便于确认配置加载结果。
+	mux.HandleFunc("GET /debug/config", s.wrap(s.handleDebugConfig))
 	// I16：以 http.TimeoutHandler 兜底单请求最大时长，避免后端 Raft 操作在迁移抖动
 	// 下长时间不返回时 HTTP 连接无限挂起。超时返回 503；内层 handler 仍在后台跑完
 	// （其写入被丢弃），不会破坏状态机，与 Clerk 有界重试互补。requestTimeout 默认 30s。
@@ -405,12 +410,12 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 func (s *Server) recordAccess(method, path string, status int, d time.Duration, reqID string) {
 	s.accessMu.Lock()
 	e := accessEntry{
-		TS:         time.Now(),
-		Method:     method,
-		Path:       path,
-		Status:     status,
-		LatencyMs:  float64(d.Microseconds()) / 1000.0,
-		RequestID:  reqID,
+		TS:        time.Now(),
+		Method:    method,
+		Path:      path,
+		Status:    status,
+		LatencyMs: float64(d.Microseconds()) / 1000.0,
+		RequestID: reqID,
 	}
 	s.accessLog = append(s.accessLog, e)
 	if len(s.accessLog) > s.accessCap {
@@ -501,6 +506,35 @@ func parseLogLevel(s string) (logLevel, bool) {
 	}
 }
 
+// ConfigSnapshot 是 /debug/config 的响应体：当前生效的网关配置（脱敏，无敏感字段）。
+type ConfigSnapshot struct {
+	ListenAddr     string   `json:"listen_addr"`
+	RequestTimeout int      `json:"request_timeout_sec"`
+	MaxConcurrent  int      `json:"max_concurrent"`
+	ClientRate     float64  `json:"client_rate"`
+	ClientBurst    int      `json:"client_burst"`
+	CORSOrigins    []string `json:"cors_origins"`
+}
+
+// handleDebugConfig 返回网关当前生效配置快照（I52），便于排障确认配置加载结果。
+// 数据来自 Apply 写入的 curCfg，与运行时实际生效值一致。
+func (s *Server) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
+	c := s.curCfg
+	snap := ConfigSnapshot{
+		ListenAddr:     c.ListenAddr,
+		RequestTimeout: c.RequestTimeout,
+		MaxConcurrent:  c.MaxConcurrent,
+		ClientRate:     c.ClientRate,
+		ClientBurst:    c.ClientBurst,
+		CORSOrigins:    c.CORSOrigins,
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(snap); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
 // SetHTTPServer 注册底层 *http.Server，使 Shutdown 能一并关闭监听（可选）。
 func (s *Server) SetHTTPServer(srv *http.Server) {
 	s.mu.Lock()
@@ -545,7 +579,7 @@ type GroupStatus struct {
 // ClusterStatus 是 /status 的聚合响应。
 type ClusterStatus struct {
 	Groups       []GroupStatus `json:"groups"`
-	Healthy      bool          `json:"healthy"`       // 所有 group 均无卡滞 = true
+	Healthy      bool          `json:"healthy"`        // 所有 group 均无卡滞 = true
 	MaxConfigNum int           `json:"max_config_num"` // 集群最新已应用 config 号
 }
 
@@ -654,8 +688,8 @@ func (s *Server) handleDebugMigrate(w http.ResponseWriter, r *http.Request) {
 
 // ConfigView 是 /debug/configs 中单段配置的视图。
 type ConfigView struct {
-	Num    int                `json:"num"`
-	Groups map[int][]string   `json:"groups"`
+	Num    int                      `json:"num"`
+	Groups map[int][]string         `json:"groups"`
 	Shards [shardmaster.NShards]int `json:"shards"`
 }
 
@@ -685,6 +719,7 @@ func (s *Server) handleDebugConfigs(w http.ResponseWriter, r *http.Request) {
 //   - Accept 含 text/plain 或 prometheus → Prometheus 文本 exposition 格式
 //     （便于被 Prometheus / scrape 客户端采集）；
 //   - 其它（含 application/json 或缺省）→ JSON 快照（counters + histograms 分位数）。
+//
 // 两种格式数据源相同，差异仅在序列化方式，零行为影响。
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	accept := r.Header.Get("Accept")

@@ -126,6 +126,7 @@ func (c GatewayConfig) Apply(s *Server) {
 		s.SetClientRateLimit(c.ClientRate, c.ClientBurst)
 	}
 	s.SetCORS(c.CORSOrigins)
+	s.curCfg = c
 }
 
 // RequestTimeout 暴露当前单请求超时配置，供测试/排障读取。

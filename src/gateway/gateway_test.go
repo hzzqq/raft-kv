@@ -440,7 +440,7 @@ func TestGatewayConfigs(t *testing.T) {
 	resp.Body.Close()
 
 	var out struct {
-		LatestNum int         `json:"latest_num"`
+		LatestNum int          `json:"latest_num"`
 		Configs   []ConfigView `json:"configs"`
 	}
 	if err := json.Unmarshal(b, &out); err != nil {
@@ -936,5 +936,48 @@ unknown_key: ignored
 	}
 	if len(s.corsOrigins) != 2 {
 		t.Fatalf("corsOrigins after Apply = %v, want 2 entries", s.corsOrigins)
+	}
+}
+
+// TestGatewayDebugConfig：验证 /debug/config 返回当前生效配置快照（I52）。cluster-free
+// 直接构造 Server + Apply 配置，再用 httptest 调用 handleDebugConfig。
+func TestGatewayDebugConfig(t *testing.T) {
+	s := &Server{
+		sem:            make(chan struct{}, maxConcurrent),
+		accessCap:      256,
+		logCap:         256,
+		requestTimeout: 30 * time.Second,
+	}
+	cfg := GatewayConfig{
+		ListenAddr:     ":9090",
+		RequestTimeout: 15,
+		MaxConcurrent:  32,
+		ClientRate:     50,
+		ClientBurst:    10,
+		CORSOrigins:    []string{"https://a.com"},
+	}
+	cfg.Apply(s)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleDebugConfig(w, r)
+	}))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/debug/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var snap ConfigSnapshot
+	if err := json.Unmarshal(b, &snap); err != nil {
+		t.Fatalf("body not valid JSON: %v (body=%s)", err, string(b))
+	}
+	if snap.ListenAddr != ":9090" || snap.RequestTimeout != 15 || snap.MaxConcurrent != 32 ||
+		snap.ClientRate != 50 || snap.ClientBurst != 10 || len(snap.CORSOrigins) != 1 || snap.CORSOrigins[0] != "https://a.com" {
+		t.Fatalf("config snapshot mismatch: %+v", snap)
 	}
 }
