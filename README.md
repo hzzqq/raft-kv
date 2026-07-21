@@ -116,6 +116,7 @@ curl http://localhost:8080/metrics           # -> JSON 指标快照
 - `waitApplied` 用带缓冲的 `notify` channel + 1s 超时，防止 leader 切换导致结果错位。
 - `applier` 对 leader 的 no-op（nil 命令）直接跳过，不更新状态机。
 - **客户端会话 GC（本轮新增）**：以 `sessions[clientId] → clientSession{LastSeq, LastResult, lastAccess}` 取代旧的 `lastSeq/lastResult` 两个扁平 map，后台 `gc()` 按 TTL（默认 1h）清理空闲会话，避免长期运行内存无限增长；`Kill()` 经 `sync.Once` 关闭 `killCh` 停用 GC，配套 `TestClientSessionGC` 回归。
+- **Get ReadIndex 快路径（本轮新增）**：leader 持 `HasLeaderLease()` 时，以 Raft `ReadIndex()` 返回的 `commitIndex` 为一致性点、待状态机 `apply` 到该索引后直接本地读（省一次日志追加，纯读路径低延迟），并以 `read_leases` 计数器记录快读次数；失去领导权 / 无 lease / 超时则回退常规 `propose` 路径（同样线性一致）。配套 `TestKVReadLease` 断言稳定集群下连续读命中快路径。
 
 ### shardmaster（配置服务）—— Lab 4 控制器
 - 维护 `NShards = 10` 个分片到 replica group 的映射，并通过 Raft 复制每一次配置变更，保证配置序列的线性一致。
@@ -148,10 +149,15 @@ curl http://localhost:8080/metrics           # -> JSON 指标快照
 - **`demo`**（`src/demo`）：一次性演示「进程内 KV 路径（Put/Get/Append + 跨组迁移）」
   与「全栈 HTTP 路径（经真实 HTTP 压网关 + 拉 `/metrics`）」，证明 `cluster → HTTP → client` 全栈打通。
 - **`gateway`**（`src/gateway`）：自带进程内集群的 HTTP REST 网关，`GET/PUT/POST-append /kv/{key}`、
-  `GET /healthz`、`GET /metrics`（JSON 序列化 `shardkv.Metrics` 快照）、`GET /debug/shards`（逐副本暴露分片归属 + 迁移状态 `pendingIn/pendingOut/incoming` + **卡滞时间戳 `PendingInSince/PendingOutSince` 与 `StallSeconds`**，用于诊断 3 组再平衡冻结）。
+  `GET /healthz`、`GET /metrics`（按 `Accept` 协商：`text/plain` 或 `application/openmetrics-text` → Prometheus 文本格式；其余 → JSON 序列化 `shardkv.Metrics` 快照）、`GET /debug/shards`（逐副本暴露分片归属 + 迁移状态 `pendingIn/pendingOut/incoming` + **卡滞时间戳 `PendingInSince/PendingOutSince` 与 `StallSeconds`**，用于诊断 3 组再平衡冻结）。
   另提供 **`GET /status`**（集群健康总览 JSON：`ClusterStatus`，每 group leader/config/持有/待收/待迁/孤儿中转计数 + 卡滞秒数 + 整体 `healthy` 标志，卡滞 >2s 即判冻结，供监控/告警轮询）与 **`GET /debug/migrate`**（纯文本迁移进度，供 CLI `start.sh migrate` 直接展示）。
   集群冻结时通过「1s RPC 超时 + 5s 有界重试」**快速失败**并返回正确 REST 语义（`ErrWrongGroup→409` / `ErrWrongLeader→503` / `ErrTimeout→504`），而非挂死。`Handler()` 可单测；`main.go` 支持 `SIGINT`/`SIGTERM` 优雅退出。
   另提供 **并发限流**（默认 64 并发，`sem` 信号量，超量返回 `429 Too Many Requests`，避免网关在迁移抖动期被压垮）；**优雅退出 `Shutdown(ctx)`**（`sync.WaitGroup` 等待在途请求结束、关闭 `applyCh` 防泄漏，供 `main.go` 的 `SIGINT`/`SIGTERM` 调用）；新增 **`GET /debug/groups`** 暴露各 replica group 的 `gid` / 副本数 / leader / 当前 config / 持有分片数，便于排障，配套 `TestGatewayConcurrencyLimit` / `TestGatewayGroups` 回归。
+- **`gateway` 可观测性与稳健性增强（本轮新增）**：
+  - **`GET /debug/accesslog?limit=N`**：以环形缓冲（默认 256 条）暴露最近访问记录（方法 / 路径 / 状态码 / 延迟 ms），便于线上排查异常请求；配套 `TestGatewayAccessLog`。
+  - **`GET /readyz`**：k8s 就绪探针——要求每个 replica group 都有「持 leader 租约（`HasLeaderLease()`）」的 leader 且无迁移卡滞才返回 `200`，否则 `503`；与 `GET /healthz`（liveness，进程存活即 `200`）明确区分，避免把「自认 leader 但已分区失联、无法提交」的节点误判为就绪。配套 `TestGatewayReadyz`。`ShardDebug` 新增 `Lease` 字段以支撑该判定。
+  - **`http.TimeoutHandler` 请求超时兜底**：`Handler()` 以 `http.TimeoutHandler(mux, 30s, "request timed out")` 包裹，单请求超期返回 `503`，防止个别慢请求拖垮网关；`SetRequestTimeout` 可配置。配套 `TestGatewayRequestTimeout`。
+  - `/metrics` 的 **Prometheus 文本格式**：`metrics.Registry.WritePrometheus` 按字母序稳定输出 counter/gauge 直接序列化、histogram 输出 `_count`/`_sum`/`_p50`/`_p95`/`_p99` 分位，`/metrics` 按 `Accept` 头协商（Prometheus → 文本，其余 → JSON）。配套 `TestGatewayMetricsPrometheus`。
 - **`kvcli`**（`src/kvcli`）：HTTP 客户端 + 压测工具，`get`/`put`/`append` 子命令外，
   另有 `bench [op] [ops] [workers]` 报告端到端吞吐与 `p50/p95/p99` 延迟。
 - **`metrics`**（`src/metrics`）：零依赖并发安全指标库（Counter + **Gauge（瞬时值，如当前 config 号 / apply 滞后，原子位模式存储 float64）** + 有界环形 Histogram + Registry），
@@ -207,6 +213,8 @@ export GO111MODULE=on
 - Labs 2–3、`shardmaster`、`shardkv` 均已在本地 Go 1.22.5 下通过 `go vet` + `go test`（含 `-count=1`）验证，并纳入 GitHub Actions CI（`vet` + `test` + `race` + 非阻断 `lint` + `coverage` 上传）。
 - 本机交互 shell 默认无 `go`，但仓库随附的托管 Go 工具链（`C:/Users/Administrator/.workbuddy/binaries/go/go/bin/go.exe`）可用于本地验证；该环境**无 gcc**，故 `go test -race` 仅能在 CI（GitHub ubuntu + gcc）侧运行，`shardkv` 的并发/冻结类回归以「高频 churn + 多轮循环」测试替代 race detector 来暴露。
 - 自动化纪律：每次改动本地提交、验收不过绝不提交；**前多轮自主迭代（cycle 1–28、cycle 29–38、cycle 39–48、cycle 49–57、cycle 58–67）已按用户授权执行 `git push origin master`（仅普通推送、不 --force、不 `rm -rf`）**（见 `docs/lab4-shardkv-design.md` 与 `.workbuddy/self-driving/state.json`）。**本轮迭代（cycle 68–87，「照刚刚的迭代20次」：raft leader lease + ShardKV ReadIndex 快读复活 / 配置号幂等 `installedCfgNum` + ReMigration 冻结修复 / shardmaster 最小搬动 + 输入校验 `ErrInvalid` / 网关并发限流 429 + 优雅退出 `Shutdown` + `/debug/groups` / kvraft 客户端会话 GC / metrics 新增 Gauge 与多项指标 / 混沌测试 I16/I18 + CI 竞态与长时 job）同样获得用户授权，将在全量 `build+vet+test` 通过后执行 `git push origin master`（仅 fast-forward）**。
+
+**最新一轮自主迭代（用户授权「迭代20次，方向是新增功能 / 完善旧功能 / 解决显性与隐性问题」，对应内部迭代 n=35–42）已全部本地提交**：含选举窗口跨迁移丢写修复（`GetShard` 三条件守卫 + raft `committedCurrentTerm` 标记）、网关可观测性（Prometheus `/metrics` 协商、访问日志 `/debug/accesslog`、`/readyz` 就绪探针、`http.TimeoutHandler` 请求超时兜底）、kvraft `Get` ReadIndex 快路径、`raft.HasCommittedCurrentTerm` 确定性守护测试；全仓 `go test ./...` 验证通过。因沙箱网络阻断 `github.com:443`，`git push origin master` 暂未完成，待联网环境补推（仅 fast-forward、绝不 `--force`、绝不 `rm -rf`）。
 
 ## 说明
 - 这是面向学习的实验性实现，重点在正确性与可读性，非生产级部署。

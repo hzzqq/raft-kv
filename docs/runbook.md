@@ -14,7 +14,10 @@
 | `GET /debug/migrate` | 纯文本迁移进度，供 `./start.sh migrate` 直接看。 |
 | `GET /debug/configs` | shardmaster 完整配置历史（初始 → 最新），复盘 rebalance 轨迹，确认分片在哪些 group 间迁移。 |
 | `GET /debug/groups` | 各 replica group 的 `gid` / 副本数 / leader / 当前 config 号 / 持有分片数，快速核对「哪个 group 当前拥有哪些分片」。 |
-| `GET /metrics` | 计数器 + 直方图 + 瞬时 Gauge（含 `shard_migration_ms` 迁移延迟、`op_latency_ms` 操作延迟、`config_stalls` 冻结计数、`config_changes` 配置变更次数、`config_num` 当前生效配置号 Gauge、`apply_lag` 应用滞后 Gauge、`shard_bytes` 分片字节直方图、`shard_bytes_overflow` 超大分片告警、`send_shard_latency` 每跳迁移延迟、`read_leases` ReadIndex 快读命中计数）。 |
+| `GET /metrics` | 计数器 + 直方图 + 瞬时 Gauge（含 `shard_migration_ms` 迁移延迟、`op_latency_ms` 操作延迟、`config_stalls` 冻结计数、`config_changes` 配置变更次数、`config_num` 当前生效配置号 Gauge、`apply_lag` 应用滞后 Gauge、`shard_bytes` 分片字节直方图、`shard_bytes_overflow` 超大分片告警、`send_shard_latency` 每跳迁移延迟、`read_leases` ReadIndex 快读命中计数）。**格式协商**：`Accept` 含 `text/plain`/`prometheus` 时输出 Prometheus 文本 exposition（可被 scrape 客户端采集），否则默认 JSON。 |
+| `GET /debug/accesslog?limit=N` | 进程内访问日志环形缓冲（最近 N 条，默认 50）：每请求的方法 / 路径 / 状态码 / 延迟，供审计排障（无需外部日志采集）。 |
+| `GET /readyz` | **就绪探针**：集群每个 group 都有「持租约的 leader」且无迁移卡滞时返回 `200`，否则 `503`；与恒 `200` 的存活探针 `/healthz` 区分，可直接作 k8s `readinessProbe`。 |
+| `GET /healthz` | 存活探针，恒 `200`。 |
 
 CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh configs`。
 
@@ -91,6 +94,24 @@ CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh conf
   选举/心跳 goroutine 改写，而 `time.Timer` 非并发安全——构成 `-race` 数据竞争。已加 `timerMu`
   守卫 `resetElectionTimer`/`resetHeartbeatTimer`；锁序保证 `timerMu` 不会在持有 `rf.mu` 的反向
   被获取，无死锁。CI 新增 `raft-race` job 持续守护。
+- **GetShard 选举窗口守卫（n=35）**：新当选 leader 在「重新提交本任期 no-op」之前，`commitIndex`
+  可能仍落后上一任 leader 已提交的位置、旧任期已提交写尚未 apply。此时若 `GetShard` 直接传出
+  `kv.shards`，快照会缺失该写、被新 group 装入即静默丢写（杀主 + 迁移重叠窗口偶发）。故 `GetShard`
+  须同时满足三条件才服务传输：① 持 leader 租约（`HasLeaderLease`）；② 已在当前任期提交过条目
+  （`HasCommittedCurrentTerm`，no-op 提交后旧任期写才被 `commitIndex` 覆盖）；③ 状态机已
+  `waitApplied` 到 `commitIndex`。任一不满足即返回 `ErrWrongLeader` 让 `fetchShard` 重试。Raft 侧
+  新增 `committedCurrentTerm` 标记（`becomeLeader` 重置、`advanceCommit` 提交当前任期条目时置位）
+  与 `HasCommittedCurrentTerm()` 访问器；确定性测试 `TestHasCommittedCurrentTerm` 与混沌回归
+  `TestChaosSwingWriteDataLoss`（A→B→A 来回再平衡 + 每 200ms 杀两组 leader + 客户端 20 次 Append）
+  共同守护。
+- **kvraft Get ReadIndex 快路径（n=39）**：与 shardkv 同源优化——leader 持租约时 `Get` 跳过一次
+  Raft 日志追加、以 `commitIndex` 为一致性点待状态机 apply 后本地读，低延迟且线性一致；无租约 /
+  超时则回退 `propose`。`KVServer` 新增 `appliedIndex` 追踪与 `waitAppliedIndex` 轮询，命中以
+  `read_leases` 计数（确定性测试 `TestKVReadLease` 守护）。
+- **就绪探针基于 leader 租约而非裸角色（n=40）**：`/readyz` 判定某 group 就绪，不仅要求存在
+  leader，还要求该 leader `HasLeaderLease()` 为真——分区失联的旧 leader 仍自认 `Leader=true` 却
+  无法提交，若仅按角色判就绪会误报「可服务」。故 `ShardDebug` 新增 `Lease` 字段，`clusterHealthy()`
+  以「持租约 leader + 无迁移卡滞」为就绪判据，`/readyz` 据此返回 200/503。
 
 ## 5. 快速排障 SOP
 
