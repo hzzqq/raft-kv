@@ -93,6 +93,17 @@ type RequestPreVoteReply struct {
 	VoteGranted bool
 }
 
+// TimeoutNowArgs / TimeoutNowReply 是领导权转移（Leadership Transfer）扩展的 RPC：
+// leader 在让位前给目标节点发送 TimeoutNow，目标据此立即越过选举超时发起选举，
+// 从而平滑地把领导权交给日志最新、最适合的节点（如用于负载再平衡）。
+type TimeoutNowArgs struct {
+	Term int
+}
+
+type TimeoutNowReply struct {
+	Term int
+}
+
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
@@ -473,6 +484,63 @@ func (rf *Raft) doRealElection(preTerm int, lastIdx, lastTerm, me int) {
 	}
 }
 
+// LeadershipTransfer 把本节点（须为 leader）的领导权平滑移交给 target 节点。
+// 流程：先确保 target 已追上本任期已提交位置（必要时触发一次复制并短暂等待），
+// 再发 TimeoutNow 让 target 立即选举，最后主动以更高任期退位让路。用于负载再平衡
+// 或计划内维护（把 leader 挪到更合适的节点）。返回 false 表示无法/未执行转移。
+func (rf *Raft) LeadershipTransfer(target int) bool {
+	rf.mu.Lock()
+	if rf.role != Leader {
+		rf.mu.Unlock()
+		return false
+	}
+	if target == rf.me || target < 0 || target >= len(rf.peers) {
+		rf.mu.Unlock()
+		return false
+	}
+	needSync := rf.matchIndex[target] < rf.commitIndex
+	term := rf.currentTerm
+	rf.mu.Unlock()
+
+	if needSync {
+		rf.broadcastAppendEntries()
+		// 等待目标追上已提交位置（最多 500ms）。
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			rf.mu.Lock()
+			role := rf.role
+			caughtUp := rf.matchIndex[target] >= rf.commitIndex
+			curTerm := rf.currentTerm
+			rf.mu.Unlock()
+			if role != Leader || curTerm != term {
+				return false
+			}
+			if caughtUp {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		rf.mu.Lock()
+		caughtUp := rf.matchIndex[target] >= rf.commitIndex && rf.role == Leader && rf.currentTerm == term
+		rf.mu.Unlock()
+		if !caughtUp {
+			return false
+		}
+	}
+
+	reply := &TimeoutNowReply{}
+	ok := rf.peers[target].Call("TimeoutNow", &TimeoutNowArgs{Term: term}, reply)
+	if !ok {
+		return false
+	}
+	// 退位并以更高任期让路，target 随即赢得选举。
+	rf.mu.Lock()
+	rf.stepDown(term + 1)
+	rf.mu.Unlock()
+	Metrics.Counter("leadership_transfers").Inc()
+	return true
+}
+
 func (rf *Raft) becomeLeader() {
 	if rf.role == Leader {
 		return
@@ -557,6 +625,16 @@ func (rf *Raft) RequestPreVote(args *RequestPreVoteArgs, reply *RequestPreVoteRe
 		(args.LastLogTerm == rf.lastLogTerm() && args.LastLogIndex >= rf.lastLogIndex())
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = upToDate
+}
+
+// TimeoutNow 处理领导权转移请求：接收方立即越过选举超时发起选举（以当前任期+1 参选），
+// 从而平滑地从当前 leader 接管领导权。发送方（旧 leader）在调用后会主动退位让路。
+func (rf *Raft) TimeoutNow(args *TimeoutNowArgs, reply *TimeoutNowReply) {
+	rf.mu.Lock()
+	reply.Term = rf.currentTerm
+	rf.mu.Unlock()
+	// 跨过选举超时，立即发起选举（Pre-Vote → 正式选举）。
+	rf.startElection()
 }
 
 // ============================== 日志复制 ==============================

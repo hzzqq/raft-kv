@@ -70,6 +70,8 @@ func (cfg *config) addServerHandler(i int, rf *Raft) {
 			rf.RequestVote(args.(*RequestVoteArgs), reply.(*RequestVoteReply))
 		case "RequestPreVote":
 			rf.RequestPreVote(args.(*RequestPreVoteArgs), reply.(*RequestPreVoteReply))
+		case "TimeoutNow":
+			rf.TimeoutNow(args.(*TimeoutNowArgs), reply.(*TimeoutNowReply))
 		case "AppendEntries":
 			rf.AppendEntries(args.(*AppendEntriesArgs), reply.(*AppendEntriesReply))
 		case "InstallSnapshot":
