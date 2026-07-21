@@ -393,3 +393,53 @@ func TestSnapshot(t *testing.T) {
 	// f 落后且已有快照，重连后应通过快照+增量追平到最终状态
 	cfg.wait(idxLast, 3, 300+9)
 }
+
+// TestHasCommittedCurrentTerm 确定性验证 n=35 修复的核心机制：leader 只有在「当前
+// 任期」提交过条目（通常是 becomeLeader 时追加的 no-op）后，HasCommittedCurrentTerm
+// 才为 true——这是 GetShard 选举窗口守卫的前提。3 节点集群当选后，follower 的 AE 应答
+// 驱动 advanceCommit 提交 noop，故该标记应在选举超时内变为 true；进一步提交一条客户端
+// 命令并等待其 apply 后，标记必然仍为 true（提交旧任期写之前必须先提交当前任期 noop
+// 的 Raft 安全性）。若该标记卡在 false，GetShard 守卫会永远拒绝服务传输（配置冻结），
+// 本测试可捕获此类回归。
+func TestHasCommittedCurrentTerm(t *testing.T) {
+	cfg := makeConfig(t, 3)
+	defer cfg.cleanup()
+
+	// 等待某 leader 提交其 noop -> HasCommittedCurrentTerm 应为 true。
+	leaderSetFlag := false
+	for i := 0; i < 500; i++ {
+		if l := cfg.leader(); l >= 0 && cfg.rafts[l].HasCommittedCurrentTerm() {
+			leaderSetFlag = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !leaderSetFlag {
+		t.Fatalf("leader never set HasCommittedCurrentTerm=true after committing its noop")
+	}
+
+	// 提交一条客户端命令并等待其被 3 副本 apply：能 commit 该命令说明当前任期 noop
+	// 已提交，故 leader 的 HasCommittedCurrentTerm 必然为 true。
+	idx := cfg.one(999, 3)
+	l := cfg.leader()
+	if l < 0 || !cfg.rafts[l].HasCommittedCurrentTerm() {
+		t.Fatalf("after committing a client command (idx=%d), leader HasCommittedCurrentTerm should be true (guards n=35 GetShard safeguard)", idx)
+	}
+
+	// 重新选举后应能再次置位：让当前 leader 退位（stepDown 到更高任期），其余副本会在
+	// 选举超时后选出新 leader 并提交新 noop，标记再次变为 true（证明该标记随任期重置
+	// 而非永久卡死或永不被设置）。
+	oldLeader := l
+	cfg.rafts[oldLeader].stepDown(cfg.rafts[oldLeader].currentTerm + 1)
+	reElected := false
+	for i := 0; i < 500; i++ {
+		if nl := cfg.leader(); nl >= 0 && nl != oldLeader && cfg.rafts[nl].HasCommittedCurrentTerm() {
+			reElected = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !reElected {
+		t.Fatalf("after re-election, no new leader set HasCommittedCurrentTerm=true (flag may be stuck)")
+	}
+}
