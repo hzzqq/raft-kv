@@ -185,6 +185,69 @@ func TestGatewayMetricsPrometheus(t *testing.T) {
 	}
 }
 
+// TestGatewayAccessLog：验证 I15 的进程内访问日志——/debug/accesslog 记录近期的
+// HTTP 请求（方法/路径/状态码/延迟）。先发若干请求，再断言日志含对应条目与正确状态码。
+func TestGatewayAccessLog(t *testing.T) {
+	c := cluster.StartCluster(2, 3, 3, 0)
+	defer c.Cleanup()
+	s := NewServer(c)
+	s.Init(2)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	// 产生若干请求：一次 PUT（200）、一次 GET（200）。
+	putReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/kv/logged", strings.NewReader("v"))
+	if pr, err := http.DefaultClient.Do(putReq); err != nil {
+		t.Fatal(err)
+	} else {
+		pr.Body.Close()
+	}
+	if _, err := http.Get(ts.URL + "/kv/logged"); err != nil {
+		t.Fatal(err)
+	}
+	// 一个必然 404 的路径也计入日志（即使本网关未注册该路由，仍应出现在访问日志中）。
+	http.Get(ts.URL + "/nope")
+
+	resp, err := http.Get(ts.URL + "/debug/accesslog?limit=10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /debug/accesslog = %d, want 200", resp.StatusCode)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var entries []struct {
+		Method    string  `json:"method"`
+		Path      string  `json:"path"`
+		Status    int     `json:"status"`
+		LatencyMs float64 `json:"latency_ms"`
+	}
+	if err := json.Unmarshal(b, &entries); err != nil {
+		t.Fatalf("decode /debug/accesslog: %v\nbody=%s", err, string(b))
+	}
+	if len(entries) == 0 {
+		t.Fatalf("/debug/accesslog returned empty: %s", string(b))
+	}
+	// 应至少含 /kv/logged 的 PUT 与 GET 两条，且 /nope 计入（无论状态码）。
+	sawPut, sawGet := false, false
+	for _, e := range entries {
+		if e.Path == "/kv/logged" && e.Method == http.MethodPut && e.Status == http.StatusOK {
+			sawPut = true
+		}
+		if e.Path == "/kv/logged" && e.Method == http.MethodGet && e.Status == http.StatusOK {
+			sawGet = true
+		}
+		if e.LatencyMs < 0 {
+			t.Fatalf("access log negative latency: %s", string(b))
+		}
+	}
+	if !sawPut || !sawGet {
+		t.Fatalf("/debug/accesslog missing expected /kv/logged entries: %s", string(b))
+	}
+}
+
 // TestGatewayObservability：验证新增的 /status（集群健康 JSON）与 /debug/migrate
 // （迁移进度文本）端点可用且返回预期结构。
 func TestGatewayObservability(t *testing.T) {

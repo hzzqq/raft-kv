@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +45,45 @@ type Server struct {
 	// 使并发限流（429）路径能被确定性触发（内存集群后端极快时，正常请求难以
 	// 让在途数打满 64 槽）。生产环境恒为 0，零行为影响。
 	testDelay time.Duration
+
+	// I15：进程内访问日志环形缓冲（最近 N 条 HTTP 请求），供 /debug/accesslog
+	// 暴露，便于审计/排障（无需外部日志采集即可回看近期请求方法/路径/状态码/延迟）。
+	accessMu  sync.Mutex
+	accessLog []accessEntry
+	accessCap int
+}
+
+// accessEntry 是 /debug/accesslog 中单条请求记录。
+type accessEntry struct {
+	TS        time.Time `json:"ts"`
+	Method    string    `json:"method"`
+	Path      string    `json:"path"`
+	Status    int       `json:"status"`
+	LatencyMs float64   `json:"latency_ms"`
+}
+
+// statusRecorder 包装 http.ResponseWriter，捕获最终状态码（WriteHeader 可能未被
+// 显式调用——此时按 200 计），供访问日志记录。其它方法经嵌入的 ResponseWriter 透传。
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if !r.wrote {
+		r.status = code
+		r.wrote = true
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if !r.wrote {
+		r.status = http.StatusOK
+		r.wrote = true
+	}
+	return r.ResponseWriter.Write(b)
 }
 
 // SetTestDelay 仅供单测注入人为延迟，使 429 路径可被稳定复现。生产不可用。
@@ -51,7 +91,7 @@ func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 
 // NewServer 用给定集群构造网关（不立即加入 group，需先 Init）。
 func NewServer(c *cluster.Cluster) *Server {
-	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent)}
+	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256}
 }
 
 // Init 依次加入 nGroups 个 replica group，使分片可写。
@@ -86,6 +126,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /debug/configs", s.wrap(s.handleDebugConfigs))
 	// 当前 group 成员与分片归属（I14）：每个 gid 的 server 列表及其拥有的分片编号。
 	mux.HandleFunc("GET /debug/groups", s.wrap(s.handleDebugGroups))
+	// 进程内访问日志（I15）：最近 N 条 HTTP 请求的方法/路径/状态码/延迟，便于审计排障。
+	mux.HandleFunc("GET /debug/accesslog", s.wrap(s.handleDebugAccessLog))
 	return mux
 }
 
@@ -93,6 +135,10 @@ func (s *Server) Handler() http.Handler {
 // 并发超过上限时立即返回 429，不无限排队。
 func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		record := func(status int, d time.Duration) {
+			s.recordAccess(r.Method, r.URL.Path, status, d)
+		}
 		select {
 		case s.sem <- struct{}{}:
 			defer func() { <-s.sem }()
@@ -100,6 +146,7 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusTooManyRequests)
 			io.WriteString(w, `{"error":"too many concurrent requests","code":429}`)
+			record(http.StatusTooManyRequests, time.Since(start))
 			return
 		}
 		s.wg.Add(1)
@@ -107,7 +154,54 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		if s.testDelay > 0 {
 			time.Sleep(s.testDelay)
 		}
-		h(w, r)
+		rec := &statusRecorder{ResponseWriter: w}
+		h(rec, r)
+		st := rec.status
+		if st == 0 {
+			st = http.StatusOK
+		}
+		record(st, time.Since(start))
+	}
+}
+
+// recordAccess 把一条请求记录追加到访问日志环形缓冲（超出容量则丢弃最旧）。
+func (s *Server) recordAccess(method, path string, status int, d time.Duration) {
+	s.accessMu.Lock()
+	e := accessEntry{
+		TS:        time.Now(),
+		Method:    method,
+		Path:      path,
+		Status:    status,
+		LatencyMs: float64(d.Microseconds()) / 1000.0,
+	}
+	s.accessLog = append(s.accessLog, e)
+	if len(s.accessLog) > s.accessCap {
+		s.accessLog = s.accessLog[len(s.accessLog)-s.accessCap:]
+	}
+	s.accessMu.Unlock()
+}
+
+// handleDebugAccessLog 返回进程内访问日志的最近 N 条（默认 50，可用 ?limit= 覆盖），
+// 按时间升序（最旧在前、最新在后），便于回看近期请求轨迹。
+func (s *Server) handleDebugAccessLog(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	s.accessMu.Lock()
+	n := len(s.accessLog)
+	if limit > n {
+		limit = n
+	}
+	out := make([]accessEntry, limit)
+	copy(out, s.accessLog[n-limit:])
+	s.accessMu.Unlock()
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(out); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
