@@ -81,6 +81,25 @@ jobs:
       - name: Race detector on chaos + migration paths
         run: go test -race ./src/shardkv/ -run 'TestChaosLeaderKillDuringMigration|TestChaosLongRun|TestSKVReMigration|TestSKVThreeGroupChurn|TestSKVConfigProgress|TestSKVReadIndex|TestSKVLinearizableAppend' -count=1 -timeout 900s
 
+  # I17b：raft 层 -race 专项。配合 cycle 90/20 #3 的 timerMu 修复，专门捕获
+  # election/heartbeat Timer 并发改写等 raft 内部数据竞态。GitHub runner 有 gcc，
+  # 本地 managed Go 无 gcc 故放 CI 侧；continue-on-error 不阻断流水线——暴露竞态即上报。
+  raft-race:
+    runs-on: ubuntu-latest
+    needs: test
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Race detector on raft
+        run: go test -race ./src/raft/ -count=1 -timeout 600s
+
   # I18：混沌长时 job。用 -count 放大"迁移中杀主 + 分片漂移 + 并发读"的 liveness
   # 回归概率（冻结/死锁属 liveness 问题，无需 -race 即可暴露）。常驻必过。
   chaos-long:
