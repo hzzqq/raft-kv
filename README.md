@@ -53,6 +53,47 @@ raft-kv/
 > [`docs/coverage.md`](docs/coverage.md)；ShardKV 数据面深层设计笔记见
 > [`docs/lab4-shardkv-design.md`](docs/lab4-shardkv-design.md)。
 
+## 快速启动
+
+`start.sh`（Git Bash / Linux）与 `start.bat`（Windows）把整套 ShardKV 系统**真正拉起来**：
+进程内启动 2 组副本集群，并起一个常驻 HTTP 网关（默认 `:8080`），可被 `kvcli` / `curl`
+持续访问。旧版脚本只跑一次性 `demo` 后退出，现默认前台常驻。
+
+```bash
+# Git Bash / Linux
+./start.sh              # 默认 = serve：构建网关并前台常驻（Ctrl+C 停止）
+./start.sh bg           # 后台启动（写 raft-kv-gateway.pid + .log）
+./start.sh stop         # 停止后台网关
+./start.sh build        # 构建全部二进制到 bin/
+./start.sh cli get hello   # 运行 kvcli 访问网关
+
+# Windows（cmd / PowerShell）
+start.bat               # 默认 = serve
+start.bat bg
+start.bat stop
+start.bat cli get hello
+```
+
+等效的 Make 目标：`make serve`（前台）、`make serve-bg`（后台）、`make stop`、`make cli args="get hello"`。
+
+网关起来后，用 `kvcli` 或 curl 交互：
+
+```bash
+# 写入 + 读取
+./start.sh cli put hello world
+./start.sh cli get  hello          # -> world
+./start.sh cli append hello "!"
+
+# 或直接 curl
+curl -X PUT http://localhost:8080/kv/foo -d 'bar'
+curl http://localhost:8080/kv/foo            # -> bar
+curl http://localhost:8080/healthz           # -> 200 OK
+curl http://localhost:8080/metrics           # -> JSON 指标快照
+```
+
+> 网关地址可用第一个参数覆盖：`./start.sh serve :9090`。集群组数默认 2，改 `src/gateway/main.go`
+> 中的 `nGroups` 即可。注意：集群是进程内的（基于 labrpc 内存网络），生产部署需替换为真实传输层。
+
 ## 设计要点
 
 ### raft（共识层）

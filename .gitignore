@@ -35,3 +35,8 @@ tmp_*.sh
 
 # Build output (make build-binaries / start scripts)
 bin/
+
+# 启动脚本运行时产物（网关 PID 文件 / 日志）
+raft-kv-gateway.pid
+raft-kv-gateway.log
+*.pid

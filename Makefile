@@ -2,7 +2,7 @@
 GO ?= go
 export PATH := $(PATH):/c/Users/Administrator/.workbuddy/binaries/go/go/bin
 
-.PHONY: build vet test test-race clean lint cover test-cover
+.PHONY: build vet test test-race clean lint cover test-cover build-binaries demo serve serve-bg stop cli
 
 build:
 	$(GO) build ./...
@@ -28,6 +28,25 @@ build-binaries:
 # 全栈冒烟：直接跑 demo（cluster -> HTTP 网关 -> HTTP 客户端）。
 demo: build-binaries
 	$(GO) run ./src/demo
+
+# 前台常驻：构建网关并拉起（默认 :8080），Ctrl+C 停止。
+# 这是「把系统真正跑起来」的入口，替代旧版跑完 demo 就退的行为。
+serve: build-binaries
+	./bin/gateway :8080
+
+# 后台常驻：写 PID + 日志，便于远程 / 自动化场景。
+serve-bg: build-binaries
+	./bin/gateway :8080 > raft-kv-gateway.log 2>&1 &
+	echo $$! > raft-kv-gateway.pid
+	@echo "gateway 后台已启动，PID=$$(cat raft-kv-gateway.pid)，日志 raft-kv-gateway.log；停止：make stop"
+
+# 停止后台网关。
+stop:
+	@if [ -f raft-kv-gateway.pid ]; then kill $$(cat raft-kv-gateway.pid) 2>/dev/null && echo "已停止" || echo "进程不存在"; rm -f raft-kv-gateway.pid; fi
+
+# 运行命令行客户端（例：make cli args="get hello"）。
+cli:
+	$(GO) run ./src/kvcli $(args)
 
 clean:
 	$(GO) clean ./...
