@@ -3,8 +3,9 @@
 # managed Go 无 gcc，竞态检测依赖 CI 侧 chaos-race job）。按 job 分段，失败即退出。
 #
 # 用法：
-#   ./scripts/ci-local.sh            # 跑全部（vet + test + migration-stress + chaos + build + demo）
+#   ./scripts/ci-local.sh            # 跑全部（vet + test + raft + migration-stress + chaos + build + demo）
 #   ./scripts/ci-local.sh test       # 仅 vet + 全量测试
+#   ./scripts/ci-local.sh raft       # 仅 raft 用例（含 commitIndex 持久化回归测试，对应 CI raft-race job 的 -race 本地等价）
 #   ./scripts/ci-local.sh chaos      # 仅混沌用例（I16/I18）
 #   ./scripts/ci-local.sh build      # 仅构建 + demo 全栈冒烟
 set -euo pipefail
@@ -18,6 +19,11 @@ run_test() {
   go vet ./...
   echo "==> [test] go test ./... -count=1 -timeout 600s"
   go test ./... -count=1 -timeout 600s
+}
+
+run_raft() {
+  echo "==> [raft] raft 用例（含 commitIndex 持久化回归，对应 CI raft-race job 的非 -race 等价）"
+  go test ./src/raft/ -count=1 -timeout 300s -v
 }
 
 run_chaos() {
@@ -39,13 +45,15 @@ run_build() {
 
 case "$RUN" in
   test)  run_test ;;
+  raft)  run_raft ;;
   chaos) run_chaos ;;
   build) run_build ;;
   all)
     run_test
+    run_raft
     run_chaos
     run_build
     ;;
-  *) echo "unknown target: $RUN (want test|chaos|build|all)"; exit 2 ;;
+  *) echo "unknown target: $RUN (want test|raft|chaos|build|all)"; exit 2 ;;
 esac
 echo "OK"
