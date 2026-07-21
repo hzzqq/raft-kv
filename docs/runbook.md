@@ -77,6 +77,20 @@ CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh conf
   churn 下降低 RPC 风暴。
 - **迁移延迟直方图（迭代 5）**：`/metrics` 的 `shard_migration_ms` 记录分片从待接收到
   装入的耗时，观测迁移性能。
+- **崩溃恢复 commitIndex 持久化（cycle 87 末 / n=21）**：`raft.persist()` 现把 `commitIndex`
+  一并编码，`readPersist()` 恢复它，`advanceCommit()` 在提交点推进时即 `persist()`。重启节点
+  据恢复的 `commitIndex` 由 `applier`（满足 `commitIndex > lastApplied`）自动重放已提交日志，
+  不再依赖新 leader 重发 `LeaderCommit`。**只持久化已提交安全点**，未提交的 `lastApplied` 仍从 0
+  起、由 `applyCond` 驱动回放，正确性无损。回归测试 `TestCommitIndexPersistenceRecovery`（孤立
+  副本仅凭持久化 commitIndex 重放全部已提交命令）守护，负向验证确认无此修复时 0/n 复现。
+- **测试桩 serverId 集中化（n=22/n=23）**：labrpc 的 `AddServer` 注册 id 与端点 `Connect`
+  目标必须一致（统一为 `serverId(g,r)=1000+g*100+r`）；`g>=1` 时若错配为 `1000+g*nReplicas+r2`
+  会使重启副本 RPC 全部静默失败（目标 server 不存在）、永久分裂投票选不出主。**所有注册/连接/
+  分区操作都已收敛到 `serverId()` 单一来源**，禁止再散落字面量。
+- **raft 选举/心跳 Timer 并发守卫（n=25）**：`electionTimer`/`heartbeatTimer` 同时被 ticker 与
+  选举/心跳 goroutine 改写，而 `time.Timer` 非并发安全——构成 `-race` 数据竞争。已加 `timerMu`
+  守卫 `resetElectionTimer`/`resetHeartbeatTimer`；锁序保证 `timerMu` 不会在持有 `rf.mu` 的反向
+  被获取，无死锁。CI 新增 `raft-race` job 持续守护。
 
 ## 5. 快速排障 SOP
 
