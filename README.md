@@ -51,7 +51,8 @@ raft-kv/
 > [`docs/usage.md`](docs/usage.md)；系统整体架构地图见
 > [`docs/architecture.md`](docs/architecture.md)；测试覆盖率快照见
 > [`docs/coverage.md`](docs/coverage.md)；ShardKV 数据面深层设计笔记见
-> [`docs/lab4-shardkv-design.md`](docs/lab4-shardkv-design.md)。
+> [`docs/lab4-shardkv-design.md`](docs/lab4-shardkv-design.md)；线上排障与可观测性手册见
+> [`docs/runbook.md`](docs/runbook.md)。
 
 ## 快速启动
 
@@ -199,7 +200,7 @@ export GO111MODULE=on
 ## 验证状态说明
 - Labs 2–3、`shardmaster`、`shardkv` 均已在本地 Go 1.22.5 下通过 `go vet` + `go test`（含 `-count=1`）验证，并纳入 GitHub Actions CI（`vet` + `test` + `race` + 非阻断 `lint` + `coverage` 上传）。
 - 本机交互 shell 默认无 `go`，但仓库随附的托管 Go 工具链（`C:/Users/Administrator/.workbuddy/binaries/go/go/bin/go.exe`）可用于本地验证；该环境**无 gcc**，故 `go test -race` 仅能在 CI（GitHub ubuntu + gcc）侧运行，`shardkv` 的并发/冻结类回归以「高频 churn + 多轮循环」测试替代 race detector 来暴露。
-- 自动化纪律：每次改动本地提交、验收不过绝不提交；**前多轮自主迭代（cycle 1–28、cycle 29–38、cycle 39–48）已按用户授权执行 `git push origin master`（仅普通推送、不 --force、不 `rm -rf`）**（见 `docs/lab4-shardkv-design.md` 与 `.workbuddy/self-driving/state.json`）。**本轮迭代（3 组/多跳冻结根治 + 网关可观测 + `migrate`/`status` CLI + `migration-stress` CI job + 本文档刷新）同样获得用户授权，将在全量 `build+vet+test` 通过后执行 `git push origin master`（仅 fast-forward）**。
+- 自动化纪律：每次改动本地提交、验收不过绝不提交；**前多轮自主迭代（cycle 1–28、cycle 29–38、cycle 39–48、cycle 49–57）已按用户授权执行 `git push origin master`（仅普通推送、不 --force、不 `rm -rf`）**（见 `docs/lab4-shardkv-design.md` 与 `.workbuddy/self-driving/state.json`）。**本轮迭代（cycle 58–67：快照看门狗时间戳重置 / 迁移 RPC 指数退避 / GC 守卫防自删权威分片 / 网关 `/debug/configs` / 迁移延迟直方图 `shard_migration_ms` / 冻结修复白盒回归 / kvraft flaky 审计 / Get 改走 propose 保证线性一致 / 运维 runbook）同样获得用户授权，已在全量 `build+vet+test` 通过后执行 `git push origin master`（仅 fast-forward）**。
 
 ## 说明
 - 这是面向学习的实验性实现，重点在正确性与可读性，非生产级部署。

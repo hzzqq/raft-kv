@@ -1,7 +1,9 @@
 package shardkv
 
 import (
+	"sync"
 	"testing"
+	"time"
 
 	"raftkv/src/shardmaster"
 )
@@ -169,5 +171,204 @@ func TestApplyNewConfigClearsPendingInOnIncoming(t *testing.T) {
 	}
 	if _, ok := kv.pendingIn[7]; ok {
 		t.Fatalf("cycle 48 回归: applyNewConfig 消费 incoming 后未清除 pendingIn[7]，将导致配置死锁")
+	}
+}
+
+// TestSnapshotMigrationRoundTrip：快照编码→安装往返必须完整保留迁移态
+// （shards / incoming / pendingIn / pendingOut / config / prevConfig 及内嵌的
+// 客户端去重 LastSeq/LastResult），否则崩溃恢复会丢数据或卡死配置推进。
+// 同时验证 installSnapshot 会把看门狗时间戳重置为「现在」，避免沿用崩溃前
+// 的陈旧时间误判卡死、让 /debug/shards 的 StallSeconds 失真。
+func TestSnapshotMigrationRoundTrip(t *testing.T) {
+	old := time.Now().Add(-10 * time.Minute) // 模拟崩溃前的陈旧时间戳
+	kv := &ShardKV{
+		mu:             sync.Mutex{},
+		shards:         map[int]*ShardData{},
+		incoming:       map[int]*ShardData{},
+		pendingIn:      map[int]bool{},
+		pendingOut:     map[int]bool{},
+		pendingInSince: map[int]time.Time{},
+		pendingOutSince: map[int]time.Time{},
+	}
+	kv.shards[0] = &ShardData{
+		Data:       map[string]string{"k": "v"},
+		LastSeq:    map[int64]int64{1: 2},
+		LastResult: map[int64]string{1: "v"},
+	}
+	kv.incoming[1] = &ShardData{Data: map[string]string{"a": "b"}}
+	kv.pendingIn[1] = true
+	kv.pendingOut[2] = true
+	kv.pendingInSince[1] = old
+	kv.pendingOutSince[2] = old
+	kv.config = shardmaster.Config{Num: 5, Groups: map[int][]string{1: {"s1"}, 2: {"s2"}}}
+	kv.config.Shards[0] = 1
+	kv.config.Shards[1] = 2
+	kv.config.Shards[2] = 1
+	kv.prevConfig = shardmaster.Config{Num: 4, Groups: map[int][]string{1: {"s1"}, 2: {"s2"}}}
+	kv.prevConfig.Shards[1] = 1
+
+	data := kv.encodeSnapshot()
+
+	// 破坏源状态，证明 install 是从快照重建、而非读残留。
+	kv.shards = nil
+	kv.incoming = nil
+	kv.pendingIn = nil
+	kv.pendingOut = nil
+	kv.pendingInSince = nil
+	kv.pendingOutSince = nil
+
+	kv2 := &ShardKV{mu: sync.Mutex{}}
+	kv2.installSnapshot(data)
+
+	if kv2.shards[0] == nil || kv2.shards[0].Data["k"] != "v" {
+		t.Fatalf("shards[0] 未恢复: %v", kv2.shards[0])
+	}
+	if kv2.shards[0].LastSeq[1] != 2 || kv2.shards[0].LastResult[1] != "v" {
+		t.Fatalf("shards[0] 去重态未恢复: %+v", kv2.shards[0])
+	}
+	if kv2.incoming[1] == nil || kv2.incoming[1].Data["a"] != "b" {
+		t.Fatalf("incoming[1] 未恢复")
+	}
+	if !kv2.pendingIn[1] {
+		t.Fatalf("pendingIn[1] 未恢复")
+	}
+	if !kv2.pendingOut[2] {
+		t.Fatalf("pendingOut[2] 未恢复")
+	}
+	if kv2.config.Num != 5 || kv2.config.Shards[0] != 1 {
+		t.Fatalf("config 未恢复: num=%d shards[0]=%d", kv2.config.Num, kv2.config.Shards[0])
+	}
+	if kv2.prevConfig.Num != 4 {
+		t.Fatalf("prevConfig 未恢复: num=%d", kv2.prevConfig.Num)
+	}
+
+	// 看门狗时间戳必须重置为「现在」附近，而非沿用崩溃前的 old（-10min）。
+	pin, okIn := kv2.pendingInSince[1]
+	pout, okOut := kv2.pendingOutSince[2]
+	if !okIn || !okOut {
+		t.Fatalf("installSnapshot 未重置看门狗时间戳")
+	}
+	if pin.Before(time.Now().Add(-30 * time.Second)) {
+		t.Fatalf("pendingInSince 仍沿用陈旧时间戳（崩溃前），应重置为现在: %v", pin)
+	}
+	if pout.Before(time.Now().Add(-30 * time.Second)) {
+		t.Fatalf("pendingOutSince 仍沿用陈旧时间戳（崩溃前），应重置为现在: %v", pout)
+	}
+	_ = old
+}
+
+// TestApplyGCKeepsOwnedShard：GC 守卫——本组当前配置仍拥有该分片（A→B→A 快速回摆）时，
+// applyGC 不得删除其权威数据，仅清除 pendingOut 标记。否则 migratePump 触发的自 GC 会
+// 删掉本组仍持有的分片造成丢数据。
+func TestApplyGCKeepsOwnedShard(t *testing.T) {
+	kv := &ShardKV{
+		gid:        1,
+		config:     shardmaster.Config{Shards: [NShards]int{}},
+		shards:     map[int]*ShardData{},
+		pendingOut: map[int]bool{},
+	}
+	kv.config.Shards[3] = 1 // 本组仍拥有分片 3
+	kv.shards[3] = &ShardData{Data: map[string]string{"k": "v"}, LastSeq: map[int64]int64{}, LastResult: map[int64]string{}}
+	kv.pendingOut[3] = true // 残留待迁出标记（churn 回摆遗留）
+
+	kv.applyGC(3)
+
+	if kv.shards[3] == nil || kv.shards[3].Data["k"] != "v" {
+		t.Fatalf("applyGC 误删本组仍拥有的分片: %v", kv.shards[3])
+	}
+	if _, ok := kv.pendingOut[3]; ok {
+		t.Fatalf("applyGC 未清除 pendingOut[3]")
+	}
+}
+
+// TestApplyGCDeletesUnownedShard：本组不再拥有该分片（正常迁移完成）时，applyGC 必须
+// 删除副本并清除 pendingOut，否则内存泄漏且 pendingOut 残留可能干扰看门狗。
+func TestApplyGCDeletesUnownedShard(t *testing.T) {
+	kv := &ShardKV{
+		gid:        1,
+		config:     shardmaster.Config{Shards: [NShards]int{}},
+		shards:     map[int]*ShardData{},
+		pendingOut: map[int]bool{},
+	}
+	kv.config.Shards[3] = 2 // 分片 3 已属 group 2
+	kv.shards[3] = &ShardData{Data: map[string]string{"k": "v"}, LastSeq: map[int64]int64{}, LastResult: map[int64]string{}}
+	kv.pendingOut[3] = true
+
+	kv.applyGC(3)
+
+	if _, ok := kv.shards[3]; ok {
+		t.Fatalf("applyGC 未删除本组不再拥有的分片")
+	}
+	if _, ok := kv.pendingOut[3]; ok {
+		t.Fatalf("applyGC 未清除 pendingOut[3]")
+	}
+}
+
+// TestResolveShardForTransfer：GetShard 的数据解析核心——优先返回已生效 shards[s]，
+// 缺失时回退 incoming[s]（3-group 多跳 rebalance 孤儿 incoming 的冻结修复核心），
+// 二者皆无才 ErrWrongGroup。白盒验证 cycle 57 的 GetShard 回退修复不回归。
+func TestResolveShardForTransfer(t *testing.T) {
+	kv := &ShardKV{
+		gid:      1,
+		shards:   map[int]*ShardData{},
+		incoming: map[int]*ShardData{},
+	}
+	// 既无 shards 也无 incoming：应 ErrWrongGroup。
+	if _, err := kv.resolveShardForTransfer(5); err != ErrWrongGroup {
+		t.Fatalf("两者皆无应 ErrWrongGroup, got %v", err)
+	}
+
+	// 仅 incoming 有（本组不拥有该分片，但缓冲了迟到推送）：应回退返回 incoming，
+	// 这正是 3-group churn 冻结根因的修复点——真正主人能直接拉走中转数据。
+	kv.incoming[5] = &ShardData{Data: map[string]string{"x": "y"}, LastSeq: map[int64]int64{}, LastResult: map[int64]string{}}
+	data, err := kv.resolveShardForTransfer(5)
+	if err != OK {
+		t.Fatalf("incoming 回退应 OK, got %v", err)
+	}
+	if data.Data["x"] != "y" {
+		t.Fatalf("回退未返回 incoming 数据: %v", data.Data)
+	}
+
+	// shards 优先于 incoming：已结算态优先，不会误返回陈旧 incoming（ReMigration 不回归）。
+	kv.shards[5] = &ShardData{Data: map[string]string{"x": "settled"}, LastSeq: map[int64]int64{}, LastResult: map[int64]string{}}
+	data2, err2 := kv.resolveShardForTransfer(5)
+	if err2 != OK {
+		t.Fatalf("shards 优先应 OK, got %v", err2)
+	}
+	if data2.Data["x"] != "settled" {
+		t.Fatalf("应优先返回 shards 而非 incoming: %v", data2.Data)
+	}
+}
+
+// TestApplyInstallShardBuffersWhenNotOwner：applyInstallShard 在「本组配置尚未推进到
+// 拥有该分片」时应把数据缓冲进 incoming 而非装入 shards——这是孤儿 incoming 路径的
+// 前置条件，也是 GetShard 回退能派上用场的前提。验证缓冲语义正确。
+func TestApplyInstallShardBuffersWhenNotOwner(t *testing.T) {
+	kv := &ShardKV{
+		gid:       1,
+		config:    shardmaster.Config{Shards: [NShards]int{}},
+		shards:    map[int]*ShardData{},
+		incoming:  map[int]*ShardData{},
+		pendingIn: map[int]bool{},
+	}
+	// 本组配置下分片 5 的 owner 是 group 2，但本组收到推送：应缓冲进 incoming。
+	kv.config.Shards[5] = 2
+
+	data := &ShardData{Data: map[string]string{"k": "v"}, LastSeq: map[int64]int64{1: 1}, LastResult: map[int64]string{1: "v"}}
+	op := Op{Kind: "InstallShard", MigrateShard: 5, MigrateData: data}
+	var res applyResult
+	kv.applyInstallShard(op, &res)
+	if res.err != OK {
+		t.Fatalf("缓冲分支 err=%v", res.err)
+	}
+	if _, ok := kv.shards[5]; ok {
+		t.Fatalf("非 owner 时不应装入 shards（应缓冲 incoming）")
+	}
+	if kv.incoming[5] == nil || kv.incoming[5].Data["k"] != "v" {
+		t.Fatalf("应缓冲进 incoming: %v", kv.incoming[5])
+	}
+	// 深拷贝护栏：传入的 data 指针不应与本组运行态别名。
+	if kv.incoming[5] == data {
+		t.Fatalf("applyInstallShard 未深拷贝，运行态与 Raft 日志共享同一 ShardData 指针")
 	}
 }

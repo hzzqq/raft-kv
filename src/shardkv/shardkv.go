@@ -371,9 +371,17 @@ func (kv *ShardKV) migratePump() {
 			}
 		}
 		for s := range kv.pendingOut {
+			newG := kv.config.Shards[s]
+			if newG == kv.gid || newG == 0 {
+				// 本组当前仍拥有该分片（配置回摆 A→B→A）或无主：残留 pendingOut 无意义，
+				// 直接清除，避免向本组自身发 SendShard 触发自 GC（即便有 GC 守卫也不丢数据，
+				// 但省掉无谓自环 RPC）。与 rekickStuckMigrations 的 pendingOut 分支一致。
+				delete(kv.pendingOut, s)
+				delete(kv.pendingOutSince, s)
+				continue
+			}
 			if t, ok := kv.pendingOutSince[s]; !ok || now.Sub(t) > 500*time.Millisecond {
 				kv.pendingOutSince[s] = now
-				newG := kv.config.Shards[s]
 				kv.mu.Unlock()
 				go kv.sendShard(s, newG)
 				kv.mu.Lock()
@@ -416,28 +424,6 @@ func (kv *ShardKV) rekickStuckMigrations(latest shardmaster.Config) {
 
 // ============================== 读取 RPC ==============================
 
-// waitApplied 等待本组状态机 apply 到绝对索引 idx（ReadIndex 读路径用）。
-// 期间若失去领导权或超时，返回 false，由调用方回退到常规 propose（日志追加，
-// 绝对正确且线性一致）。绝不死等，避免卡住客户端。
-func (kv *ShardKV) waitApplied(idx int) bool {
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for {
-		kv.mu.Lock()
-		done := kv.appliedIndex >= idx
-		kv.mu.Unlock()
-		if done {
-			return true
-		}
-		if _, isLeader := kv.rf.GetState(); !isLeader {
-			return false
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	shard := key2shard(args.Key)
@@ -453,31 +439,11 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	kv.mu.Unlock()
 
-	// 线性一致读优化（ReadIndex）：leader 上直接读本地状态机，省去一次日志追加。
-	// 一致性点 = leader 当前 commitIndex；等待本组状态机 apply 到该索引后，本地
-	// 状态即反映所有已提交写，等价于一次线性一致读。等待期间若失去领导权或超时，
-	// 回退到常规 propose 路径（同样线性一致，只是多一次日志追加）。
-	if idx, ok := kv.rf.ReadIndex(); ok {
-		if kv.waitApplied(idx) {
-			kv.mu.Lock()
-			// 等待期间配置可能把分片迁走，需重新校验归属，否则读到的不是本组数据。
-			if kv.config.Shards[shard] == kv.gid {
-				if sd, ok2 := kv.shards[shard]; ok2 {
-					val := sd.Data[args.Key]
-					kv.mu.Unlock()
-					reply.Err = OK
-					reply.Value = val
-					start := time.Now()
-					Metrics.Histogram("op_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
-					Metrics.Counter("ops_total").Inc()
-					return
-				}
-			}
-			kv.mu.Unlock()
-		}
-	}
-
-	// 兜底：走常规 propose（日志追加，绝对正确且线性一致）。
+	// 线性一致读：始终走 propose（日志追加）路径——它经 Raft 共识，绝对线性一致。
+	// 注意：本仓库 raft 未实现 leader lease / 心跳确认式 ReadIndex。若走 ReadIndex
+	// 快速路径，分区下旧 leader 会基于落后 commitIndex 返回 stale read（违反线性
+	// 一致），故此处有意不使用该优化，优先保证正确性。待 raft 层补齐 leader lease
+	// 后，可恢复 ReadIndex 快路径（届时需以心跳 round-trip 确认领导权）。
 	start := time.Now()
 	op := Op{Kind: "Cmd", ClientId: args.ClientId, Seq: args.Seq, Shard: shard, Key: args.Key, OpType: "Get"}
 	res := kv.propose(op)
@@ -542,31 +508,30 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
 		return
 	}
 	kv.mu.Lock()
-	sd, ok := kv.shards[args.Shard]
-	if !ok {
-		// 回退：本组当前不"拥有"该分片，但可能缓冲了它的迁移数据（incoming）。
-		// 多跳 rebalance（A→B→C 连跳）下，中间组 B 在失去所有权前收到旧 owner A
-		// 的迟到推送，被 applyInstallShard 缓冲进 incoming[s]；真正的主人 C 的
-		// fetchShard 按 prevConfig 去问 B 要 s——若 GetShard 只服务 shards，永远
-		// 返回 ErrWrongGroup，C 的 pendingIn[s] 清不掉、配置冻结（3-group churn
-		// 根因之一）。故此处仅在本组 shards[s] 缺失时回退返回 incoming[s]：该数据
-		// 由合法旧 owner 推送、真实有效，新 owner 拉走后即安装，无需任何后台转发
-		// 协程（避免孤儿转发打爆网络/选举、造成整集群冻结的回归）。若 shards[s]
-		// 已存在则优先返回它（已结算态），不会误返回陈旧 incoming，故 ReMigration
-		// 等回摆场景不会回归。
-		if data, ok2 := kv.incoming[args.Shard]; ok2 {
-			reply.Data = data.copy()
-			kv.mu.Unlock()
-			reply.Err = OK
-			return
-		}
+	data, err := kv.resolveShardForTransfer(args.Shard)
+	if err != OK {
 		kv.mu.Unlock()
-		reply.Err = ErrWrongGroup
+		reply.Err = err
 		return
 	}
-	reply.Data = sd.copy()
+	reply.Data = data.copy()
 	kv.mu.Unlock()
 	reply.Err = OK
+}
+
+// resolveShardForTransfer 返回某分片供迁移传输的数据：优先本组已生效的 shards[s]，
+// 否则回退到缓冲的 incoming[s]（多跳 rebalance 下孤儿 incoming 仍含有效数据，新 owner
+// 拉走后即安装）。本组既不拥有也不缓冲该分片则 ErrWrongGroup。调用方必须持有 kv.mu。
+// 这是 3-group / 多跳 churn 冻结根因的修复核心：若只服务 shards，真正主人 C 向中间组
+// B 拉取迟到推送时永远 ErrWrongGroup，pendingIn[s] 清不掉、配置冻结。
+func (kv *ShardKV) resolveShardForTransfer(s int) (*ShardData, Err) {
+	if sd, ok := kv.shards[s]; ok {
+		return sd, OK
+	}
+	if data, ok2 := kv.incoming[s]; ok2 {
+		return data, OK
+	}
+	return nil, ErrWrongGroup
 }
 
 // ============================== propose / applier ==============================
@@ -652,10 +617,7 @@ func (kv *ShardKV) applier() {
 		case "InstallShard":
 			kv.applyInstallShard(op, &res)
 		case "GCShard":
-			delete(kv.shards, op.GCShard)
-			// 关键：GC 完成后必须清除待迁出标记，否则 hasPending 永远为 true，
-			// pollConfig 无法推进配置，KV 冻结在旧配置，客户端读到空/陈旧分片而丢数据。
-			delete(kv.pendingOut, op.GCShard)
+			kv.applyGC(op.GCShard)
 		}
 		nid := op.NotifyId
 		ch := kv.notified[nid]
@@ -745,6 +707,7 @@ func (kv *ShardKV) applyNewConfig(cfg shardmaster.Config) {
 					// 无法推进配置——形成"收方等配置推进清 pendingIn / 配置推进
 					// 又被 pendingIn 阻塞"的死锁，3-group / ReMigration churn 冻结。
 					delete(kv.pendingIn, s)
+					kv.recordMigrationLatency(s)
 				} else if !have {
 					// 既未持有也未在 incoming 中缓冲：从上一版配置记录的旧 owner 拉取。
 					kv.pendingIn[s] = true
@@ -810,12 +773,33 @@ func (kv *ShardKV) applyInstallShard(op Op, res *applyResult) {
 	if kv.config.Shards[s] == kv.gid {
 		kv.shards[s] = incoming
 		delete(kv.pendingIn, s)
+		kv.recordMigrationLatency(s)
 	} else {
 		// 配置尚未推进到"拥有该分片"，先缓冲，待 applyNewConfig 消费并安装。
 		kv.incoming[s] = incoming
 	}
 	if res != nil {
 		res.err = OK
+	}
+}
+
+// applyGC 处理 GCShard：丢弃已迁出的分片副本，但仅当本组当前配置不再拥有该分片时。
+// GC 语义是"新 owner 已持有，本组可删副本"；A→B→A 快速 churn 下分片可能在 sendShard
+// 尚未完成 GC 时就回摆回本组，残留 pendingOut 会被 migratePump / 旧 sendShard 协程触发
+// 自 GC——若无此守卫会删掉本组仍是权威 owner 的分片数据（丢数据）。pendingOut 标记无论
+// 是否拥有都清除。调用方必须持有 kv.mu。
+func (kv *ShardKV) applyGC(s int) {
+	if kv.config.Shards[s] != kv.gid {
+		delete(kv.shards, s)
+	}
+	delete(kv.pendingOut, s)
+}
+
+// recordMigrationLatency 记录分片 s 从"进入待接收(pendingIn)"到"成功装入本组"的
+// 耗时（毫秒），供 /metrics 的 shard_migration_ms 直方图观测迁移性能。
+func (kv *ShardKV) recordMigrationLatency(s int) {
+	if t, ok := kv.pendingInSince[s]; ok && !t.IsZero() {
+		Metrics.Histogram("shard_migration_ms").Record(time.Since(t).Seconds() * 1000)
 	}
 }
 
@@ -842,7 +826,24 @@ func (kv *ShardKV) mergeShardData(s int, incoming *ShardData) {
 	}
 }
 
+// migrateBackoff 返回第 attempt 次迁移重试的退避时长（指数退避，上限 1s）。
+// 用于 fetchShard/sendShard 在来源不可达时降低 RPC 风暴、缓解 churn 下的网络争用；
+// 首跳（attempt=0）仍为 50ms，保持正常路径延迟不变，仅在持续失败时退避。
+func migrateBackoff(attempt int) time.Duration {
+	const base = 50 * time.Millisecond
+	const max = 1 * time.Second
+	d := base
+	for i := 0; i < attempt; i++ {
+		d *= 2
+		if d >= max {
+			return max
+		}
+	}
+	return d
+}
+
 func (kv *ShardKV) fetchShard(s int, oldServers []string, epoch int64) {
+	attempt := 0
 	for !kv.killed() {
 		kv.mu.Lock()
 		if !kv.pendingIn[s] {
@@ -914,11 +915,13 @@ func (kv *ShardKV) fetchShard(s int, oldServers []string, epoch int64) {
 		if got {
 			return
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(migrateBackoff(attempt))
+		attempt++
 	}
 }
 
 func (kv *ShardKV) sendShard(s, newG int) {
+	attempt := 0
 	for !kv.killed() {
 		kv.mu.Lock()
 		if !kv.pendingOut[s] {
@@ -936,7 +939,8 @@ func (kv *ShardKV) sendShard(s, newG int) {
 		// 其自身早已在 applyNewConfig 中拉起本 goroutine，会自动接管推送。
 		_, isLeader := kv.rf.GetState()
 		if !isLeader {
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(migrateBackoff(attempt))
+			attempt++
 			continue
 		}
 
@@ -959,7 +963,8 @@ func (kv *ShardKV) sendShard(s, newG int) {
 
 		servers := cfg.Groups[newG]
 		if len(servers) == 0 {
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(migrateBackoff(attempt))
+			attempt++
 			continue
 		}
 		sent := false
@@ -975,7 +980,8 @@ func (kv *ShardKV) sendShard(s, newG int) {
 			// 对方已提交该分片数据，本组可安全回收。GCShard 的 propose 可能因
 			// 瞬时负载触发内置 3s 超时（ErrTimeout），必须重试直至提交成功，
 			// 否则 pendingOut[s] 残留会留下脏状态（cycle 48 加固）。循环至
-			// pendingOut[s] 被 GC 处理器清除为止。
+			// pendingOut[s] 被 GC 处理器清除为止。GC 重试保持紧密（50ms），
+			// 以便尽快清除 pendingOut、释放配置推进。
 			for !kv.killed() {
 				kv.mu.Lock()
 				if !kv.pendingOut[s] {
@@ -991,7 +997,8 @@ func (kv *ShardKV) sendShard(s, newG int) {
 			}
 			return
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(migrateBackoff(attempt))
+		attempt++
 	}
 }
 
@@ -1055,6 +1062,20 @@ func (kv *ShardKV) installSnapshot(data []byte) {
 	}
 	kv.config = snap.Config
 	kv.prevConfig = snap.PrevConfig
+
+	// 重置看门狗时间戳：快照恢复后从「现在」重新计时，避免沿用崩溃/安装前的
+	// 陈旧时间戳，导致看门狗误判某分片「已卡死很久」而狂触发 rekick（活锁热点），
+	// 同时防止 /debug/shards 的 StallSeconds 显示虚假大值。fetchEpoch 只增不减，
+	// 用于作废陈旧 fetcher，无需重置。
+	now := time.Now()
+	kv.pendingInSince = map[int]time.Time{}
+	for s := range kv.pendingIn {
+		kv.pendingInSince[s] = now
+	}
+	kv.pendingOutSince = map[int]time.Time{}
+	for s := range kv.pendingOut {
+		kv.pendingOutSince[s] = now
+	}
 }
 
 // ============================== Clerk（客户端） ==============================

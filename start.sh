@@ -91,8 +91,12 @@ case "$cmd" in
     # 集群健康总览：对接网关 /status（JSON），便于监控/告警轮询。
     curl -s "http://localhost${ADDR}/status" | "$GO" run ./src/statusfmt || echo ">> 网关未运行？先 ./start.sh bg 或 ./start.sh serve"
     ;;
+  configs)
+    # 配置历史：对接网关 /debug/configs（JSON），复盘 rebalance 轨迹。
+    curl -s "http://localhost${ADDR}/debug/configs" || echo ">> 网关未运行？先 ./start.sh bg 或 ./start.sh serve"
+    ;;
   *)
-    echo "用法: ./start.sh [serve|bg|stop|build|demo|test|cli]"
+    echo "用法: ./start.sh [serve|bg|stop|build|demo|test|cli|migrate|status|configs]"
     exit 1
     ;;
 esac

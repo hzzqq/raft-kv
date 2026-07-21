@@ -18,6 +18,7 @@ import (
 
 	"raftkv/src/cluster"
 	"raftkv/src/shardkv"
+	"raftkv/src/shardmaster"
 )
 
 // Server 持有集群与绑定到它的 ShardKV 客户端。
@@ -60,6 +61,9 @@ func (s *Server) Handler() http.Handler {
 	// 迁移进度（人类可读，供 CLI `start.sh migrate` 直接展示）：每个 group leader 副本的
 	// 实时迁移状态 + 集群最新 config 号，一眼看清再平衡是否卡住。
 	mux.HandleFunc("GET /debug/migrate", s.handleDebugMigrate)
+	// 配置历史（人类/程序可读）：展示 shardmaster 从初始到最新的每段配置，便于复盘
+	// rebalance 轨迹、确认分片在哪些 group 间迁移（排查 3-group 冻结时尤其有用）。
+	mux.HandleFunc("GET /debug/configs", s.handleDebugConfigs)
 	return mux
 }
 
@@ -149,6 +153,35 @@ func (s *Server) handleDebugMigrate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, b.String())
+}
+
+// ConfigView 是 /debug/configs 中单段配置的视图。
+type ConfigView struct {
+	Num    int                `json:"num"`
+	Groups map[int][]string   `json:"groups"`
+	Shards [shardmaster.NShards]int `json:"shards"`
+}
+
+// handleDebugConfigs 返回 shardmaster 的完整配置历史（JSON），便于复盘 rebalance 轨迹。
+func (s *Server) handleDebugConfigs(w http.ResponseWriter, r *http.Request) {
+	cfgs := s.c.Configs()
+	if len(cfgs) == 0 {
+		http.Error(w, "no configs", http.StatusInternalServerError)
+		return
+	}
+	views := make([]ConfigView, 0, len(cfgs))
+	for _, cfg := range cfgs {
+		views = append(views, ConfigView{Num: cfg.Num, Groups: cfg.Groups, Shards: cfg.Shards})
+	}
+	out := map[string]interface{}{
+		"latest_num": cfgs[len(cfgs)-1].Num,
+		"configs":    views,
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(out); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 // handleMetrics 返回 shardkv.Metrics 的 JSON 快照（counters + histograms 分位数）。

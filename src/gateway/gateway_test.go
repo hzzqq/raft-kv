@@ -207,3 +207,53 @@ func TestGatewayFailFast(t *testing.T) {
 		t.Fatalf("gateway did not fail fast: took %v (want < 8s)", elapsed)
 	}
 }
+
+// TestGatewayConfigs：GET /debug/configs 返回 shardmaster 完整配置历史，且最新配置号
+// 与集群已应用配置一致、每段配置含分片归属。用于复盘 rebalance 轨迹（排查冻结时确认
+// 分片在哪些 group 间迁移）。
+func TestGatewayConfigs(t *testing.T) {
+	c := cluster.StartCluster(3, 3, 3, 0)
+	defer c.Cleanup()
+	s := NewServer(c)
+	s.Init(3)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	// 触发一次 rebalance，制造多段配置历史。
+	c.Churn(2, 30*time.Millisecond, 1)
+	c.WaitAllConfigs(c.Configs()[len(c.Configs())-1].Num)
+
+	resp, err := http.Get(ts.URL + "/debug/configs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /debug/configs = %d, want 200", resp.StatusCode)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var out struct {
+		LatestNum int         `json:"latest_num"`
+		Configs   []ConfigView `json:"configs"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("decode /debug/configs: %v\nbody=%s", err, string(b))
+	}
+	if out.LatestNum < 1 {
+		t.Fatalf("latest_num = %d, want >= 1", out.LatestNum)
+	}
+	if len(out.Configs) != out.LatestNum+1 {
+		t.Fatalf("configs count = %d, want %d", len(out.Configs), out.LatestNum+1)
+	}
+	// 历史应含初始空配置（num=0, 无 group）与若干次 rebalance（group 数递增）。
+	seenGroups := map[int]bool{}
+	for _, cfg := range out.Configs {
+		for g := range cfg.Groups {
+			seenGroups[g] = true
+		}
+	}
+	if len(seenGroups) == 0 {
+		t.Fatalf("/debug/configs 未包含任何 group 配置")
+	}
+}

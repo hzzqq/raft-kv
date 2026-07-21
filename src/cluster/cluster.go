@@ -153,6 +153,19 @@ func (c *Cluster) Clerk() *shardkv.Clerk {
 	return shardkv.MakeClerk(c.SMNames, c.make_end)
 }
 
+// Configs 返回 shardmaster 的完整配置历史（configs[0..latest]），供网关
+// /debug/configs 展示 rebalance 轨迹。经公开的 shardmaster.Clerk 查 leader 副本，
+// 逐号 Query 取回每段配置（调试用途，允许读到各副本已提交状态）。
+func (c *Cluster) Configs() []shardmaster.Config {
+	ck := shardmaster.MakeClerk(c.SMNames, c.make_end)
+	latest := ck.Query(-1)
+	out := make([]shardmaster.Config, 0, latest.Num+1)
+	for i := 0; i <= latest.Num; i++ {
+		out = append(out, ck.Query(i))
+	}
+	return out
+}
+
 // Join 把第 g 个 group 加入集群（gid = g+1）。
 func (c *Cluster) Join(g int) {
 	ck := shardmaster.MakeClerk(c.SMNames, c.make_end)

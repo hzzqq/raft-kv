@@ -139,6 +139,10 @@ reg.Reset()            // 跨用例重置，避免进程级指标累积
 ```
 
 网关的 `GET /metrics` 直接序列化 `shardkv.Metrics.Snapshot()`，便于接入外部监控。
+新增 `shard_migration_ms` 直方图记录分片入站迁移端到端耗时（从 `pendingInSince` 起算，
+到 `applyInstallShard` 落盘或 `applyNewConfig` 消费 incoming 为止）。
+
+线上排障（端点速查、症状对照、迁移卡滞 SOP）见 [`docs/runbook.md`](runbook.md)。
 
 ---
 
