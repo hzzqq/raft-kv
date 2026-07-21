@@ -877,3 +877,64 @@ func TestGatewayCORS(t *testing.T) {
 	}
 	resp4.Body.Close()
 }
+
+// TestGatewayConfigLoad：验证极简 YAML 子集配置解析（I51）——覆盖各字段、列表解析、
+// 未知键忽略，以及 Apply 后 Server 配置生效（限流桶与 CORS 被设置）。cluster-free。
+func TestGatewayConfigLoad(t *testing.T) {
+	yaml := `
+# 网关配置
+listen_addr: ":9090"
+request_timeout_sec: 15
+max_concurrent: 32
+client_rate: 50
+client_burst: 10
+cors_origins: ["https://a.com", "https://b.com"]
+unknown_key: ignored
+`
+	cfg, err := ParseGatewayConfig([]byte(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ListenAddr != ":9090" {
+		t.Fatalf("listen_addr = %q, want :9090", cfg.ListenAddr)
+	}
+	if cfg.RequestTimeout != 15 {
+		t.Fatalf("request_timeout_sec = %d, want 15", cfg.RequestTimeout)
+	}
+	if cfg.MaxConcurrent != 32 {
+		t.Fatalf("max_concurrent = %d, want 32", cfg.MaxConcurrent)
+	}
+	if cfg.ClientRate != 50 {
+		t.Fatalf("client_rate = %v, want 50", cfg.ClientRate)
+	}
+	if cfg.ClientBurst != 10 {
+		t.Fatalf("client_burst = %d, want 10", cfg.ClientBurst)
+	}
+	if len(cfg.CORSOrigins) != 2 || cfg.CORSOrigins[0] != "https://a.com" || cfg.CORSOrigins[1] != "https://b.com" {
+		t.Fatalf("cors_origins = %v, want [a.com b.com]", cfg.CORSOrigins)
+	}
+
+	// Apply 后 Server 配置应生效：限流桶被创建、CORS 被设置。
+	s := &Server{
+		sem:            make(chan struct{}, maxConcurrent),
+		accessCap:      256,
+		logCap:         256,
+		requestTimeout: 30 * time.Second,
+	}
+	cfg.Apply(s)
+	if s.RequestTimeout() != 15*time.Second {
+		t.Fatalf("RequestTimeout after Apply = %v, want 15s", s.RequestTimeout())
+	}
+	if cap(s.sem) != 32 {
+		t.Fatalf("sem cap after Apply = %d, want 32", cap(s.sem))
+	}
+	s.limitMu.Lock()
+	nilMap := s.clientLimiters == nil
+	s.limitMu.Unlock()
+	if nilMap {
+		t.Fatalf("clientLimiters not initialized after Apply")
+	}
+	if len(s.corsOrigins) != 2 {
+		t.Fatalf("corsOrigins after Apply = %v, want 2 entries", s.corsOrigins)
+	}
+}
