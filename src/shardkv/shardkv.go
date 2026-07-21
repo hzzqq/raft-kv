@@ -88,6 +88,7 @@ type kvSnapshot struct {
 	Incoming   map[int]*ShardData
 	PendingIn  map[int]bool
 	PendingOut map[int]bool
+	Installed  map[int]int // 各分片已安装时的配置号（I2 幂等去重，随快照恢复）
 }
 
 func init() {
@@ -163,6 +164,10 @@ type ShardKV struct {
 	pendingInSince  map[int]time.Time // 卡死看门狗：每个 pendingIn 分片首次进入未决态的时间戳（用于 /debug/shards 暴露卡滞时长 + 驱动 rekick）
 	pendingOutSince map[int]time.Time // 同上，针对 pendingOut
 
+	// 迁移幂等 / 配置推进去重辅助状态。
+	installedCfgNum   map[int]int // 每个分片「已安装/已拥有」时对应的配置号，InstallShard 幂等去重依据（I2）
+	proposedConfigNum int         // 本组已向 Raft 提议的最高配置号，pollConfig 去重、避免重复写日志（I8）
+
 	notified map[int64]chan applyResult
 	notifyId int64
 
@@ -200,6 +205,7 @@ func MakeShardKV(gid int, masters []string, make_end func(string) *raft.ClientEn
 		pendingOut:   map[int]bool{},
 		pendingInSince:  map[int]time.Time{},
 		pendingOutSince: map[int]time.Time{},
+		installedCfgNum:   map[int]int{},
 		fetchEpoch:   map[int]int64{},
 		notified:     map[int64]chan applyResult{},
 		maxraftstate: maxraftstate,
@@ -311,7 +317,15 @@ func (kv *ShardKV) pollConfig() {
 		if next.Num != cur+1 {
 			continue
 		}
-		kv.propose(Op{Kind: "NewConfig", Config: next})
+		// I8：去重——同一配置号只向 Raft 提议一次；提议成功（已提交应用）后
+		// applyNewConfig 会更新 proposedConfigNum，否则保持原值以便下次重试。
+		if next.Num <= kv.proposedConfigNum {
+			continue
+		}
+		res := kv.propose(Op{Kind: "NewConfig", Config: next})
+		if res.err == OK {
+			kv.proposedConfigNum = next.Num
+		}
 	}
 }
 
@@ -439,11 +453,30 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	kv.mu.Unlock()
 
-	// 线性一致读：始终走 propose（日志追加）路径——它经 Raft 共识，绝对线性一致。
-	// 注意：本仓库 raft 未实现 leader lease / 心跳确认式 ReadIndex。若走 ReadIndex
-	// 快速路径，分区下旧 leader 会基于落后 commitIndex 返回 stale read（违反线性
-	// 一致），故此处有意不使用该优化，优先保证正确性。待 raft 层补齐 leader lease
-	// 后，可恢复 ReadIndex 快路径（届时需以心跳 round-trip 确认领导权）。
+	// 线性一致读优化（ReadIndex 快路径）：仅当本副本是 leader 且持有合法 leader
+	// 租约（HasLeaderLease，多数派近期有心跳接触）时，才跳过日志追加、直接读本地
+	// 状态机。租约保证该 leader 期间无更新任期产生，commitIndex 不会被回滚，故等待
+	// 本组 apply 到 commitIndex 后本地读是线性一致的。租约失效（分区/刚上任）或分片
+	// 尚未生效时，一律回退 propose 路径，绝不牺牲正确性。
+	if kv.rf.HasLeaderLease() {
+		if commitIdx, isLeader := kv.rf.ReadIndex(); isLeader {
+			if kv.waitApplied(commitIdx, 3*time.Second) {
+				kv.mu.Lock()
+				if sd, ok := kv.shards[shard]; ok {
+					v := sd.Data[args.Key]
+					kv.mu.Unlock()
+					Metrics.Counter("read_leases").Inc()
+					Metrics.Counter("ops_total").Inc()
+					reply.Err = OK
+					reply.Value = v
+					return
+				}
+				kv.mu.Unlock()
+			}
+		}
+	}
+
+	// 回退路径：始终走 propose（经 Raft 共识，绝对线性一致）。
 	start := time.Now()
 	op := Op{Kind: "Cmd", ClientId: args.ClientId, Seq: args.Seq, Shard: shard, Key: args.Key, OpType: "Get"}
 	res := kv.propose(op)
@@ -454,6 +487,25 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	reply.Err = res.err
 	reply.Value = res.value
+}
+
+// waitApplied 轮询等待本组状态机已应用到索引 idx（ReadIndex 快路径用），
+// 超时返回 false。仅用于租约有效的 leader 本地读前，确保读到 commitIndex 对应的
+// 已提交状态。appliedIndex 的读写均在 kv.mu 保护下进行（applier 在持锁时写入）。
+func (kv *ShardKV) waitApplied(idx int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		kv.mu.Lock()
+		applied := kv.appliedIndex
+		kv.mu.Unlock()
+		if applied >= idx {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -532,6 +584,31 @@ func (kv *ShardKV) resolveShardForTransfer(s int) (*ShardData, Err) {
 		return data, OK
 	}
 	return nil, ErrWrongGroup
+}
+
+// debugState 返回一份加锁拷贝的迁移状态快照，仅供测试诊断（避免无锁读 map 触发
+// 并发读写 panic）。打印 pendingIn/pendingOut/shards/incoming 与配置号，定位迁移冻结。
+func (kv *ShardKV) debugState() string {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	pin := []int{}
+	for s := range kv.pendingIn {
+		pin = append(pin, s)
+	}
+	pout := []int{}
+	for s := range kv.pendingOut {
+		pout = append(pout, s)
+	}
+	sh := []int{}
+	for s := range kv.shards {
+		sh = append(sh, s)
+	}
+	inc := []int{}
+	for s := range kv.incoming {
+		inc = append(inc, s)
+	}
+	return fmt.Sprintf("config=%d prev=%d proposed=%d pendingIn=%v pendingOut=%v shards=%v incoming=%v | raft[%s]",
+		kv.config.Num, kv.prevConfig.Num, kv.proposedConfigNum, pin, pout, sh, inc, kv.rf.String())
 }
 
 // ============================== propose / applier ==============================
@@ -623,13 +700,20 @@ func (kv *ShardKV) applier() {
 		ch := kv.notified[nid]
 		delete(kv.notified, nid)
 		kv.appliedIndex = idx
+		// I9：apply 滞后画像 = commitIndex - appliedIndex（提交但未应用条目数）。
+		if ci, _ := kv.rf.ReadIndex(); ci > idx {
+			Metrics.Gauge("apply_lag").Set(float64(ci - idx))
+		} else {
+			Metrics.Gauge("apply_lag").Set(0)
+		}
 		kv.mu.Unlock()
 
 		if ch != nil {
 			ch <- res
 		}
-		// 快照压缩（可选）：日志超过阈值时把 KV 状态压进 Raft 快照。
-		if kv.maxraftstate > 0 && kv.rf.RaftStateSize() > kv.maxraftstate {
+		// 快照压缩（可选）：日志超过阈值时把 KV 状态压进 Raft 快照；另外每次配置
+		// 变更（NewConfig）也强制快照一次，及时固化最新配置 + 迁移状态（I5）。
+		if kv.maxraftstate > 0 && (kv.rf.RaftStateSize() > kv.maxraftstate || op.Kind == "NewConfig") {
 			kv.mu.Lock()
 			data := kv.encodeSnapshot()
 			idx := msg.CommandIndex
@@ -680,6 +764,15 @@ func (kv *ShardKV) applyNewConfig(cfg shardmaster.Config) {
 	}
 	kv.prevConfig = kv.config
 	kv.config = cfg
+	if kv.installedCfgNum == nil {
+		kv.installedCfgNum = map[int]int{}
+	}
+	// I5：配置变更计数（可观测配置推进频率）。
+	Metrics.Counter("config_changes").Inc()
+	// I9：当前生效配置号画像。
+	Metrics.Gauge("config_num").Set(float64(cfg.Num))
+	// I8：配置已应用，更新已提议水位，避免 pollConfig 重复提议。
+	kv.proposedConfigNum = cfg.Num
 	for s := 0; s < NShards; s++ {
 		_, have := kv.shards[s]
 		if cfg.Shards[s] == kv.gid {
@@ -719,6 +812,10 @@ func (kv *ShardKV) applyNewConfig(cfg shardmaster.Config) {
 				// have==true：分片已在上一轮迁移中到位，无需动作。
 			}
 			delete(kv.pendingOut, s) // 本组现在拥有 s，不再迁出它
+			// I2：记录安装配置号（幂等去重依据）。
+			if _, ok := kv.shards[s]; ok {
+				kv.installedCfgNum[s] = cfg.Num
+			}
 		} else {
 			// 本组现在不拥有分片 s
 			if have {
@@ -749,6 +846,9 @@ func (kv *ShardKV) applyNewConfig(cfg shardmaster.Config) {
 }
 
 func (kv *ShardKV) applyInstallShard(op Op, res *applyResult) {
+	if kv.installedCfgNum == nil {
+		kv.installedCfgNum = map[int]int{}
+	}
 	s := op.MigrateShard
 	// 关键并发安全修复：必须深拷贝迁移来的 ShardData 再写入本组状态，绝不能直接存
 	// op.MigrateData 指针。原因：op.MigrateData 的指针同时被存进了本组 Raft 日志
@@ -759,25 +859,50 @@ func (kv *ShardKV) applyInstallShard(op Op, res *applyResult) {
 	// "concurrent map read and map write"（TestSKVConcurrent 在高频 churn + 并发写下必现）。
 	// 深拷贝后，日志里的副本与运行态副本是两份独立对象，互不干扰，竞态彻底消除。
 	incoming := op.MigrateData.copy()
-	if _, exists := kv.shards[s]; exists {
-		// 已拥有该分片：必须"合并"而非"覆盖"。
-		// 新 owner 在迁移期间可能已经直接接收了客户端写（旧 owner 的快照里没有这些写），
-		// 若直接覆盖会把本组已写入的数据冲掉，造成迁移丢数据。合并只补充旧 owner 快照中
-		// 多出来的 key，并取较大的 LastSeq/LastResult 以保住本组的较新写与幂等基线。
-		kv.mergeShardData(s, incoming)
+	// I3（安全版）：仅当本组「当前不拥有」该分片且迁移配置号已落后于本组配置号时，
+	// 才丢弃陈旧传输——此时数据已无用（本组不持有该分片，配置也已推进过去）。
+	// 若本组「拥有」该分片（kv.config.Shards[s]==gid），则这是因"配置推进快于单跳迁移"
+	// 而迟到的合法传输，必须安装，否则 pendingIn 永不清除、配置冻结（ReMigration 快速
+	// churn 回归）。旧的"无条件 op.MigrateConfigNum < config.Num 即丢弃"会把这种合法
+	// 迟到传输也丢掉，正是本次冻结的根因。
+	if op.MigrateConfigNum < kv.config.Num && kv.config.Shards[s] != kv.gid {
 		if res != nil {
 			res.err = OK
 		}
-		return // 幂等：已拥有
+		return
 	}
 	if kv.config.Shards[s] == kv.gid {
-		kv.shards[s] = incoming
+		// 本组拥有该分片：数据已到位，无论是否已持有都必须清除 pendingIn[s] 解除冻结
+		// （I2 之前的实现在"已持有"分支提前 return 漏清 pendingIn，正是 ReMigration 冻结
+		// 的根因）。已持有则合并（保住迁移窗口内的本地写），未持有则直接安装；均按
+		// installedCfgNum 去重避免重复触发迁移耗时计数（I2 / 幂等），但去重绝不阻止清
+		// pendingIn——这是 liveness 关键。
+		if _, exists := kv.shards[s]; exists {
+			if installed := kv.installedCfgNum[s]; installed >= op.MigrateConfigNum {
+				kv.mergeShardData(s, incoming)
+				delete(kv.pendingIn, s)
+				kv.recordMigrationLatency(s)
+				if res != nil {
+					res.err = OK
+				}
+				return
+			}
+			kv.mergeShardData(s, incoming)
+			kv.installedCfgNum[s] = op.MigrateConfigNum
+		} else {
+			kv.shards[s] = incoming
+			kv.installedCfgNum[s] = op.MigrateConfigNum
+		}
 		delete(kv.pendingIn, s)
 		kv.recordMigrationLatency(s)
-	} else {
-		// 配置尚未推进到"拥有该分片"，先缓冲，待 applyNewConfig 消费并安装。
-		kv.incoming[s] = incoming
+		kv.recordShardBytes(s) // I15：记录分片字节大小 + 超大分片告警
+		if res != nil {
+			res.err = OK
+		}
+		return
 	}
+	// 本组当前不拥有该分片：缓冲到 incoming，待 applyNewConfig 推进配置后消费安装。
+	kv.incoming[s] = incoming
 	if res != nil {
 		res.err = OK
 	}
@@ -801,6 +926,31 @@ func (kv *ShardKV) recordMigrationLatency(s int) {
 	if t, ok := kv.pendingInSince[s]; ok && !t.IsZero() {
 		Metrics.Histogram("shard_migration_ms").Record(time.Since(t).Seconds() * 1000)
 	}
+}
+
+// recordShardBytes 记录分片 s 经迁移装入时的序列化字节大小（直方图 shard_bytes），
+// 并对超过阈值（4MiB）的超大分片告警（counter shard_bytes_overflow），便于及时发现
+// 异常大的分片数据拖慢快照/迁移。
+func (kv *ShardKV) recordShardBytes(s int) {
+	sd := kv.shards[s]
+	if sd == nil {
+		return
+	}
+	n := shardByteSize(sd)
+	Metrics.Histogram("shard_bytes").Record(float64(n))
+	const overflowThreshold = 4 * 1024 * 1024
+	if n > overflowThreshold {
+		Metrics.Counter("shard_bytes_overflow").Inc()
+	}
+}
+
+// shardByteSize 返回 ShardData 经 gob 编码后的字节数（用于迁移分片大小观测）。
+func shardByteSize(sd *ShardData) int {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(sd); err != nil {
+		return 0
+	}
+	return buf.Len()
 }
 
 // mergeShardData 将迁移来的分片数据合并进本组已持有的分片：
@@ -971,7 +1121,11 @@ func (kv *ShardKV) sendShard(s, newG int) {
 		for _, srv := range servers {
 			end := kv.make_end(srv)
 			reply := &SendShardReply{}
-			if end.Call("ShardKV.SendShard", &SendShardArgs{Shard: s, Data: data, ConfigNum: cfg.Num}, reply) && reply.Err == OK {
+			t0 := time.Now()
+			ok := end.Call("ShardKV.SendShard", &SendShardArgs{Shard: s, Data: data, ConfigNum: cfg.Num}, reply) && reply.Err == OK
+			// I10：记录 SendShard RPC 延迟（成功/失败均记录），观测迁移推送性能。
+			Metrics.Histogram("send_shard_latency").Record(float64(time.Since(t0).Microseconds()) / 1000.0)
+			if ok {
 				sent = true
 				break
 			}
@@ -1025,6 +1179,10 @@ func (kv *ShardKV) encodeSnapshot() []byte {
 	for k, v := range kv.pendingOut {
 		snap.PendingOut[k] = v
 	}
+	snap.Installed = map[int]int{}
+	for k, v := range kv.installedCfgNum {
+		snap.Installed[k] = v
+	}
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	enc.Encode(snap)
@@ -1059,6 +1217,10 @@ func (kv *ShardKV) installSnapshot(data []byte) {
 	kv.pendingOut = map[int]bool{}
 	for k, v := range snap.PendingOut {
 		kv.pendingOut[k] = v
+	}
+	kv.installedCfgNum = map[int]int{}
+	for k, v := range snap.Installed {
+		kv.installedCfgNum[k] = v
 	}
 	kv.config = snap.Config
 	kv.prevConfig = snap.PrevConfig

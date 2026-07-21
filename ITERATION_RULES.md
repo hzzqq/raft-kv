@@ -18,6 +18,24 @@
 - **push 授权已确认**：10 轮完成后执行普通快进 `git push origin master`（不 `--force`）。
 - 纪律延续 §一~§五；绿条优先——任何会破坏既有绿条的修复先回退换方向。
 
+## 〇、本轮批次（cycle 68–87，2026-07-21「照刚刚的迭代20次」）
+- 基线：cycle 67 tip `b453452`（快照看门狗 / 迁移 RPC 退避 / GC 守卫 / 网关 `/debug/configs` /
+  迁移延迟直方图 / kvraft flaky 审计 / 运维 runbook），全量 `go test ./...` 绿。
+- 本批 20 轮聚焦（新增功能 / 完善旧功能 / 解决显性与隐性问题）：
+  1. raft leader lease（`HasLeaderLease`）+ ShardKV `Get` ReadIndex 快读复活（I1）；
+  2. 配置号幂等 `installedCfgNum` + 过期传输安全丢弃（I2/I3），修复 ReMigration 快速 churn 冻结回归；
+  3. `pollConfig` 去重（`proposedConfigNum`）避免重复提议（I4/I8）；
+  4. 配置变更/快照指标（`config_changes` / `config_num` / 快照压缩含 `NewConfig`）（I5/I9）；
+  5. 迁移分片字节观测 `shard_bytes` / `shard_bytes_overflow` + 每跳延迟 `send_shard_latency`（I10/I15）；
+  6. shardmaster 最小搬动 `rebalance` + 输入校验 `ErrInvalid`；
+  7. 网关并发限流 429 + 优雅退出 `Shutdown` + `/debug/groups`（I 网关层）；
+  8. kvraft 客户端会话 GC（TTL）；
+  9. metrics 新增 `Gauge` 类型；
+  10. 混沌测试 `TestChaosLeaderKillDuringMigration`（I16）/ `TestChaosLongRun`（I18）+ CI `chaos-race`（I17）/ `chaos-long`（I18）job；
+  11. README / runbook / 交接文档同步。
+- **push 授权已确认**（沿用 §一.5）：20 轮完成后执行普通快进 `git push origin master`（不 `--force`、不 `rm -rf`）。
+- 纪律延续 §一~§五；绿条优先——任何会破坏既有绿条的修复先回退换方向。
+
 ## 一、安全红线（不可逾越）
 1. 每次改动必须先 `go build ./...` + `go vet` + 相关包测试通过，方可提交；绝不把项目留在损坏/不编译状态。
 2. 验收不过：先尝试一次修复；一次修复仍失败 → 回滚本次改动（`git checkout -- <files>`），记录原因，换下一个需求，不空转。

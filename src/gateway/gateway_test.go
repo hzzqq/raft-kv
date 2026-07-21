@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"raftkv/src/cluster"
+	"raftkv/src/shardmaster"
 )
 
 func TestGatewayHTTP(t *testing.T) {
@@ -255,5 +257,167 @@ func TestGatewayConfigs(t *testing.T) {
 	}
 	if len(seenGroups) == 0 {
 		t.Fatalf("/debug/configs 未包含任何 group 配置")
+	}
+}
+
+// TestGatewayConcurrencyLimit：并发洪泛远超信号量上限（64）的 /kv 请求（I12 的核心
+// 担忧场景——慢速 Raft 读会在信号量上真实重叠），验证网关不会无限排队：超出的请求
+// 立即得到 429，而整体保持稳定（无 panic、所有请求都能收到响应、洪泛后仍可用）。
+func TestGatewayConcurrencyLimit(t *testing.T) {
+	c := cluster.StartCluster(2, 3, 3, 0)
+	defer c.Cleanup()
+	s := NewServer(c)
+	s.Init(2)
+
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	// 先写入一个值，使后续 GET 在未被限流时返回 200。
+	putReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/kv/flood", strings.NewReader("v"))
+	if pr, err := http.DefaultClient.Do(putReq); err != nil {
+		t.Fatal(err)
+	} else {
+		pr.Body.Close()
+	}
+
+	const n = 240
+	// 客户端并发上限（90 个连接），既压垮测试监听器 accept 队列，又仍远高于
+	// 网关 64 个信号量槽——因此 handler 会真实重叠打满信号量，触发 429；同时
+	// 不至于把内存 Raft 集群压到不可恢复。
+	const clientConc = 90
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	got200, got429, gotOther := 0, 0, 0
+	var firstErr error
+	gate := make(chan struct{}, clientConc)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			gate <- struct{}{}
+			defer func() { <-gate }()
+			resp, err := http.Get(ts.URL + "/kv/flood")
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
+			}
+			code := resp.StatusCode
+			resp.Body.Close()
+			mu.Lock()
+			switch code {
+			case http.StatusOK:
+				got200++
+			case http.StatusTooManyRequests:
+				got429++
+			default:
+				gotOther++
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		t.Fatalf("unexpected request error: %v", firstErr)
+	}
+	total := got200 + got429 + gotOther
+	if total != n {
+		t.Fatalf("processed %d requests, want %d (200=%d, 429=%d, other=%d)", total, n, got200, got429, gotOther)
+	}
+	if got200 == 0 {
+		t.Fatalf("expected some 200 responses, got none (429=%d, other=%d)", got429, gotOther)
+	}
+	if got429 == 0 {
+		t.Fatalf("expected some 429 responses under flood, got none (200=%d, other=%d)", got200, gotOther)
+	}
+
+	// 洪泛后网关仍可用：/kv 请求应在短暂收敛后再次稳定返回 200（容忍洪泛造成的
+	// 内存集群瞬时不可达——网关已正确以 429/504 快速失败而非挂死，这里只验证恢复）。
+	var recovered bool
+	for attempt := 0; attempt < 20; attempt++ {
+		resp, err := http.Get(ts.URL + "/kv/flood")
+		if err == nil {
+			code := resp.StatusCode
+			resp.Body.Close()
+			if code == http.StatusOK {
+				recovered = true
+				break
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !recovered {
+		t.Fatalf("gateway did not recover to 200 after flood (last seen non-200/err)")
+	}
+}
+
+// TestGatewayGroups：GET /debug/groups 返回当前 group 成员与分片归属的 JSON，
+// 结构正确、gid 齐全、且 [0..NShards) 正好被各 group 不重不漏地切分（I14）。
+func TestGatewayGroups(t *testing.T) {
+	const nGroups = 3
+	c := cluster.StartCluster(nGroups, 3, 3, 0)
+	defer c.Cleanup()
+	s := NewServer(c)
+	s.Init(nGroups)
+
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/debug/groups")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /debug/groups = %d, want 200", resp.StatusCode)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var out struct {
+		Num    int `json:"num"`
+		Groups []struct {
+			GID     int      `json:"gid"`
+			Servers []string `json:"servers"`
+			Shards  []int    `json:"shards"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("decode /debug/groups: %v\nbody=%s", err, string(b))
+	}
+	if len(out.Groups) != nGroups {
+		t.Fatalf("/debug/groups groups = %d, want %d (body=%s)", len(out.Groups), nGroups, string(b))
+	}
+
+	// gids 应为 1..nGroups，且每个 group 都有 server 成员。
+	seen := map[int]bool{}
+	allShards := map[int]bool{}
+	for _, g := range out.Groups {
+		seen[g.GID] = true
+		if len(g.Servers) == 0 {
+			t.Fatalf("gid %d has no servers: %s", g.GID, string(b))
+		}
+		for _, sh := range g.Shards {
+			if allShards[sh] {
+				t.Fatalf("shard %d owned by more than one group: %s", sh, string(b))
+			}
+			allShards[sh] = true
+		}
+	}
+	for i := 1; i <= nGroups; i++ {
+		if !seen[i] {
+			t.Fatalf("gid %d missing from /debug/groups: %s", i, string(b))
+		}
+	}
+
+	// [0..NShards) 必须被恰好覆盖一次（不重不漏）。
+	for i := 0; i < shardmaster.NShards; i++ {
+		if !allShards[i] {
+			t.Fatalf("shard %d not owned by any group: %s", i, string(b))
+		}
 	}
 }

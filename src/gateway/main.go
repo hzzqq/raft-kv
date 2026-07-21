@@ -27,8 +27,9 @@ func main() {
 	s.Init(nGroups)
 
 	srv := &http.Server{Addr: addr, Handler: s.Handler()}
+	s.SetHTTPServer(srv)
 
-	// 优雅退出：捕获 SIGINT/SIGTERM，先关闭监听、再给在途请求 5s 宽限，最后 defer 清理集群。
+	// 优雅退出：捕获 SIGINT/SIGTERM，先等待在途请求完成、再关闭监听，最后 defer 清理集群。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -44,7 +45,7 @@ func main() {
 	fmt.Println("\n>> 收到终止信号，优雅关闭网关中...")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	if err := s.Shutdown(shutdownCtx); err != nil {
 		fmt.Fprintln(os.Stderr, "gateway shutdown error:", err)
 	}
 }

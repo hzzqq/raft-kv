@@ -26,6 +26,7 @@ const (
 	OK             Err = "OK"
 	ErrWrongLeader Err = "ErrWrongLeader"
 	ErrTimeout     Err = "ErrTimeout"
+	ErrInvalid     Err = "ErrInvalid"
 )
 
 // Config 是一份分片配置。Num 单调递增；Shards[i] 表示分片 i 由哪个 gid 负责；
@@ -208,21 +209,80 @@ func (sm *ShardMaster) applyOp(op Op) {
 	sm.configs = append(sm.configs, newCfg)
 }
 
-// rebalance 把 NShards 个分片尽量均匀地分给当前所有 group（确定性轮转）。
+// rebalance 在保持尽可能多已有 shard→gid 分配的前提下，把 NShards 个分片
+// 尽量均匀地分给当前所有 group（负载差不超过 ±1）。完全确定性：gids 按升序
+// 处理，分片按下标顺序扫描。Move 的单分片覆盖在 applyOp 中完成，不调用本函数。
+// 当 group 数量变化时，仅搬动"必须搬动"的分片（被移除 group 的碎片与超出目标
+// 负载的碎片），从而把配置变更的扰动降到最小。
 func rebalance(cfg *Config) {
 	gids := make([]int, 0, len(cfg.Groups))
 	for g := range cfg.Groups {
 		gids = append(gids, g)
 	}
 	sort.Ints(gids)
-	if len(gids) == 0 {
+	ng := len(gids)
+	if ng == 0 {
 		for i := range cfg.Shards {
 			cfg.Shards[i] = 0
 		}
 		return
 	}
-	for i := range cfg.Shards {
-		cfg.Shards[i] = gids[i%len(gids)]
+	idxOf := make(map[int]int, ng)
+	for i, g := range gids {
+		idxOf[g] = i
+	}
+	// 目标负载：前 extra 个 group 各得 base+1，其余各得 base（差不超过 ±1）。
+	load := make([]int, ng)
+	target := make([]int, ng)
+	base := NShards / ng
+	extra := NShards % ng
+	for i := 0; i < ng; i++ {
+		if i < extra {
+			target[i] = base + 1
+		} else {
+			target[i] = base
+		}
+	}
+	// 统计当前仍有效的分配负载；gid 已不在 Groups 的碎片标记为待重分配(-1)。
+	for i := 0; i < NShards; i++ {
+		g := cfg.Shards[i]
+		if gi, ok := idxOf[g]; ok {
+			load[gi]++
+		} else {
+			cfg.Shards[i] = -1
+		}
+	}
+	// 把超额 group 上多出的碎片释放出来（按下标顺序释放其名下分片）。
+	for gi := 0; gi < ng; gi++ {
+		for load[gi] > target[gi] {
+			for i := 0; i < NShards; i++ {
+				if cfg.Shards[i] == gids[gi] {
+					cfg.Shards[i] = -1
+					load[gi]--
+					break
+				}
+			}
+		}
+	}
+	// 把每个待重分配碎片交给"当前负载最低且尚未达标"的 group。
+	for i := 0; i < NShards; i++ {
+		if cfg.Shards[i] != -1 {
+			continue
+		}
+		best := -1
+		for gi := 0; gi < ng; gi++ {
+			if load[gi] >= target[gi] {
+				continue
+			}
+			if best == -1 || load[gi] < load[best] {
+				best = gi
+			}
+		}
+		if best == -1 {
+			best = 0 // 理论上不会触发（总有未达标 group）
+		}
+		cfg.Shards[i] = gids[best]
+		load[best]++
 	}
 }
 
@@ -232,6 +292,59 @@ func copyGroups(src map[int][]string) map[int][]string {
 		dst[g] = append([]string{}, s...)
 	}
 	return dst
+}
+
+// ============================== 输入校验（I6） ==============================
+
+// validateJoin：gid 必须 > 0；每个 servers 条目必须非空；且不可重复加入已存在的 gid。
+func validateJoin(groups map[int][]string, servers map[int][]string) bool {
+	if len(servers) == 0 {
+		return false
+	}
+	for gid, srvs := range servers {
+		if gid <= 0 {
+			return false
+		}
+		if len(srvs) == 0 {
+			return false
+		}
+		if _, exists := groups[gid]; exists {
+			return false
+		}
+	}
+	return true
+}
+
+// validateLeave：每个待移除 gid 必须当前存在于 Groups 中（空列表视为非法）。
+func validateLeave(groups map[int][]string, gids []int) bool {
+	if len(gids) == 0 {
+		return false
+	}
+	seen := map[int]bool{}
+	for _, g := range gids {
+		if g <= 0 {
+			return false
+		}
+		if seen[g] {
+			return false
+		}
+		seen[g] = true
+		if _, exists := groups[g]; !exists {
+			return false
+		}
+	}
+	return true
+}
+
+// validateMove：分片下标必须在 [0, NShards)；目标 gid 必须存在于当前 Groups。
+func validateMove(groups map[int][]string, shard, gid int) bool {
+	if shard < 0 || shard >= NShards {
+		return false
+	}
+	if _, exists := groups[gid]; !exists {
+		return false
+	}
+	return true
 }
 
 // ============================== RPC：Join / Leave / Move ==============================
@@ -270,12 +383,33 @@ func (sm *ShardMaster) propose(op Op) Err {
 }
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
+	sm.mu.Lock()
+	ok := validateJoin(sm.configs[len(sm.configs)-1].Groups, args.Servers)
+	sm.mu.Unlock()
+	if !ok {
+		reply.Err = ErrInvalid
+		return
+	}
 	reply.Err = sm.propose(Op{Kind: "Join", CkId: args.CkId, Seq: args.Seq, Servers: args.Servers})
 }
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
+	sm.mu.Lock()
+	ok := validateLeave(sm.configs[len(sm.configs)-1].Groups, args.Gids)
+	sm.mu.Unlock()
+	if !ok {
+		reply.Err = ErrInvalid
+		return
+	}
 	reply.Err = sm.propose(Op{Kind: "Leave", CkId: args.CkId, Seq: args.Seq, Gids: args.Gids})
 }
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
+	sm.mu.Lock()
+	ok := validateMove(sm.configs[len(sm.configs)-1].Groups, args.Shard, args.Gid)
+	sm.mu.Unlock()
+	if !ok {
+		reply.Err = ErrInvalid
+		return
+	}
 	reply.Err = sm.propose(Op{Kind: "Move", CkId: args.CkId, Seq: args.Seq, Shard: args.Shard, Gid: args.Gid})
 }
 

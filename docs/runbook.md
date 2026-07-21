@@ -13,7 +13,8 @@
 | `GET /debug/shards` | 全集群每副本的分片归属 + 迁移态（`pending_in` / `pending_out` / `incoming`）+ 卡滞时间戳。最细粒度。 |
 | `GET /debug/migrate` | 纯文本迁移进度，供 `./start.sh migrate` 直接看。 |
 | `GET /debug/configs` | shardmaster 完整配置历史（初始 → 最新），复盘 rebalance 轨迹，确认分片在哪些 group 间迁移。 |
-| `GET /metrics` | 计数器 + 直方图（含 `shard_migration_ms` 迁移延迟、`op_latency_ms` 操作延迟、`config_stalls` 冻结计数）。 |
+| `GET /debug/groups` | 各 replica group 的 `gid` / 副本数 / leader / 当前 config 号 / 持有分片数，快速核对「哪个 group 当前拥有哪些分片」。 |
+| `GET /metrics` | 计数器 + 直方图 + 瞬时 Gauge（含 `shard_migration_ms` 迁移延迟、`op_latency_ms` 操作延迟、`config_stalls` 冻结计数、`config_changes` 配置变更次数、`config_num` 当前生效配置号 Gauge、`apply_lag` 应用滞后 Gauge、`shard_bytes` 分片字节直方图、`shard_bytes_overflow` 超大分片告警、`send_shard_latency` 每跳迁移延迟、`read_leases` ReadIndex 快读命中计数）。 |
 
 CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh configs`。
 
@@ -40,6 +41,12 @@ CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh conf
 - 若 owner 就是本组自身（A→B→A 快速回摆），`migratePump` 会清除残留标记（`applyGC` 守卫保证不自删权威分片，见 §4）；
 - 否则 `sendShard` 重试推送，成功后 `propose(GCShard)` 清理。
 
+### 症状 D：网关在迁移抖动 / 压测下返回 `429 Too Many Requests`
+**含义**：网关并发上限（默认 64，`Server.sem` 信号量）被占满，新请求被限流保护而非雪崩。
+**排查**：属预期保护行为；若常态性触顶，说明上游并发过高或后端迁移期变慢。可经 `main.go`
+的 `maxConcurrent` 调大，或降低 `kvcli bench` 的并发 worker 数。限流仅作用在网关入口，
+不丢数据——客户端按 429 退避重试即可。
+
 ## 3. kvraft 包「flaky 挂死」说明（非代码 bug）
 
 `src/kvraft` 的不可靠/分区类测试（如 `TestKVSnapshotStress`、分区场景）在受限 CPU
@@ -60,9 +67,12 @@ CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh conf
   的改法（cycle 9 / 55 / 本轮初三次重蹈，会打爆网络/选举、整集群冻结）。
 - **GC 守卫**：`applyGC` 仅在本组当前配置不再拥有该分片时才删除其数据；A→B→A 快速
   回摆下残留 `pending_out` 被 `migratePump` 触发自 GC 时不会删掉本组权威副本。
-- **线性一致读（迭代 8）**：`Get` 始终走 `propose`（经 Raft 共识，绝对线性一致）。本仓库
-  raft 未实现 leader lease / 心跳确认式 ReadIndex，旧 `ReadIndex` 快路径在分区下会返回
-  stale read，故有意禁用。待 raft 补齐 leader lease 后可恢复该优化。
+- **线性一致读（迭代 8 引入，本轮经 leader lease 重新启用）**：`Get` 在 leader 上先查
+  `raft.HasLeaderLease()`，持 lease 时走 ReadIndex 快读（以 `commitIndex` 为一致性点、待状态机
+  `apply` 到该索引后直接读本地，省一次日志追加、低延迟）；无 lease / 失去领导权 / 超时则回退
+  `propose`（同样线性一致）。leader lease 由每节点维护的 `lastContact[peer]`（收到合法
+  `AppendEntries`/`InstallSnapshot` 时刷新）+ 多数派近因判定提供，避免无 lease 下的 stale read——
+  故快读路径现可安全启用，`read_leases` 计数可观测命中率。
 - **迁移 RPC 退避（迭代 2）**：`fetchShard`/`sendShard` 指数退避（首跳 50ms，上限 1s），
   churn 下降低 RPC 风暴。
 - **迁移延迟直方图（迭代 5）**：`/metrics` 的 `shard_migration_ms` 记录分片从待接收到

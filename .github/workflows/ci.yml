@@ -34,7 +34,7 @@ jobs:
         # AND the concurrent + ReadIndex fast-path workloads to catch data races in the
         # migration state machine and the appliedIndex/ReadIndex read path.
         # (SnapshotChurn at maxraftstate>0 is heavier; kept out to limit CI time.)
-        run: go test -race ./src/shardkv/ -run 'TestSKVBasic|TestSKVMove|TestSKVConcurrent|TestSKVReadIndex' -count=1 -timeout 600s
+        run: go test -race ./src/shardkv/ -run 'TestSKVBasic|TestSKVMove|TestSKVConcurrent|TestSKVReadIndex|TestChaosLeaderKillDuringMigration' -count=1 -timeout 600s
 
       - name: Test ShardKV SnapshotChurn with race detector (best-effort)
         # SnapshotChurn 走 maxraftstate>0 的快照压缩 + churn 路径，是 installSnapshot /
@@ -60,6 +60,43 @@ jobs:
 
       - name: Migration stress (ReMigration + ThreeGroupChurn, -count=5)
         run: go test ./src/shardkv/ -run 'TestSKVReMigration|TestSKVThreeGroupChurn' -count=5 -timeout 900s
+
+  # I17：混沌-竞态专项。把"迁移中杀主"的并发路径（sendShard/fetchShard/migratePump
+  # 与 ReadIndex 快读、appliedIndex 并发读）放 -race 下跑，专门捕获迁移状态机与读
+  # 路径的数据竞态。本地 managed Go 无 gcc，故放 CI 侧；continue-on-error 不阻断
+  # 流水线——暴露竞态即上报。
+  chaos-race:
+    runs-on: ubuntu-latest
+    needs: test
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Race detector on chaos + migration paths
+        run: go test -race ./src/shardkv/ -run 'TestChaosLeaderKillDuringMigration|TestChaosLongRun|TestSKVReMigration|TestSKVThreeGroupChurn|TestSKVConfigProgress|TestSKVReadIndex|TestSKVLinearizableAppend' -count=1 -timeout 900s
+
+  # I18：混沌长时 job。用 -count 放大"迁移中杀主 + 分片漂移 + 并发读"的 liveness
+  # 回归概率（冻结/死锁属 liveness 问题，无需 -race 即可暴露）。常驻必过。
+  chaos-long:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Chaos long run (amplified)
+        run: go test ./src/shardkv/ -run 'TestChaosLongRun|TestSKVReMigration|TestSKVThreeGroupChurn|TestSKVConfigProgress|TestSKVReadIndex|TestSKVLinearizableAppend' -count=3 -timeout 1200s
 
   fullstack-smoke:
     runs-on: ubuntu-latest

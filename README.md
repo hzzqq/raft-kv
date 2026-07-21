@@ -106,6 +106,7 @@ curl http://localhost:8080/metrics           # -> JSON 指标快照
 - **no-op 任期开头条目**：leader 上任时立即追加一条空命令（no-op）。按 Raft 提交规则，leader 只能借助"当前任期"的条目来间接提交旧任期的日志——no-op 作为当前任期的首条条目，被多数派复制并提交后即可"拉动"先前未提交的旧条目，分区愈合后状态机才能补齐。
 - **持久化（2C）**：`persist()` 保存 `currentTerm` / `votedFor` / `log` / 快照边界；`readPersist()` 容忍损坏数据。日志以 `interface{}` 形式 gob 编码，KV 层在 `init()` 中 `gob.Register(Op{})`，否则重启后日志反序列化失败、命令丢失。
 - **快照（2D）**：`Snapshot` / `CondInstallSnapshot` / `InstallSnapshot`，落后节点通过快照追赶。
+- **leader lease（本轮新增）**：每个节点维护 `lastContact[peer]`（收到合法 `AppendEntries` / `InstallSnapshot` 时刷新），`HasLeaderLease()` 统计在 `ElectionTimeoutMin` 窗口内联系到多数派的节点——leader 仅在有 lease 时才对外提供 ReadIndex 线性一致读，避免无 lease 保证下的陈旧读（详见 shardkv ReadIndex）。
 - **并发**：所有状态访问走 `rf.mu`；复制由心跳计时器（~110ms）触发，避免持锁发 RPC 造成死锁。
 
 ### kvraft（KV 层）—— Lab 3
@@ -114,11 +115,13 @@ curl http://localhost:8080/metrics           # -> JSON 指标快照
 - `Clerk` 轮询各节点，遇到 `WrongLeader` 自动切换 `leaderHint` 重试。
 - `waitApplied` 用带缓冲的 `notify` channel + 1s 超时，防止 leader 切换导致结果错位。
 - `applier` 对 leader 的 no-op（nil 命令）直接跳过，不更新状态机。
+- **客户端会话 GC（本轮新增）**：以 `sessions[clientId] → clientSession{LastSeq, LastResult, lastAccess}` 取代旧的 `lastSeq/lastResult` 两个扁平 map，后台 `gc()` 按 TTL（默认 1h）清理空闲会话，避免长期运行内存无限增长；`Kill()` 经 `sync.Once` 关闭 `killCh` 停用 GC，配套 `TestClientSessionGC` 回归。
 
 ### shardmaster（配置服务）—— Lab 4 控制器
 - 维护 `NShards = 10` 个分片到 replica group 的映射，并通过 Raft 复制每一次配置变更，保证配置序列的线性一致。
 - **接口**：`Join`（新增 group）/ `Leave`（移除 group）/ `Move`（手工迁移单分片）/ `Query`（读取最新或历史配置）。
 - **确定性再平衡** `rebalance`：对当前所有 `gid` 排序后轮转分配 10 个分片，保证同一份初始配置下结果唯一、可复现。
+- **最小化搬动 + 输入校验（本轮强化）**：`rebalance` 改为「保留上一版分片映射 + 仅把多余分片从负载最重组搬到最轻组」的确定性最小搬动策略，避免每次 Join/Leave 全量重排引发大范围迁移抖动；`Join` / `Leave` / `Move` 增加输入校验（空 group / 重复 gid / 越界分片 / 未知操作 → `ErrInvalid`），非法请求直接拒绝不落 Raft，配套 `TestShardMasterValidation` / `TestRebalanceMinimalMoves` / `TestRebalanceKeepsBalance` 回归。
 - **Move 只改一个分片**：新配置从上一版**继承完整分片映射**，仅覆盖被 `Move` 的目标分片，其余分片归属不变。若从全零数组开始只写一个分片，会让其余 9 个分片被清零成「未分配(gid 0)」，replica group 集体丢失分片所有权而卡死——这是 `Apply` 路径里最隐蔽的一类 bug。
 - **幂等去重**：`Op` 携带 `CkId` + `Seq`，applier 仅当 `Seq > lastSeq[CkId]` 才应用；`Query` 为只读（不加 Raft，直接返回已提交的最新配置）。
 - **消除丢失唤醒竞态**：调用方在 `rf.Start` **之前**就分配并注册 `NotifyId`，applier 据此唤醒等待者，避免"先 Start 拿 index 再注册 channel"造成的丢失唤醒。
@@ -132,7 +135,8 @@ curl http://localhost:8080/metrics           # -> JSON 指标快照
 - **跨迁移客户端幂等**：每个分片的 `ShardData` 独立保存 `LastSeq` / `LastResult`，保证迁移前后客户端命令不重复执行。
 - **迁移期「合并而非覆盖」**：新 owner 在分片正式归属前就可能已直接收到客户端写；此时若旧 owner 的迁移快照到达，必须**合并**（只补充旧 owner 快照里多出来的 key，并取较大的 `LastSeq`/`LastResult`）而非整体覆盖，否则会把新 owner 在迁移窗口内已写入的数据冲掉，造成迁移丢数据。此逻辑同时作用于 `applyInstallShard`（已持有分片时）与 `applyNewConfig`（incoming 缓冲在配置推进时落地）两个入口。
 - **快照压缩**：KV 状态（各分片数据 + 当前/上一版配置 + 迁移中的 incoming/pending）被 gob 压进 Raft 快照；`installSnapshot` 在重启/落后追赶时一次性恢复。
-- **ReadIndex 线性一致快速读（cycle 19）**：`Clerk`/`Get` 在 leader 上以 `commitIndex` 为一致性点，待本组状态机 `apply` 到该索引后直接读本地状态机，省去一次日志追加；等待期间失去领导权或超时则回退到常规 `propose` 路径（同样线性一致）。`raft.ReadIndex()` 返回 leader 的 `commitIndex` + 领导权标记，`ShardKV.appliedIndex` 由 applier 在每条已应用条目 / 快照上置为绝对索引。
+- **ReadIndex 线性一致快速读（cycle 19 引入，本轮经 leader lease 重新启用）**：`Get` 在 leader 上先查 `raft.HasLeaderLease()`，持 lease 时以 `commitIndex` 为一致性点、待状态机 `apply` 到该索引后直接读本地状态机（省一次日志追加，纯读路径低延迟）；此前因 raft 层无 lease 保证而被保守禁用，现 `HasLeaderLease()` 提供任期 + 多数派近因保证，快读路径安全复活。失去领导权 / 无 lease / 超时则回退常规 `propose` 路径（同样线性一致）。`raft.ReadIndex()` 返回 leader 的 `commitIndex` + 领导权标记，`ShardKV.appliedIndex` 由 applier 在每条已应用条目 / 快照上置为绝对索引。
+- **配置号幂等 + 过期传输安全丢弃（本轮 I2/I3 修复）**：`applyInstallShard` 以 `installedCfgNum[s]` 记录每分片「最近一次成功安装的迁移配置号」，重复/迟到的同号或旧号推送仅合并（不覆盖）不重复计耗时；**过期丢弃仅在本组「不拥有」该分片时进行**——若本组拥有该分片则迟到的合法传输（配置推进快于单跳迁移）必须安装，否则 `pendingIn[s]` 永不清除、配置冻结（ReMigration 快速 churn 回归根因，已修复并加 `TestInstallShardConfigNumIdempotent` / `TestDropStaleIncoming` 白盒回归）。
 
 ## 全栈组件与可观测性
 
@@ -147,10 +151,11 @@ curl http://localhost:8080/metrics           # -> JSON 指标快照
   `GET /healthz`、`GET /metrics`（JSON 序列化 `shardkv.Metrics` 快照）、`GET /debug/shards`（逐副本暴露分片归属 + 迁移状态 `pendingIn/pendingOut/incoming` + **卡滞时间戳 `PendingInSince/PendingOutSince` 与 `StallSeconds`**，用于诊断 3 组再平衡冻结）。
   另提供 **`GET /status`**（集群健康总览 JSON：`ClusterStatus`，每 group leader/config/持有/待收/待迁/孤儿中转计数 + 卡滞秒数 + 整体 `healthy` 标志，卡滞 >2s 即判冻结，供监控/告警轮询）与 **`GET /debug/migrate`**（纯文本迁移进度，供 CLI `start.sh migrate` 直接展示）。
   集群冻结时通过「1s RPC 超时 + 5s 有界重试」**快速失败**并返回正确 REST 语义（`ErrWrongGroup→409` / `ErrWrongLeader→503` / `ErrTimeout→504`），而非挂死。`Handler()` 可单测；`main.go` 支持 `SIGINT`/`SIGTERM` 优雅退出。
+  另提供 **并发限流**（默认 64 并发，`sem` 信号量，超量返回 `429 Too Many Requests`，避免网关在迁移抖动期被压垮）；**优雅退出 `Shutdown(ctx)`**（`sync.WaitGroup` 等待在途请求结束、关闭 `applyCh` 防泄漏，供 `main.go` 的 `SIGINT`/`SIGTERM` 调用）；新增 **`GET /debug/groups`** 暴露各 replica group 的 `gid` / 副本数 / leader / 当前 config / 持有分片数，便于排障，配套 `TestGatewayConcurrencyLimit` / `TestGatewayGroups` 回归。
 - **`kvcli`**（`src/kvcli`）：HTTP 客户端 + 压测工具，`get`/`put`/`append` 子命令外，
   另有 `bench [op] [ops] [workers]` 报告端到端吞吐与 `p50/p95/p99` 延迟。
-- **`metrics`**（`src/metrics`）：零依赖并发安全指标库（Counter + 有界环形 Histogram + Registry），
-  已接入 `raft` / `kvraft` / `shardkv` 三个热路径（纯原子增量，不改行为），供网关 `/metrics` 暴露。
+- **`metrics`**（`src/metrics`）：零依赖并发安全指标库（Counter + **Gauge（瞬时值，如当前 config 号 / apply 滞后，原子位模式存储 float64）** + 有界环形 Histogram + Registry），
+  已接入 `raft` / `kvraft` / `shardkv` 三个热路径（纯原子增量，不改行为），供网关 `/metrics` 暴露；本轮新增 `config_changes` / `config_num` / `apply_lag` / `shard_bytes` / `shard_bytes_overflow` / `send_shard_latency` / `config_stalls` 等指标。
 
 ## 构建与测试
 
@@ -189,6 +194,7 @@ export GO111MODULE=on
   - `TestSKVConcurrent` 多客户端并发写 + 后台 churn，线性一致；`TestSKVSnapshotChurn` 开启 `maxraftstate` 下并发 + churn（命中 `installSnapshot` 路径）；`TestSKVReMigration` 单分片 A→B→A 快速漂移（配置不冻结、迁移窗口内写不丢）；`TestSKVConfigProgress` 多轮 Move 下配置持续推进 + 数据完整。
   - `TestSKVLinearizableAppend`（cycle 29）N 个并发 Clerk 对各自 key 追加顺序敏感值，后台 2 组 churn 下断言 `Get` 等于运行期拼接串，捕捉「迁移丢更新/乱序/覆盖」（比 Put-Get 更强的线性一致守卫）；`TestSKVPersistRestart`（cycle 34）写入后杀掉并**用同一 `raft.Persister` 重启整组副本**，断言数据可读且可继续写（快照压缩之外的另一条崩溃恢复路径）。
   - `TestSKVThreeGroupChurn`（cycle 40）构造 3 组反复 `Leave`/`Join` 的整体再平衡 churn，是 §7 冻结根因的复现载体；**现已转为常驻**（冻结根因已修复，见下）。
+  - **混沌测试（本轮 I16/I18）**：`TestChaosLeaderKillDuringMigration`（I16）在分片持续迁移窗口内反复杀掉源/目的组 leader 并重启（同一 `raft.Persister` 崩溃恢复），断言配置持续推进、数据不丢——专门守护 cycle 48 孤儿 incoming / pendingIn 残留根因在「迁移中杀主」场景下不复发；`TestChaosLongRun`（I18）更长轮次（40 轮）+ 并发纯读放大崩溃-重选窗口。CI 侧新增 `chaos-race`（I17，`-race` 覆盖混沌/迁移路径，本地无 gcc 故放 CI）与 `chaos-long`（I18，放大轮次防 liveness 回归）两个 job。
   - **3 组/多跳再平衡冻结已根治**（详见设计文档 §7）：两条失效路径均消除——① fetch 侧卡死由 cycle 48 的「`applyNewConfig` 消费 `incoming` 必清 `pendingIn` + `pollConfig` 仅以 `pendingIn` 门控配置推进 + `migratePump` 保活泵」消除；② orphan incoming（中间组收到迟到推送却无主可装、真正主人永远拉不到）由本轮的 `GetShard` **安全回退**（本组 `shards[s]` 缺失时返回 `incoming[s]`，只读、零改写、零新协程，与 `applyNewConfig` 权威路径正交）消除。曾 3 次尝试「独立 goroutine 改写状态式」修复（cycle 9 `reconcile`、cycle 55 `drainOrphanedIncoming`、本轮初 `forwardIncoming`）均因状态冲突 / RPC 风暴回归，`GetShard` 回退为正确解。`TestSKVReMigration`（A→B→A 漂移）与 `TestSKVThreeGroupChurn`（3 组 churn）现已**常驻且确定性通过**（`-count=3` 串行复跑均 3/3），CI 侧另设 `migration-stress` job 以 `-count=5` 高压力防回归。
   - **迁移 liveness 看门狗（cycle 39）**：`pollConfig` 在 `pendingIn/pendingOut` 任一分片卡滞 >3s 时，以**最新** ShardMaster 配置重算 owner 并重拉取/重推送（`fetchEpoch` bump 使陈旧 fetcher 自退），同时 `Metrics.Counter("config_stalls").Inc()`（`/metrics` 可观测）。网关 `/debug/shards` 暴露 `PendingInSince/PendingOutSince/StallSeconds`（cycle 46），`/status` 的 `healthy` 以卡滞 >2s 为冻结判据。看门狗作为极端卡死兜底 + 观测信号保留。
 
@@ -200,7 +206,7 @@ export GO111MODULE=on
 ## 验证状态说明
 - Labs 2–3、`shardmaster`、`shardkv` 均已在本地 Go 1.22.5 下通过 `go vet` + `go test`（含 `-count=1`）验证，并纳入 GitHub Actions CI（`vet` + `test` + `race` + 非阻断 `lint` + `coverage` 上传）。
 - 本机交互 shell 默认无 `go`，但仓库随附的托管 Go 工具链（`C:/Users/Administrator/.workbuddy/binaries/go/go/bin/go.exe`）可用于本地验证；该环境**无 gcc**，故 `go test -race` 仅能在 CI（GitHub ubuntu + gcc）侧运行，`shardkv` 的并发/冻结类回归以「高频 churn + 多轮循环」测试替代 race detector 来暴露。
-- 自动化纪律：每次改动本地提交、验收不过绝不提交；**前多轮自主迭代（cycle 1–28、cycle 29–38、cycle 39–48、cycle 49–57）已按用户授权执行 `git push origin master`（仅普通推送、不 --force、不 `rm -rf`）**（见 `docs/lab4-shardkv-design.md` 与 `.workbuddy/self-driving/state.json`）。**本轮迭代（cycle 58–67：快照看门狗时间戳重置 / 迁移 RPC 指数退避 / GC 守卫防自删权威分片 / 网关 `/debug/configs` / 迁移延迟直方图 `shard_migration_ms` / 冻结修复白盒回归 / kvraft flaky 审计 / Get 改走 propose 保证线性一致 / 运维 runbook）同样获得用户授权，已在全量 `build+vet+test` 通过后执行 `git push origin master`（仅 fast-forward）**。
+- 自动化纪律：每次改动本地提交、验收不过绝不提交；**前多轮自主迭代（cycle 1–28、cycle 29–38、cycle 39–48、cycle 49–57、cycle 58–67）已按用户授权执行 `git push origin master`（仅普通推送、不 --force、不 `rm -rf`）**（见 `docs/lab4-shardkv-design.md` 与 `.workbuddy/self-driving/state.json`）。**本轮迭代（cycle 68–87，「照刚刚的迭代20次」：raft leader lease + ShardKV ReadIndex 快读复活 / 配置号幂等 `installedCfgNum` + ReMigration 冻结修复 / shardmaster 最小搬动 + 输入校验 `ErrInvalid` / 网关并发限流 429 + 优雅退出 `Shutdown` + `/debug/groups` / kvraft 客户端会话 GC / metrics 新增 Gauge 与多项指标 / 混沌测试 I16/I18 + CI 竞态与长时 job）同样获得用户授权，将在全量 `build+vet+test` 通过后执行 `git push origin master`（仅 fast-forward）**。
 
 ## 说明
 - 这是面向学习的实验性实现，重点在正确性与可读性，非生产级部署。

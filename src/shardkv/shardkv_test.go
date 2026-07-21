@@ -170,7 +170,10 @@ func (cfg *skvConfig) restartReplica(g, r int) {
 	peers := make([]*raft.ClientEnd, cfg.nReplicas)
 	for r2 := 0; r2 < cfg.nReplicas; r2++ {
 		e := cfg.net.MakeEnd(id*cfg.nReplicas+r2, id)
-		cfg.net.Connect(id*cfg.nReplicas+r2, 1000+g*cfg.nReplicas+r2)
+		// 注意：服务端注册 id 用 1000+g*100+r（见 makeSKVConfig），
+		// 故 connect 的目标 serverId 必须是 1000+g*100+r2，而非 1000+g*nReplicas+r2；
+		// 否则 g>=1 时重启副本的 RPC 会指向不存在的 server，导致永久分裂投票（选不出主）。
+		cfg.net.Connect(id*cfg.nReplicas+r2, 1000+g*100+r2)
 		peers[r2] = e
 	}
 	applyCh := make(chan raft.ApplyMsg, 4000)

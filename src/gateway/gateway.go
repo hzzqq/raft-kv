@@ -10,26 +10,39 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"raftkv/src/cluster"
 	"raftkv/src/shardkv"
 	"raftkv/src/shardmaster"
 )
 
+// maxConcurrent 是网关在途请求的信号量上限（I12）。超过即返回 429，避免资源被压垮。
+const maxConcurrent = 64
+
 // Server 持有集群与绑定到它的 ShardKV 客户端。
 type Server struct {
 	c     *cluster.Cluster
 	clerk *shardkv.Clerk
+
+	// I12：有界并发信号量；I13：在途请求计数，供优雅关闭等待。
+	sem chan struct{}
+	wg  sync.WaitGroup
+
+	// 可选：底层 HTTP Server，供 Shutdown 一并关闭监听。
+	mu  sync.Mutex
+	srv *http.Server
 }
 
 // NewServer 用给定集群构造网关（不立即加入 group，需先 Init）。
 func NewServer(c *cluster.Cluster) *Server {
-	return &Server{c: c, clerk: c.Clerk()}
+	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent)}
 }
 
 // Init 依次加入 nGroups 个 replica group，使分片可写。
@@ -43,28 +56,80 @@ func (s *Server) Init(nGroups int) {
 // Handler 返回 HTTP 路由（Go 1.22 的 method+path 模式）。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /kv/{key}", s.handleGet)
-	mux.HandleFunc("PUT /kv/{key}", s.handlePut)
-	mux.HandleFunc("POST /kv/{key}/append", s.handleAppend)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
+	mux.HandleFunc("GET /kv/{key}", s.wrap(s.handleGet))
+	mux.HandleFunc("PUT /kv/{key}", s.wrap(s.handlePut))
+	mux.HandleFunc("POST /kv/{key}/append", s.wrap(s.handleAppend))
+	mux.HandleFunc("GET /healthz", s.wrap(s.handleHealthz))
 	// 可观测性：把进程内 ShardKV 的 Metrics 注册表 JSON 序列化暴露出来。
 	// 指标由 cycle 11 的 metrics 包在热路径上以纯原子操作累计，零行为影响。
-	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	mux.HandleFunc("GET /metrics", s.wrap(s.handleMetrics))
 	// 诊断：暴露每个 group/副本的「分片归属 + 待接收/待迁出」状态，便于定位
 	// 3-group 再平衡卡死等迁移问题（pendingIn/pendingOut 残留会冻结配置推进）。
-	mux.HandleFunc("GET /debug/shards", s.handleDebugShards)
+	mux.HandleFunc("GET /debug/shards", s.wrap(s.handleDebugShards))
 	// 集群健康总览（程序化消费）：每 group 是否有 leader、当前 config 号、拥有分片数、
 	// 待接收/待迁出/孤儿 incoming 分片，以及是否存在卡滞（StallSeconds>0 即冻结风险）。
-	mux.HandleFunc("GET /status", s.handleStatus)
+	mux.HandleFunc("GET /status", s.wrap(s.handleStatus))
 	// 迁移进度（人类可读，供 CLI `start.sh migrate` 直接展示）：每个 group leader 副本的
 	// 实时迁移状态 + 集群最新 config 号，一眼看清再平衡是否卡住。
-	mux.HandleFunc("GET /debug/migrate", s.handleDebugMigrate)
+	mux.HandleFunc("GET /debug/migrate", s.wrap(s.handleDebugMigrate))
 	// 配置历史（人类/程序可读）：展示 shardmaster 从初始到最新的每段配置，便于复盘
 	// rebalance 轨迹、确认分片在哪些 group 间迁移（排查 3-group 冻结时尤其有用）。
-	mux.HandleFunc("GET /debug/configs", s.handleDebugConfigs)
+	mux.HandleFunc("GET /debug/configs", s.wrap(s.handleDebugConfigs))
+	// 当前 group 成员与分片归属（I14）：每个 gid 的 server 列表及其拥有的分片编号。
+	mux.HandleFunc("GET /debug/groups", s.wrap(s.handleDebugGroups))
 	return mux
+}
+
+// wrap 给每个 handler 套上并发限制（I12）与在途请求计数（I13 优雅关闭用）。
+// 并发超过上限时立即返回 429，不无限排队。
+func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case s.sem <- struct{}{}:
+			defer func() { <-s.sem }()
+		default:
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusTooManyRequests)
+			io.WriteString(w, `{"error":"too many concurrent requests","code":429}`)
+			return
+		}
+		s.wg.Add(1)
+		defer s.wg.Done()
+		h(w, r)
+	}
+}
+
+// handleHealthz 是存活探针（200 即健康）。
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+}
+
+// SetHTTPServer 注册底层 *http.Server，使 Shutdown 能一并关闭监听（可选）。
+func (s *Server) SetHTTPServer(srv *http.Server) {
+	s.mu.Lock()
+	s.srv = srv
+	s.mu.Unlock()
+}
+
+// Shutdown 先等待在途请求（WaitGroup）结束，再关闭 HTTP 监听，实现优雅关闭（I13）。
+func (s *Server) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	s.mu.Lock()
+	srv := s.srv
+	s.mu.Unlock()
+	if srv != nil {
+		return srv.Shutdown(ctx)
+	}
+	return nil
 }
 
 // GroupStatus 是 /status 中单个 replica group 的健康快照（取 leader 副本视角）。
@@ -190,6 +255,43 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(snap); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// GroupView 是 /debug/groups 中单个 replica group 的视图：成员 server 列表 + 拥有的分片编号。
+type GroupView struct {
+	GID     int      `json:"gid"`
+	Servers []string `json:"servers"`
+	Shards  []int    `json:"shards"`
+}
+
+// handleDebugGroups 返回当前 shardmaster 的最新 group 成员与分片归属（JSON）：
+// 每个 gid 列出其 server 列表，以及 [0..NShards) 中归它所有的分片编号。
+func (s *Server) handleDebugGroups(w http.ResponseWriter, r *http.Request) {
+	cfgs := s.c.Configs()
+	if len(cfgs) == 0 {
+		http.Error(w, "no configs", http.StatusInternalServerError)
+		return
+	}
+	latest := cfgs[len(cfgs)-1]
+	groups := make([]GroupView, 0, len(latest.Groups))
+	for gid, servers := range latest.Groups {
+		var owned []int
+		for i := 0; i < shardmaster.NShards; i++ {
+			if latest.Shards[i] == gid {
+				owned = append(owned, i)
+			}
+		}
+		groups = append(groups, GroupView{GID: gid, Servers: servers, Shards: owned})
+	}
+	out := map[string]interface{}{
+		"num":    latest.Num,
+		"groups": groups,
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(out); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }

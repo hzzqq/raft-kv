@@ -34,6 +34,21 @@ func (c *Counter) Add(n int64) int64 { return atomic.AddInt64(&c.v, n) }
 // Value 返回当前值。
 func (c *Counter) Value() int64 { return atomic.LoadInt64(&c.v) }
 
+// Gauge 是并发安全的瞬时值指标（可任意 Set，用于当前配置号、apply 滞后等）。
+type Gauge struct {
+	v int64
+}
+
+// Set 设置当前值（以 float64 位模式原子存储，避免额外类型转换开销）。
+func (g *Gauge) Set(v float64) {
+	atomic.StoreInt64(&g.v, int64(math.Float64bits(v)))
+}
+
+// Value 返回当前值。
+func (g *Gauge) Value() float64 {
+	return math.Float64frombits(uint64(atomic.LoadInt64(&g.v)))
+}
+
 // Histogram 记录 float64 样本（如延迟毫秒数），使用固定容量环形缓冲，
 // 无论样本量多大都保持内存有界、分位数查询廉价。
 type Histogram struct {
@@ -121,6 +136,7 @@ type Registry struct {
 	mu         sync.Mutex
 	counters   map[string]*Counter
 	histograms map[string]*Histogram
+	gauges     map[string]*Gauge
 }
 
 // NewRegistry 创建一个空的指标注册表。
@@ -128,6 +144,7 @@ func NewRegistry() *Registry {
 	return &Registry{
 		counters:   map[string]*Counter{},
 		histograms: map[string]*Histogram{},
+		gauges:     map[string]*Gauge{},
 	}
 }
 
@@ -155,6 +172,18 @@ func (r *Registry) Histogram(name string) *Histogram {
 	return h
 }
 
+// Gauge 取得（不存在则创建）命名瞬时值指标。
+func (r *Registry) Gauge(name string) *Gauge {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if g, ok := r.gauges[name]; ok {
+		return g
+	}
+	g := &Gauge{}
+	r.gauges[name] = g
+	return g
+}
+
 // Snapshot 返回 JSON 友好结构：{"counters": {...}, "histograms": {...}}。
 func (r *Registry) Snapshot() map[string]interface{} {
 	r.mu.Lock()
@@ -167,9 +196,14 @@ func (r *Registry) Snapshot() map[string]interface{} {
 	for k, v := range r.histograms {
 		hists[k] = v.Snapshot()
 	}
+	gauges := make(map[string]float64, len(r.gauges))
+	for k, v := range r.gauges {
+		gauges[k] = v.Value()
+	}
 	return map[string]interface{}{
 		"counters":   counters,
 		"histograms": hists,
+		"gauges":     gauges,
 	}
 }
 
@@ -179,6 +213,7 @@ func (r *Registry) Reset() {
 	defer r.mu.Unlock()
 	r.counters = map[string]*Counter{}
 	r.histograms = map[string]*Histogram{}
+	r.gauges = map[string]*Gauge{}
 }
 
 // DumpJSON 把当前快照序列化为 JSON 字节，便于网关 / 演示程序直接输出。

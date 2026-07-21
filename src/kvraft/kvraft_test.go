@@ -363,3 +363,36 @@ func TestKVSnapshotStress(t *testing.T) {
 		}
 	}
 }
+
+// TestClientSessionGC 验证空闲超时的 client 会话会被回收，而最近访问的会话保留。
+// 直接构造会话并手动触发 gcSweep（背景 GC 周期为默认 10min，测试期间不会触发），
+// 既保持确定性、不依赖真实长睡眠，又避免与请求处理产生竞态。
+func TestClientSessionGC(t *testing.T) {
+	ck := makeKVConfig(t, 1)
+	defer ck.cleanup()
+	kv := ck.kvs[0]
+
+	// 缩短 TTL，便于确定性验证（背景 GC 周期为默认 10min，测试窗口内不会触发）。
+	kv.gcTTL = 100 * time.Millisecond
+
+	now := time.Now()
+	kv.mu.Lock()
+	kv.sessions[1] = &clientSession{LastSeq: 5, LastResult: "a", lastAccess: now.Add(-500 * time.Millisecond)} // 空闲 > TTL
+	kv.sessions[2] = &clientSession{LastSeq: 5, LastResult: "b", lastAccess: now.Add(-50 * time.Millisecond)}  // 空闲 < TTL
+	kv.sessions[3] = &clientSession{LastSeq: 5, LastResult: "c", lastAccess: now}                              // 刚刚访问
+	kv.mu.Unlock()
+
+	kv.gcSweep(now)
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if _, ok := kv.sessions[1]; ok {
+		t.Fatalf("idle session 1 should have been GC'd")
+	}
+	if _, ok := kv.sessions[2]; !ok {
+		t.Fatalf("recent session 2 should be retained")
+	}
+	if _, ok := kv.sessions[3]; !ok {
+		t.Fatalf("recent session 3 should be retained")
+	}
+}

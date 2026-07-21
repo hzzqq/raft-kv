@@ -138,6 +138,13 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
+	// ---- leader 租约（线性一致读 ReadIndex 快路径用）----
+	// lastContact[i] 记录本节点最后一次「接触」peer i 的时间：follower 在收到合法
+	// leader 的 AppendEntries/InstallSnapshot 时更新 lastContact[LeaderId]；leader
+	// 在收到 peer i 的成功 AE/IS 应答及自身每次心跳时更新 lastContact[i/me]。
+	// HasLeaderLease 据此判断 leader 是否在 ElectionTimeoutMin 内仍与多数派保持接触。
+	lastContact []time.Time
+
 	// ---- 选举/心跳计时 ----
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
@@ -184,6 +191,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.log)
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
+	e.Encode(rf.commitIndex)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -197,9 +205,10 @@ func (rf *Raft) readPersist(data []byte) {
 	var term int
 	var voted int
 	var logs []LogEntry
-	var lii, lit int
+	var lii, lit, commit int
 	if d.Decode(&term) != nil || d.Decode(&voted) != nil ||
-		d.Decode(&logs) != nil || d.Decode(&lii) != nil || d.Decode(&lit) != nil {
+		d.Decode(&logs) != nil || d.Decode(&lii) != nil || d.Decode(&lit) != nil ||
+		d.Decode(&commit) != nil {
 		// 损坏的持久化数据，忽略
 		return
 	}
@@ -208,6 +217,7 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.log = logs
 	rf.lastIncludedIndex = lii
 	rf.lastIncludedTerm = lit
+	rf.commitIndex = commit
 }
 
 // ============================== 对外接口 ==============================
@@ -225,6 +235,30 @@ func (rf *Raft) ReadIndex() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.commitIndex, rf.role == Leader
+}
+
+// HasLeaderLease 返回 leader 是否仍持有多数派最近接触的心跳租约。
+// 用于支持线性一致读（ReadIndex 快路径）：仅当租约有效时，leader 才能基于
+// commitIndex 安全地本地读，否则可能返回落后/陈旧数据（分区下旧 leader 的
+// stale read 问题）。租约时长取选举超时最小值 ElectionTimeoutMin。
+func (rf *Raft) HasLeaderLease() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != Leader {
+		return false
+	}
+	lease := ElectionTimeoutMin
+	contacted := 0
+	for i := range rf.peers {
+		if i == rf.me {
+			contacted++
+			continue
+		}
+		if !rf.lastContact[i].IsZero() && time.Since(rf.lastContact[i]) <= lease {
+			contacted++
+		}
+	}
+	return contacted > len(rf.peers)/2
 }
 
 // LastApplied 返回已应用到状态机的最后索引（测试用，用于断言未达多数时不提交）。
@@ -342,6 +376,7 @@ func (rf *Raft) becomeLeader() {
 		return
 	}
 	rf.role = Leader
+	rf.lastContact[rf.me] = time.Now()
 	Metrics.Counter("leader_changes").Inc()
 	// 任期开始时追加一条 no-op（空命令）。按 Raft 提交规则，leader 只能
 	// 通过提交"当前任期"的条目来间接提交旧任期的日志；no-op 作为当前任期的
@@ -423,6 +458,7 @@ func (rf *Raft) advanceCommit() {
 		}
 		if count > len(rf.peers)/2 && rf.entryTerm(n) == rf.currentTerm {
 			rf.commitIndex = n
+			rf.persist() // 持久化提交点：崩溃重启后据 commitIndex 重放已提交条目
 			rf.applyCond.Broadcast()
 			break
 		}
@@ -468,8 +504,9 @@ func (rf *Raft) broadcastAppendEntries() {
 					rf.stepDown(reply.Term)
 					return
 				}
-				if rf.role == Leader && args.Term == rf.currentTerm {
-					rf.matchIndex[i] = args.LastIncludedIndex
+			if rf.role == Leader && args.Term == rf.currentTerm {
+				rf.lastContact[i] = time.Now()
+				rf.matchIndex[i] = args.LastIncludedIndex
 					rf.nextIndex[i] = args.LastIncludedIndex + 1
 				}
 			}(i, args)
@@ -503,6 +540,7 @@ func (rf *Raft) broadcastAppendEntries() {
 				return
 			}
 			if rf.role == Leader && args.Term == rf.currentTerm {
+				rf.lastContact[i] = time.Now()
 				if reply.Success {
 					rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
 					rf.nextIndex[i] = rf.matchIndex[i] + 1
@@ -552,6 +590,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// 听到 leader，刷新选举计时
 	rf.resetElectionTimer()
+	rf.lastContact[args.LeaderId] = time.Now()
 	reply.Term = rf.currentTerm
 
 	// 1) 日志一致性检查
@@ -676,6 +715,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.stepDown(args.Term)
 	}
 	rf.resetElectionTimer()
+	rf.lastContact[args.LeaderId] = time.Now()
 	if args.LastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
@@ -701,6 +741,7 @@ func (rf *Raft) ticker() {
 		case <-rf.heartbeatTimer.C:
 			rf.mu.Lock()
 			if rf.role == Leader {
+				rf.lastContact[rf.me] = time.Now()
 				rf.mu.Unlock()
 				rf.broadcastAppendEntries()
 			} else {
@@ -763,6 +804,7 @@ func Make(peers []*ClientEnd, me int, persister *Persister, applyCh chan ApplyMs
 		lastApplied:   0,
 		lastIncludedIndex: 0,
 		lastIncludedTerm:  0,
+		lastContact:       make([]time.Time, len(peers)),
 		electionTimer:  time.NewTimer(ElectionTimeoutMax),
 		heartbeatTimer: time.NewTimer(HeartbeatInterval),
 		killCh:        make(chan struct{}),
