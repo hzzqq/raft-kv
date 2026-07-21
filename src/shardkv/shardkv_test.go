@@ -102,17 +102,17 @@ func makeSKVConfig(t testing.TB, nGroups, nReplicas, nSM, maxraftstate int) *skv
 	// ---- shardkv 各 group ----
 	for g := 0; g < nGroups; g++ {
 		for r := 0; r < nReplicas; r++ {
-			name := fmt.Sprintf("g%d-%d", g, r)
-			id := 1000 + g*100 + r
-			cfg.nameToID[name] = id
-			cfg.groupNames[g] = append(cfg.groupNames[g], name)
+		name := fmt.Sprintf("g%d-%d", g, r)
+		id := serverId(g, r)
+		cfg.nameToID[name] = id
+		cfg.groupNames[g] = append(cfg.groupNames[g], name)
 
-			peers := make([]*raft.ClientEnd, nReplicas)
-			for r2 := 0; r2 < nReplicas; r2++ {
-				e := net.MakeEnd(id*nReplicas+r2, id)
-				net.Connect(id*nReplicas+r2, 1000+g*100+r2)
-				peers[r2] = e
-			}
+		peers := make([]*raft.ClientEnd, nReplicas)
+		for r2 := 0; r2 < nReplicas; r2++ {
+			e := net.MakeEnd(id*nReplicas+r2, id)
+			net.Connect(id*nReplicas+r2, serverId(g, r2))
+			peers[r2] = e
+		}
 		applyCh := make(chan raft.ApplyMsg, 4000)
 		p := raft.MakeEmptyPersister()
 		rf := raft.Make(peers, r, p, applyCh)
@@ -160,20 +160,24 @@ func (cfg *skvConfig) leaveGroup(g int) {
 	ck.Leave([]int{g + 1})
 }
 
+// serverId 返回第 g 组第 r 个副本在 labrpc 网络中的注册 id。
+// 关键约定：AddServer 注册 id 与 Connect 的目标 serverId 必须一致，否则
+// g>=1 时重启副本的 RPC 会指向不存在的 server（静默返回 false -> 永久分裂投票）。
+// 所有注册/连接/分区操作都必须经由本函数，禁止再出现 1000+g*100+r 的散落字面量。
+func serverId(g, r int) int { return 1000 + g*100 + r }
+
 // restartReplica 杀掉第 g 组第 r 个副本，并用「同一 persister」重建 Raft + ShardKV，
 // 模拟该副本崩溃后从持久化状态恢复（而非凭空新建）。网络 handler 通过 AddServer
 // 重新注册到新实例（旧循环会被关闭）。用于验证崩溃恢复后状态机/日志能从 persister 还原。
 func (cfg *skvConfig) restartReplica(g, r int) {
 	cfg.groups[g][r].Kill()
-	id := 1000 + g*100 + r
+	id := serverId(g, r)
 	p := cfg.kvPersist[g][r]
 	peers := make([]*raft.ClientEnd, cfg.nReplicas)
 	for r2 := 0; r2 < cfg.nReplicas; r2++ {
 		e := cfg.net.MakeEnd(id*cfg.nReplicas+r2, id)
-		// 注意：服务端注册 id 用 1000+g*100+r（见 makeSKVConfig），
-		// 故 connect 的目标 serverId 必须是 1000+g*100+r2，而非 1000+g*nReplicas+r2；
-		// 否则 g>=1 时重启副本的 RPC 会指向不存在的 server，导致永久分裂投票（选不出主）。
-		cfg.net.Connect(id*cfg.nReplicas+r2, 1000+g*100+r2)
+		// 服务端注册 id 与 connect 目标必须一致，统一走 serverId() 避免 g>=1 时 RPC 黑洞。
+		cfg.net.Connect(id*cfg.nReplicas+r2, serverId(g, r2))
 		peers[r2] = e
 	}
 	applyCh := make(chan raft.ApplyMsg, 4000)
@@ -222,12 +226,12 @@ func (cfg *skvConfig) waitGroupConfig(g, r, num int) {
 
 func (cfg *skvConfig) disconnectGroup(g int) {
 	for r := 0; r < cfg.nReplicas; r++ {
-		cfg.net.Enable(1000+g*100+r, false)
+		cfg.net.Enable(serverId(g, r), false)
 	}
 }
 func (cfg *skvConfig) connectGroup(g int) {
 	for r := 0; r < cfg.nReplicas; r++ {
-		cfg.net.Enable(1000+g*100+r, true)
+		cfg.net.Enable(serverId(g, r), true)
 	}
 }
 
