@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"raftkv/src/cluster"
 	"raftkv/src/shardkv"
@@ -38,7 +39,15 @@ type Server struct {
 	// 可选：底层 HTTP Server，供 Shutdown 一并关闭监听。
 	mu  sync.Mutex
 	srv *http.Server
+
+	// testDelay 仅用于单测：wrap 在取得信号量后休眠该时长，人为拉长在途窗口，
+	// 使并发限流（429）路径能被确定性触发（内存集群后端极快时，正常请求难以
+	// 让在途数打满 64 槽）。生产环境恒为 0，零行为影响。
+	testDelay time.Duration
 }
+
+// SetTestDelay 仅供单测注入人为延迟，使 429 路径可被稳定复现。生产不可用。
+func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 
 // NewServer 用给定集群构造网关（不立即加入 group，需先 Init）。
 func NewServer(c *cluster.Cluster) *Server {
@@ -95,6 +104,9 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		}
 		s.wg.Add(1)
 		defer s.wg.Done()
+		if s.testDelay > 0 {
+			time.Sleep(s.testDelay)
+		}
 		h(w, r)
 	}
 }

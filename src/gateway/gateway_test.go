@@ -272,6 +272,11 @@ func TestGatewayConcurrencyLimit(t *testing.T) {
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 
+	// 内存集群后端经线性读快路径优化后极快，正常请求难以让在途数打满 64 槽，导致
+	// 429 路径偶发不被触发。注入 10ms 人为延迟拉长在途窗口，使 90 并发洪泛能确定性
+	// 打满信号量、稳定复现 429（仅单测生效，生产 testDelay 恒为 0）。
+	s.SetTestDelay(10 * time.Millisecond)
+
 	// 先写入一个值，使后续 GET 在未被限流时返回 200。
 	putReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/kv/flood", strings.NewReader("v"))
 	if pr, err := http.DefaultClient.Do(putReq); err != nil {
