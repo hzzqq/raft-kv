@@ -571,9 +571,35 @@ func (kv *ShardKV) SendShard(args *SendShardArgs, reply *SendShardReply) {
 // GetShard 由新 owner 拉取：旧 owner 返回其分片数据副本（GC 前仍保留）。
 // 仅 leader 响应，避免从落后 follower 拉到尚未应用客户端写操作的陈旧/空数据
 // （否则迁移会把空分片装到新 group，造成数据丢失）。
+//
+// 关键正确性守卫（选举抖动窗口丢写修复）：新当选 leader 在「重新提交本任期
+// no-op」之前，其 commitIndex 可能仍落后上一任 leader 已提交的位置，旧任期已提交
+// 写尚未 apply。若此时直接传出 kv.shards，快照会缺失该写、被新 group 装入后即静
+// 默丢写（TestChaosSwingWriteDataLoss 在杀主+迁移重叠窗口偶发复现）。因此必须：
+//  1) 持有 leader 租约（多数派近期有心跳接触，非分区旧主）；
+//  2) 已在当前任期提交过条目（HasCommittedCurrentTerm：no-op 已提交，旧任期写
+//     现已被 commitIndex 覆盖）；
+//  3) 等待本组状态机 apply 到 commitIndex（waitApplied），确保传出的快照包含
+//     全部已提交写。任一不满足即返回 ErrWrongLeader，fetchShard 会重试。
 func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// 守卫 1+2：持有租约且已提交当前任期条目。
+	if !kv.rf.HasLeaderLease() || !kv.rf.HasCommittedCurrentTerm() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// 守卫 3：读到当前 commitIndex，并等待状态机 apply 到该点，避免传出
+	// 尚未应用旧任期写的陈旧快照。
+	commitIdx, stillLeader := kv.rf.ReadIndex()
+	if !stillLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	if !kv.waitApplied(commitIdx, 3*time.Second) {
 		reply.Err = ErrWrongLeader
 		return
 	}

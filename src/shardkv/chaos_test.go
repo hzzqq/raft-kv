@@ -2,6 +2,8 @@ package shardkv
 
 import (
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -252,5 +254,89 @@ func TestChaosLongRun(t *testing.T) {
 	}
 
 	// 配置稳定后迁移中间态必须归零（同 TestChaosLeaderKillDuringMigration 的守护）。
+	cfg.assertNoMigrationOrphans(t)
+}
+
+// TestChaosSwingWriteDataLoss：在 A->B->A 高频来回再平衡期间反复杀掉两组 leader，
+// 同时客户端持续向同一 key 追加写入，验证跨迁移丢写三重修复（n=33）在
+// 「崩溃 + 高频再平衡 + 持续写」叠加下仍不丢写、最终收敛（数据完整、无冻结）。
+// 这是 n=33 修复的最强回归：TestSKVClientLiveDuringMigration 已覆盖单纯迁移窗口，
+// 本测试进一步叠加 leader 崩溃，确认 applyCmd 所有权守卫 / purge-on-regain / LWW
+// 版本判据在选举抖动下依旧成立，避免该真实丢写 bug 在崩溃场景下回归。
+func TestChaosSwingWriteDataLoss(t *testing.T) {
+	const nGroups = 2
+	cfg := makeSKVConfig(t, nGroups, 3, 3, 0)
+	defer cfg.cleanup()
+	ck := cfg.makeClerk()
+	cfg.joinGroup(0)
+	cfg.joinGroup(1)
+	cfg.waitGroupConfig(1, 0, 2)
+
+	key := "chaos-swing-key"
+	shard := key2shard(key)
+
+	// 后台 churn：把该分片在两组间来回再平衡（A->B->A 摆动），制造持续迁移窗口。
+	churnDone := make(chan struct{})
+	go func() {
+		defer close(churnDone)
+		for i := 0; i < 10; i++ {
+			cfg.moveShard(shard, i%2)
+			time.Sleep(150 * time.Millisecond)
+		}
+	}()
+
+	// 后台杀主：每 ~200ms 杀掉两组当前 leader 并重启，制造选举抖动（与 I16 同款）。
+	killDone := make(chan struct{})
+	go func() {
+		defer close(killDone)
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-churnDone:
+				return
+			case <-ticker.C:
+				for g := 0; g < nGroups; g++ {
+					if lr := cfg.leaderOf(g); lr >= 0 {
+						cfg.restartReplica(g, lr)
+					}
+				}
+			}
+		}
+	}()
+
+	// 客户端持续向同一 key 追加 20 个 'x'；迁移窗口 + 选举抖动下应最终全部落地。
+	const nAppends = 20
+	done := make(chan error, 1)
+	go func() {
+		lens := make([]int, 0, nAppends)
+		for i := 0; i < nAppends; i++ {
+			ck.Append(key, "x")
+			lens = append(lens, len(ck.Get(key)))
+		}
+		got := ck.Get(key)
+		want := strings.Repeat("x", nAppends)
+		if got != want {
+			done <- fmt.Errorf("after chaos swing+kill Get(%s)=%q want %q (len got=%d want=%d) lens=%v", key, got, want, len(got), nAppends, lens)
+			return
+		}
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		<-churnDone
+		<-killDone
+		if err != nil {
+			t.Fatalf("%s", err)
+		}
+	case <-time.After(90 * time.Second):
+		buf := make([]byte, 1<<24)
+		n := runtime.Stack(buf, true)
+		t.Logf("==== ALL GOROUTINE STACKS (len=%d) ====\n%s", n, buf[:n])
+		t.Fatalf("client HUNG during chaos swing+kill (likely data-loss freeze regression of n=33). stuck replicas:\n%s", dumpShardState(cfg))
+	}
+
+	// 配置稳定后迁移中间态必须归零（同 I16/I18 的守护）。
 	cfg.assertNoMigrationOrphans(t)
 }

@@ -134,6 +134,12 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 	role        Role
+	// committedCurrentTerm 标记本 leader 是否已在「当前任期」提交过条目（通常为
+	// becomeLeader 时追加的 no-op）。Raft 提交安全性要求：leader 只能经由提交
+	// 当前任期条目来间接提交旧任期条目。故该标记置位前，commitIndex 可能仍落后
+	// 于上一任 leader 已提交的位置、旧任期已提交写尚未 apply——此时若对外服务
+	// 读/迁移传输，会传出陈旧快照造成丢写。GetShard 据此守卫（详见 shardkv）。
+	committedCurrentTerm bool
 
 	nextIndex  []int
 	matchIndex []int
@@ -265,6 +271,17 @@ func (rf *Raft) HasLeaderLease() bool {
 	return contacted > len(rf.peers)/2
 }
 
+// HasCommittedCurrentTerm 返回 leader 是否已在当前任期提交过条目（通常为 no-op）。
+// 仅当该标记为 true 时，commitIndex 才已覆盖本任期 no-op，从而"拉动"所有先前
+// 已提交的旧任期写——此时对外服务读/迁移传输才是安全的（不会传出旧 leader 已提交
+// 但尚未 apply 的陈旧快照）。新 leader 在重新提交 no-op 前该标记恒为 false，
+// 用于 GetShard 的传输守卫（见 shardkv.go）。
+func (rf *Raft) HasCommittedCurrentTerm() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.committedCurrentTerm
+}
+
 // LastApplied 返回已应用到状态机的最后索引（测试用，用于断言未达多数时不提交）。
 func (rf *Raft) LastApplied() int {
 	rf.mu.Lock()
@@ -382,6 +399,9 @@ func (rf *Raft) becomeLeader() {
 		return
 	}
 	rf.role = Leader
+	// 新任期必须重新提交一条当前任期 no-op 才能提交旧任期条目；重置该标记，
+	// 确保 GetShard 等传输守卫在重新提交 no-op 之前不会传出陈旧快照。
+	rf.committedCurrentTerm = false
 	rf.lastContact[rf.me] = time.Now()
 	Metrics.Counter("leader_changes").Inc()
 	// 任期开始时追加一条 no-op（空命令）。按 Raft 提交规则，leader 只能
@@ -466,6 +486,7 @@ func (rf *Raft) advanceCommit() {
 		}
 		if count > len(rf.peers)/2 && rf.entryTerm(n) == rf.currentTerm {
 			rf.commitIndex = n
+			rf.committedCurrentTerm = true // 当前任期条目已提交，旧任期写现可安全服务
 			rf.persist() // 持久化提交点：崩溃重启后据 commitIndex 重放已提交条目
 			rf.applyCond.Broadcast()
 			break
