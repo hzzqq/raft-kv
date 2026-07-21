@@ -11,6 +11,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -69,11 +71,22 @@ func (s *Server) SetRequestTimeout(d time.Duration) { s.requestTimeout = d }
 
 // accessEntry 是 /debug/accesslog 中单条请求记录。
 type accessEntry struct {
-	TS        time.Time `json:"ts"`
-	Method    string    `json:"method"`
-	Path      string    `json:"path"`
-	Status    int       `json:"status"`
-	LatencyMs float64   `json:"latency_ms"`
+	TS         time.Time `json:"ts"`
+	Method     string    `json:"method"`
+	Path       string    `json:"path"`
+	Status     int       `json:"status"`
+	LatencyMs  float64   `json:"latency_ms"`
+	RequestID  string    `json:"request_id,omitempty"`
+}
+
+// genRequestID 生成一个随机请求 ID（16 位 hex）。用于 X-Request-ID 透传，便于跨服务
+// 链路追踪；crypto/rand 保证不可预测且全局唯一（网关非超高频场景，开销可忽略）。
+func genRequestID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // statusRecorder 包装 http.ResponseWriter，捕获最终状态码（WriteHeader 可能未被
@@ -218,8 +231,14 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		// X-Request-ID 透传：入站已带则沿用，否则生成。回写响应头，便于跨服务链路追踪。
+		reqID := r.Header.Get("X-Request-ID")
+		if reqID == "" {
+			reqID = genRequestID()
+		}
+		w.Header().Set("X-Request-ID", reqID)
 		record := func(status int, d time.Duration) {
-			s.recordAccess(r.Method, r.URL.Path, status, d)
+			s.recordAccess(r.Method, r.URL.Path, status, d, reqID)
 		}
 		select {
 		case s.sem <- struct{}{}:
@@ -228,7 +247,7 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusTooManyRequests)
 			io.WriteString(w, `{"error":"too many concurrent requests","code":429}`)
-			s.logf(levelWarn, "concurrency limit exceeded", map[string]string{"method": r.Method, "path": r.URL.Path})
+			s.logf(levelWarn, "concurrency limit exceeded", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
 			record(http.StatusTooManyRequests, time.Since(start))
 			return
 		}
@@ -244,7 +263,7 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			st = http.StatusOK
 		}
 		// 结构化记录每请求一条日志：成功=info，4xx=warn，5xx=error，便于 /debug/log 排障。
-		fields := map[string]string{"method": r.Method, "path": r.URL.Path, "status": strconv.Itoa(st)}
+		fields := map[string]string{"method": r.Method, "path": r.URL.Path, "status": strconv.Itoa(st), "request_id": reqID}
 		switch {
 		case st >= 500:
 			s.logf(levelError, "request error", fields)
@@ -258,14 +277,15 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 }
 
 // recordAccess 把一条请求记录追加到访问日志环形缓冲（超出容量则丢弃最旧）。
-func (s *Server) recordAccess(method, path string, status int, d time.Duration) {
+func (s *Server) recordAccess(method, path string, status int, d time.Duration, reqID string) {
 	s.accessMu.Lock()
 	e := accessEntry{
-		TS:        time.Now(),
-		Method:    method,
-		Path:      path,
-		Status:    status,
-		LatencyMs: float64(d.Microseconds()) / 1000.0,
+		TS:         time.Now(),
+		Method:     method,
+		Path:       path,
+		Status:     status,
+		LatencyMs:  float64(d.Microseconds()) / 1000.0,
+		RequestID:  reqID,
 	}
 	s.accessLog = append(s.accessLog, e)
 	if len(s.accessLog) > s.accessCap {

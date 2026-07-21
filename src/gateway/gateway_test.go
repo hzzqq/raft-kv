@@ -701,3 +701,45 @@ func TestGatewayLogLevel(t *testing.T) {
 		}
 	}
 }
+
+// TestGatewayRequestID：验证 X-Request-ID 透传（I48）——入站缺则生成、存在则沿用，
+// 均回写到响应头，便于跨服务链路追踪。该测试直接构造 Server + 平凡 handler，不依赖
+// raft 集群，故不受沙箱恢复后偶发的 raft 选举挂死影响（更稳）。
+func TestGatewayRequestID(t *testing.T) {
+	// 直接构造 Server（不经由 cluster，避免集群启动），仅需 wrap 用到的字段。
+	s := &Server{
+		sem:            make(chan struct{}, maxConcurrent),
+		accessCap:      256,
+		logCap:         256,
+		requestTimeout: 30 * time.Second,
+	}
+	h := s.wrap(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "ok")
+	})
+	ts := httptest.NewServer(http.HandlerFunc(h))
+	defer ts.Close()
+
+	// 1) 入站无 X-Request-ID -> 网关生成并回写。
+	resp, err := http.Get(ts.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idGen := resp.Header.Get("X-Request-ID")
+	if idGen == "" {
+		t.Fatalf("expected X-Request-ID to be generated and set on response")
+	}
+	resp.Body.Close()
+
+	// 2) 入站带 X-Request-ID -> 网关原样透传（不重新生成）。
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/x", nil)
+	req.Header.Set("X-Request-ID", "trace-abc-123")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp2.Header.Get("X-Request-ID"); got != "trace-abc-123" {
+		t.Fatalf("X-Request-ID not propagated: got %q want trace-abc-123", got)
+	}
+	resp2.Body.Close()
+}
