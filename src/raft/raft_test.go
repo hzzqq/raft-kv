@@ -20,10 +20,10 @@ type config struct {
 	logs       [][]interface{} // 各节点已应用的状态机命令（按序）
 	connected  []bool
 	n          int
-	t          *testing.T
+	t          testing.TB
 }
 
-func makeConfig(t *testing.T, n int) *config {
+func makeConfig(t testing.TB, n int) *config {
 	net := MakeNetwork()
 	cfg := &config{net: net, n: n, t: t}
 	cfg.rafts = make([]*Raft, n)
