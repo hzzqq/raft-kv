@@ -743,3 +743,66 @@ func TestGatewayRequestID(t *testing.T) {
 	}
 	resp2.Body.Close()
 }
+
+// TestGatewayClientLimit：验证每客户端令牌桶限流（I49）——同一客户端在突发上限内
+// 放行，超出返回 429 + Retry-After；不同客户端互不影响。cluster-free 构造。
+// 用极小补充速率（0.001 rps）使测试窗口内几乎不补充，从而突发上限即精确允许数。
+func TestGatewayClientLimit(t *testing.T) {
+	s := &Server{
+		sem:            make(chan struct{}, maxConcurrent),
+		accessCap:      256,
+		logCap:         256,
+		requestTimeout: 30 * time.Second,
+		clientLimiters: make(map[string]*tokenBucket),
+		clientRate:     0.001, // 测试窗口内几乎不补充
+		clientBurst:    5,
+	}
+	h := s.wrap(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "ok")
+	})
+	ts := httptest.NewServer(http.HandlerFunc(h))
+	defer ts.Close()
+	client := &http.Client{}
+
+	// 客户端 c1：连续 10 次请求，前 5 次（突发）放行，后 5 次限流 429。
+	ok, limited := 0, 0
+	for i := 0; i < 10; i++ {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/x", nil)
+		req.Header.Set("X-Client-ID", "c1")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch resp.StatusCode {
+		case http.StatusOK:
+			ok++
+		case http.StatusTooManyRequests:
+			limited++
+			if resp.Header.Get("Retry-After") == "" {
+				t.Fatalf("rate-limited response missing Retry-After header")
+			}
+		default:
+			t.Fatalf("unexpected status %d", resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	if ok != 5 {
+		t.Fatalf("client c1: expected 5 allowed (burst), got %d", ok)
+	}
+	if limited != 5 {
+		t.Fatalf("client c1: expected 5 rate-limited, got %d", limited)
+	}
+
+	// 不同客户端 c2 应不受 c1 消耗影响（独立令牌桶），首次请求即放行。
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/x", nil)
+	req.Header.Set("X-Client-ID", "c2")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("client c2: expected allowed (independent bucket), got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}

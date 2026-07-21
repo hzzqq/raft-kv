@@ -64,10 +64,85 @@ type Server struct {
 	// 长时间不返回；超出该上限即由 http.TimeoutHandler 返回 503，避免 HTTP 连接
 	// 无限挂起（显式兜底，与 Clerk 自身的有界重试互补）。默认 30s，零正常影响。
 	requestTimeout time.Duration
+
+	// I49：每客户端令牌桶限流（在全局并发 429 之上更细粒度保护）。按客户端标识
+	// （X-Client-ID 或 RemoteAddr IP）限流，超限返回 429 + Retry-After。
+	limitMu       sync.Mutex
+	clientLimiters map[string]*tokenBucket
+	clientRate     float64 // 每客户端每秒补充令牌数（<=0 表示关闭限流）
+	clientBurst    float64 // 每客户端桶容量（突发上限）
+}
+
+// tokenBucket 是单客户端的令牌桶：按时间补充令牌，桶满截断；取用时需至少 1 枚令牌。
+type tokenBucket struct {
+	tokens float64
+	last   time.Time
+	rate   float64
+	burst  float64
+}
+
+// allow 按当前时刻补充令牌（elapsed*rate，截断到 burst），若 >=1 则消耗 1 枚并放行。
+func (b *tokenBucket) allow(now time.Time) bool {
+	elapsed := now.Sub(b.last).Seconds()
+	b.last = now
+	b.tokens += elapsed * b.rate
+	if b.tokens > b.burst {
+		b.tokens = b.burst
+	}
+	if b.tokens >= 1 {
+		b.tokens -= 1
+		return true
+	}
+	return false
 }
 
 // SetRequestTimeout 仅供单测覆盖默认单请求超时（生产不可用）。
 func (s *Server) SetRequestTimeout(d time.Duration) { s.requestTimeout = d }
+
+// SetClientRateLimit 配置每客户端令牌桶限流（生产可用）：rps 为每客户端每秒补充
+// 令牌数，burst 为桶容量（允许的最大突发请求数）。rps<=0 表示关闭限流。
+func (s *Server) SetClientRateLimit(rps float64, burst int) {
+	s.limitMu.Lock()
+	s.clientRate = rps
+	s.clientBurst = float64(burst)
+	if s.clientLimiters == nil {
+		s.clientLimiters = make(map[string]*tokenBucket)
+	}
+	s.limitMu.Unlock()
+}
+
+// clientKey 从请求推导客户端标识：优先 X-Client-ID 头，否则取 RemoteAddr 的 IP 部分
+// （去掉 :port，因每次连接的端口会变）。同一客户端的请求共享一个令牌桶。
+func (s *Server) clientKey(r *http.Request) string {
+	if id := r.Header.Get("X-Client-ID"); id != "" {
+		return id
+	}
+	if idx := strings.LastIndex(r.RemoteAddr, ":"); idx >= 0 {
+		return r.RemoteAddr[:idx]
+	}
+	return r.RemoteAddr
+}
+
+// allowClient 返回该客户端本次请求是否被限流放行。clientRate<=0 时直接放行（限流关闭）。
+// 令牌桶按需惰性创建；map 过大时清空重置以防内存无限增长（demo 级保护）。
+func (s *Server) allowClient(r *http.Request) bool {
+	if s.clientRate <= 0 {
+		return true
+	}
+	key := s.clientKey(r)
+	s.limitMu.Lock()
+	b, ok := s.clientLimiters[key]
+	if !ok {
+		if len(s.clientLimiters) > 4096 {
+			s.clientLimiters = make(map[string]*tokenBucket)
+		}
+		b = &tokenBucket{tokens: s.clientBurst, last: time.Now(), rate: s.clientRate, burst: s.clientBurst}
+		s.clientLimiters[key] = b
+	}
+	allowed := b.allow(time.Now())
+	s.limitMu.Unlock()
+	return allowed
+}
 
 // accessEntry 是 /debug/accesslog 中单条请求记录。
 type accessEntry struct {
@@ -118,7 +193,7 @@ func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 
 // NewServer 用给定集群构造网关（不立即加入 group，需先 Init）。
 func NewServer(c *cluster.Cluster) *Server {
-	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second}
+	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40}
 }
 
 // logLevel 是结构化日志级别，数值越大越严重。
@@ -237,6 +312,15 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			reqID = genRequestID()
 		}
 		w.Header().Set("X-Request-ID", reqID)
+		// 每客户端令牌桶限流（I49）：超限直接 429 + Retry-After，不进入并发信号量。
+		if !s.allowClient(r) {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			io.WriteString(w, `{"error":"client rate limit exceeded","code":429}`)
+			s.logf(levelWarn, "client rate limit exceeded", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
+			return
+		}
 		record := func(status int, d time.Duration) {
 			s.recordAccess(r.Method, r.URL.Path, status, d, reqID)
 		}
