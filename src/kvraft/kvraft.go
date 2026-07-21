@@ -401,6 +401,7 @@ func MakeClerk(servers []*raft.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 	ck.seq++
 	op := GetArgs{Key: key, ClientId: ck.clientId, Seq: ck.seq}
+	backoff := 10 * time.Millisecond
 	for {
 		srv := ck.servers[ck.leaderHint]
 		reply := &GetReply{}
@@ -408,14 +409,19 @@ func (ck *Clerk) Get(key string) string {
 		if ok && !reply.WrongLeader {
 			return reply.Value
 		}
+		// 轮换 leader 候选 + 指数退避，避免 leader 切换期对副本的惊群重试
 		ck.leaderHint = (ck.leaderHint + 1) % len(ck.servers)
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(backoff)
+		if backoff < 500*time.Millisecond {
+			backoff *= 2
+		}
 	}
 }
 
 func (ck *Clerk) PutAppend(key, value, op string) {
 	ck.seq++
 	args := PutAppendArgs{Key: key, Value: value, Op: op, ClientId: ck.clientId, Seq: ck.seq}
+	backoff := 10 * time.Millisecond
 	for {
 		srv := ck.servers[ck.leaderHint]
 		reply := &PutAppendReply{}
@@ -424,7 +430,10 @@ func (ck *Clerk) PutAppend(key, value, op string) {
 			return
 		}
 		ck.leaderHint = (ck.leaderHint + 1) % len(ck.servers)
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(backoff)
+		if backoff < 500*time.Millisecond {
+			backoff *= 2
+		}
 	}
 }
 

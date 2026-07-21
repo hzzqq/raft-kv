@@ -1365,6 +1365,7 @@ type Clerk struct {
 	make_end func(string) *raft.ClientEnd
 	clientId int64
 	seq      int64
+	leaderOf map[int]string // gid -> 最近一次返回 OK 的 server（leader 缓存，减少误路由）
 }
 
 func MakeClerk(masters []string, make_end func(string) *raft.ClientEnd) *Clerk {
@@ -1373,6 +1374,7 @@ func MakeClerk(masters []string, make_end func(string) *raft.ClientEnd) *Clerk {
 		make_end: make_end,
 		clientId: nrand(),
 		seq:      0,
+		leaderOf: make(map[int]string),
 	}
 }
 
@@ -1383,12 +1385,63 @@ func (ck *Clerk) refresh() {
 	ck.mu.Unlock()
 }
 
+// cachedLeader 在锁内读取某 gid 最近一次成功的 server（leader 缓存）。
+func (ck *Clerk) cachedLeader(gid int) string {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	return ck.leaderOf[gid]
+}
+
+// setLeader 在锁内记录某 gid 最近一次成功的 server。
+func (ck *Clerk) setLeader(gid int, srv string) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	ck.leaderOf[gid] = srv
+}
+
+// orderServers 将 preferred（若非空且确实属于 servers）前置到副本列表首位，其余
+// 保持原相对顺序；preferred 不在 servers 中（如缓存的 leader 已随配置变迁离组）时
+// 原样返回，避免去试一个陈旧/不存在的副本。服务端序由 shardmaster 配置决定且稳定。
+func orderServers(servers []string, preferred string) []string {
+	if preferred == "" {
+		return servers
+	}
+	found := false
+	for _, s := range servers {
+		if s == preferred {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return servers
+	}
+	out := make([]string, 0, len(servers))
+	out = append(out, preferred)
+	for _, s := range servers {
+		if s != preferred {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// clerkSleepBackoff 执行一次退避睡眠并把退避时长翻倍（上限 500ms），返回新时长。
+// 指数退避避免 leader 切换/迁移抖动期客户端对副本的惊群重试。
+func clerkSleepBackoff(backoff *time.Duration) {
+	time.Sleep(*backoff)
+	if *backoff < 500*time.Millisecond {
+		*backoff *= 2
+	}
+}
+
 func (ck *Clerk) Get(key string) string {
 	ck.mu.Lock()
 	ck.seq++
 	seq := ck.seq
 	ck.mu.Unlock()
 	shard := key2shard(key)
+	backoff := 10 * time.Millisecond
 	for {
 		ck.refresh()
 		// 在锁内捕获配置快照：refresh() 在 ck.mu 下写入 ck.config，若不持锁读取，
@@ -1408,11 +1461,13 @@ func (ck *Clerk) Get(key string) string {
 			continue
 		}
 		ok := false
-		for _, srv := range servers {
+		// 优先尝试缓存的 leader，再扫其余副本（leader 缓存：减少误路由到非 leader）
+		for _, srv := range orderServers(servers, ck.cachedLeader(gid)) {
 			end := ck.make_end(srv)
 			reply := &GetReply{}
 			if ck.callWithTimeout(end, "ShardKV.Get", &GetArgs{Key: key, ClientId: ck.clientId, Seq: seq}, reply) {
 				if reply.Err == OK {
+					ck.setLeader(gid, srv)
 					return reply.Value
 				}
 				if reply.Err == ErrWrongGroup {
@@ -1424,7 +1479,7 @@ func (ck *Clerk) Get(key string) string {
 		if ok {
 			continue // 分片已迁走，重新查配置
 		}
-		time.Sleep(50 * time.Millisecond)
+		clerkSleepBackoff(&backoff)
 	}
 }
 
@@ -1434,6 +1489,7 @@ func (ck *Clerk) PutAppend(key, value, opType string) {
 	seq := ck.seq
 	ck.mu.Unlock()
 	shard := key2shard(key)
+	backoff := 10 * time.Millisecond
 	for {
 		ck.refresh()
 		// 在锁内捕获配置快照：refresh() 在 ck.mu 下写入 ck.config，若不持锁读取，
@@ -1453,11 +1509,13 @@ func (ck *Clerk) PutAppend(key, value, opType string) {
 			continue
 		}
 		ok := false
-		for _, srv := range servers {
+		// 优先尝试缓存的 leader，再扫其余副本
+		for _, srv := range orderServers(servers, ck.cachedLeader(gid)) {
 			end := ck.make_end(srv)
 			reply := &PutAppendReply{}
 			if ck.callWithTimeout(end, "ShardKV.PutAppend", &PutAppendArgs{Key: key, Value: value, OpType: opType, ClientId: ck.clientId, Seq: seq}, reply) {
 				if reply.Err == OK {
+					ck.setLeader(gid, srv)
 					return
 				}
 				if reply.Err == ErrWrongGroup {
@@ -1469,7 +1527,7 @@ func (ck *Clerk) PutAppend(key, value, opType string) {
 		if ok {
 			continue
 		}
-		time.Sleep(50 * time.Millisecond)
+		clerkSleepBackoff(&backoff)
 	}
 }
 
@@ -1491,6 +1549,7 @@ func (ck *Clerk) GetE(key string) (string, Err) {
 	ck.mu.Unlock()
 	shard := key2shard(key)
 	deadline := time.Now().Add(clerkBoundedRetries)
+	backoff := 10 * time.Millisecond
 	for {
 		if time.Now().After(deadline) {
 			return "", ErrTimeout
@@ -1500,21 +1559,23 @@ func (ck *Clerk) GetE(key string) (string, Err) {
 		cfg := ck.config
 		ck.mu.Unlock()
 		if cfg.Num == 0 {
-			time.Sleep(50 * time.Millisecond)
+			clerkSleepBackoff(&backoff)
 			continue
 		}
 		gid := cfg.Shards[shard]
 		servers := cfg.Groups[gid]
 		if len(servers) == 0 {
-			time.Sleep(50 * time.Millisecond)
+			clerkSleepBackoff(&backoff)
 			continue
 		}
 		wrongGroup := false
-		for _, srv := range servers {
+		// 优先尝试缓存的 leader，再扫其余副本
+		for _, srv := range orderServers(servers, ck.cachedLeader(gid)) {
 			end := ck.make_end(srv)
 			reply := &GetReply{}
 			if ck.callWithTimeout(end, "ShardKV.Get", &GetArgs{Key: key, ClientId: ck.clientId, Seq: seq}, reply) {
 				if reply.Err == OK {
+					ck.setLeader(gid, srv)
 					return reply.Value, OK
 				}
 				if reply.Err == ErrWrongGroup {
@@ -1526,7 +1587,7 @@ func (ck *Clerk) GetE(key string) (string, Err) {
 		if wrongGroup {
 			continue // 分片已迁走，重新查配置
 		}
-		time.Sleep(50 * time.Millisecond)
+		clerkSleepBackoff(&backoff)
 	}
 }
 
@@ -1547,6 +1608,7 @@ func (ck *Clerk) putAppendE(key, value, opType string) Err {
 	ck.mu.Unlock()
 	shard := key2shard(key)
 	deadline := time.Now().Add(clerkBoundedRetries)
+	backoff := 10 * time.Millisecond
 	for {
 		if time.Now().After(deadline) {
 			return ErrTimeout
@@ -1556,21 +1618,23 @@ func (ck *Clerk) putAppendE(key, value, opType string) Err {
 		cfg := ck.config
 		ck.mu.Unlock()
 		if cfg.Num == 0 {
-			time.Sleep(50 * time.Millisecond)
+			clerkSleepBackoff(&backoff)
 			continue
 		}
 		gid := cfg.Shards[shard]
 		servers := cfg.Groups[gid]
 		if len(servers) == 0 {
-			time.Sleep(50 * time.Millisecond)
+			clerkSleepBackoff(&backoff)
 			continue
 		}
 		wrongGroup := false
-		for _, srv := range servers {
+		// 优先尝试缓存的 leader，再扫其余副本
+		for _, srv := range orderServers(servers, ck.cachedLeader(gid)) {
 			end := ck.make_end(srv)
 			reply := &PutAppendReply{}
 			if ck.callWithTimeout(end, "ShardKV.PutAppend", &PutAppendArgs{Key: key, Value: value, OpType: opType, ClientId: ck.clientId, Seq: seq}, reply) {
 				if reply.Err == OK {
+					ck.setLeader(gid, srv)
 					return OK
 				}
 				if reply.Err == ErrWrongGroup {
@@ -1582,7 +1646,7 @@ func (ck *Clerk) putAppendE(key, value, opType string) Err {
 		if wrongGroup {
 			continue
 		}
-		time.Sleep(50 * time.Millisecond)
+		clerkSleepBackoff(&backoff)
 	}
 }
 
