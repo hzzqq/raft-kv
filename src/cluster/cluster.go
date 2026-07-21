@@ -85,7 +85,7 @@ func StartCluster(nGroups, nReplicas, nSM, maxraftstate int) *Cluster {
 		jj := j
 		net.AddServer(j, func(method string, args, reply interface{}) {
 			switch method {
-			case "RequestVote", "AppendEntries", "InstallSnapshot":
+			case "RequestVote", "RequestPreVote", "AppendEntries", "InstallSnapshot", "TimeoutNow":
 				sm.RaftRPC(method, args, reply)
 			case "ShardMaster.Join":
 				sm.Join(args.(*shardmaster.JoinArgs), reply.(*shardmaster.JoinReply))
@@ -124,13 +124,17 @@ func StartCluster(nGroups, nReplicas, nSM, maxraftstate int) *Cluster {
 			// 捕获 g/r 为局部副本，避免闭包共享循环变量（仅 default panic 分支用到）。
 			gg, rr := g, r
 			net.AddServer(id, func(method string, args, reply interface{}) {
-				switch method {
-				case "RequestVote":
-					rf.RequestVote(args.(*raft.RequestVoteArgs), reply.(*raft.RequestVoteReply))
-				case "AppendEntries":
-					rf.AppendEntries(args.(*raft.AppendEntriesArgs), reply.(*raft.AppendEntriesReply))
-				case "InstallSnapshot":
-					rf.InstallSnapshot(args.(*raft.InstallSnapshotArgs), reply.(*raft.InstallSnapshotReply))
+			switch method {
+			case "RequestVote":
+				rf.RequestVote(args.(*raft.RequestVoteArgs), reply.(*raft.RequestVoteReply))
+			case "RequestPreVote":
+				rf.RequestPreVote(args.(*raft.RequestPreVoteArgs), reply.(*raft.RequestPreVoteReply))
+			case "AppendEntries":
+				rf.AppendEntries(args.(*raft.AppendEntriesArgs), reply.(*raft.AppendEntriesReply))
+			case "InstallSnapshot":
+				rf.InstallSnapshot(args.(*raft.InstallSnapshotArgs), reply.(*raft.InstallSnapshotReply))
+			case "TimeoutNow":
+				rf.TimeoutNow(args.(*raft.TimeoutNowArgs), reply.(*raft.TimeoutNowReply))
 				case "ShardKV.Get":
 					kv.Get(args.(*shardkv.GetArgs), reply.(*shardkv.GetReply))
 				case "ShardKV.PutAppend":

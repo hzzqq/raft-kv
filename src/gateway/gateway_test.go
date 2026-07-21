@@ -630,3 +630,74 @@ func TestGatewayGroups(t *testing.T) {
 		}
 	}
 }
+
+// TestGatewayLogLevel：验证 /debug/log 分级结构化日志（I47）——每请求产生一条日志，
+// 可按 ?level= 过滤最低级别（成功请求为 info，错误请求升级 warn/error）。
+func TestGatewayLogLevel(t *testing.T) {
+	c := cluster.StartCluster(2, 3, 3, 0)
+	defer c.Cleanup()
+	s := NewServer(c)
+	s.Init(2)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	// 一次成功请求（应产生 info 级日志）
+	putReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/kv/foo", strings.NewReader("bar"))
+	resp, err := http.DefaultClient.Do(putReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+	// 触发一次客户端错误：对不存在路径发起不支持的方法，网关返回 4xx -> warn。
+	// GET /kv/ 形式非法（缺 key），路由不匹配 -> 405 Method Not Allowed。
+	bad, _ := http.NewRequest(http.MethodDelete, ts.URL+"/kv/foo", nil)
+	br, _ := http.DefaultClient.Do(bad)
+	if br != nil {
+		br.Body.Close()
+	}
+
+	// 默认（info 级）应能看到成功请求的 info 日志。
+	respLog, err := http.Get(ts.URL + "/debug/log?level=info&limit=50")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lb, _ := io.ReadAll(respLog.Body)
+	respLog.Body.Close()
+	var logs []map[string]interface{}
+	if err := json.Unmarshal(lb, &logs); err != nil {
+		t.Fatalf("GET /debug/log body not valid JSON: %v (body=%s)", err, string(lb))
+	}
+	if len(logs) == 0 {
+		t.Fatalf("GET /debug/log returned no entries (body=%s)", string(lb))
+	}
+	// 至少有一条 info 级 "request" 日志（成功 PUT 产生）。
+	hasInfo := false
+	for _, l := range logs {
+		if l["level"] == "info" && l["msg"] == "request" {
+			hasInfo = true
+		}
+	}
+	if !hasInfo {
+		t.Fatalf("GET /debug/log missing info 'request' entry (body=%s)", string(lb))
+	}
+
+	// ?level=error 应只返回 error 级（本测试无 5xx，故为空数组）。
+	respErr, err := http.Get(ts.URL + "/debug/log?level=error&limit=50")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eb, _ := io.ReadAll(respErr.Body)
+	respErr.Body.Close()
+	var errLogs []map[string]interface{}
+	if err := json.Unmarshal(eb, &errLogs); err != nil {
+		t.Fatalf("GET /debug/log?level=error body not valid JSON: %v (body=%s)", err, string(eb))
+	}
+	for _, l := range errLogs {
+		if l["level"] != "error" {
+			t.Fatalf("level=error filter leaked non-error entry: %s", string(eb))
+		}
+	}
+}

@@ -52,6 +52,12 @@ type Server struct {
 	accessLog []accessEntry
 	accessCap int
 
+	// I47：分级结构化日志环形缓冲（最近 N 条），供 /debug/log 暴露，统一排障入口
+	// （取代散落的 fmt.Println，且可按级别过滤 debug/info/warn/error）。
+	logMu  sync.Mutex
+	logBuf []logEntry
+	logCap int
+
 	// 单请求最大处理时长（I16）。后端 Raft 操作在迁移抖动/leader 切换下可能偶发
 	// 长时间不返回；超出该上限即由 http.TimeoutHandler 返回 503，避免 HTTP 连接
 	// 无限挂起（显式兜底，与 Clerk 自身的有界重试互补）。默认 30s，零正常影响。
@@ -99,7 +105,67 @@ func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 
 // NewServer 用给定集群构造网关（不立即加入 group，需先 Init）。
 func NewServer(c *cluster.Cluster) *Server {
-	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, requestTimeout: 30 * time.Second}
+	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second}
+}
+
+// logLevel 是结构化日志级别，数值越大越严重。
+type logLevel int
+
+const (
+	levelDebug logLevel = iota
+	levelInfo
+	levelWarn
+	levelError
+)
+
+func (l logLevel) String() string {
+	switch l {
+	case levelDebug:
+		return "debug"
+	case levelInfo:
+		return "info"
+	case levelWarn:
+		return "warn"
+	case levelError:
+		return "error"
+	default:
+		return "unknown"
+	}
+}
+
+// levelOf 把级别字符串映射回数值（未知级别按 info 处理）。
+func levelOf(s string) logLevel {
+	switch s {
+	case "debug":
+		return levelDebug
+	case "info":
+		return levelInfo
+	case "warn", "warning":
+		return levelWarn
+	case "error":
+		return levelError
+	default:
+		return levelInfo
+	}
+}
+
+// logEntry 是 /debug/log 中单条结构化日志。
+type logEntry struct {
+	TS     time.Time         `json:"ts"`
+	Level  string            `json:"level"`
+	Msg    string            `json:"msg"`
+	Fields map[string]string `json:"fields,omitempty"`
+}
+
+// logf 追加一条分级结构化日志到环形缓冲（超出容量丢弃最旧）。
+func (s *Server) logf(level logLevel, msg string, fields map[string]string) {
+	s.logMu.Lock()
+	e := logEntry{TS: time.Now(), Level: level.String(), Msg: msg, Fields: fields}
+	s.logBuf = append(s.logBuf, e)
+	if len(s.logBuf) > s.logCap {
+		s.logBuf = s.logBuf[len(s.logBuf)-s.logCap:]
+	}
+	s.logMu.Unlock()
 }
 
 // Init 依次加入 nGroups 个 replica group，使分片可写。
@@ -138,6 +204,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /debug/groups", s.wrap(s.handleDebugGroups))
 	// 进程内访问日志（I15）：最近 N 条 HTTP 请求的方法/路径/状态码/延迟，便于审计排障。
 	mux.HandleFunc("GET /debug/accesslog", s.wrap(s.handleDebugAccessLog))
+	// 分级结构化日志（I47）：最近 N 条带级别（debug/info/warn/error）的日志，
+	// 可按 ?level= 过滤最低级别、?limit= 控制条数，统一排障入口。
+	mux.HandleFunc("GET /debug/log", s.wrap(s.handleDebugLog))
 	// I16：以 http.TimeoutHandler 兜底单请求最大时长，避免后端 Raft 操作在迁移抖动
 	// 下长时间不返回时 HTTP 连接无限挂起。超时返回 503；内层 handler 仍在后台跑完
 	// （其写入被丢弃），不会破坏状态机，与 Clerk 有界重试互补。requestTimeout 默认 30s。
@@ -159,6 +228,7 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusTooManyRequests)
 			io.WriteString(w, `{"error":"too many concurrent requests","code":429}`)
+			s.logf(levelWarn, "concurrency limit exceeded", map[string]string{"method": r.Method, "path": r.URL.Path})
 			record(http.StatusTooManyRequests, time.Since(start))
 			return
 		}
@@ -172,6 +242,16 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		st := rec.status
 		if st == 0 {
 			st = http.StatusOK
+		}
+		// 结构化记录每请求一条日志：成功=info，4xx=warn，5xx=error，便于 /debug/log 排障。
+		fields := map[string]string{"method": r.Method, "path": r.URL.Path, "status": strconv.Itoa(st)}
+		switch {
+		case st >= 500:
+			s.logf(levelError, "request error", fields)
+		case st >= 400:
+			s.logf(levelWarn, "request client error", fields)
+		default:
+			s.logf(levelInfo, "request", fields)
 		}
 		record(st, time.Since(start))
 	}
@@ -221,6 +301,59 @@ func (s *Server) handleDebugAccessLog(w http.ResponseWriter, r *http.Request) {
 // handleHealthz 是存活探针（200 即健康）。
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleDebugLog 返回进程内分级结构化日志的最近 N 条（默认 50，?limit= 覆盖），
+// 可按 ?level= 过滤最低级别（debug/info/warn/error，默认 info）。按时间升序（最旧
+// 在前、最新在后），便于回看近期事件轨迹与级别分布。
+func (s *Server) handleDebugLog(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	minLevel := levelInfo
+	if lv := r.URL.Query().Get("level"); lv != "" {
+		if parsed, ok := parseLogLevel(lv); ok {
+			minLevel = parsed
+		}
+	}
+	s.logMu.Lock()
+	var filtered []logEntry
+	for _, e := range s.logBuf {
+		if levelOf(e.Level) >= minLevel {
+			filtered = append(filtered, e)
+		}
+	}
+	n := len(filtered)
+	if limit > n {
+		limit = n
+	}
+	page := make([]logEntry, limit)
+	copy(page, filtered[n-limit:])
+	s.logMu.Unlock()
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(page); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// parseLogLevel 把 ?level= 查询参数解析为 logLevel，未知值返回 ok=false（保持默认 info）。
+func parseLogLevel(s string) (logLevel, bool) {
+	switch s {
+	case "debug":
+		return levelDebug, true
+	case "info":
+		return levelInfo, true
+	case "warn", "warning":
+		return levelWarn, true
+	case "error":
+		return levelError, true
+	default:
+		return levelInfo, false
+	}
 }
 
 // SetHTTPServer 注册底层 *http.Server，使 Shutdown 能一并关闭监听（可选）。
