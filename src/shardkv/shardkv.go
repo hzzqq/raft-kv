@@ -588,6 +588,15 @@ func (kv *ShardKV) resolveShardForTransfer(s int) (*ShardData, Err) {
 
 // debugState 返回一份加锁拷贝的迁移状态快照，仅供测试诊断（避免无锁读 map 触发
 // 并发读写 panic）。打印 pendingIn/pendingOut/shards/incoming 与配置号，定位迁移冻结。
+// orphanCounts 在持锁下返回当前残留的迁移中间态数量：
+// pendingIn（待收未收）/ pendingOut（待迁未 GC）/ incoming（收到未生效）。
+// 配置稳定后应全部为 0；非 0 表示迁移状态机有泄漏（即便未冻结也已破坏一致性）。
+func (kv *ShardKV) orphanCounts() (pendingIn, pendingOut, incoming int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	return len(kv.pendingIn), len(kv.pendingOut), len(kv.incoming)
+}
+
 func (kv *ShardKV) debugState() string {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()

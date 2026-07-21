@@ -99,6 +99,41 @@ func TestChaosLeaderKillDuringMigration(t *testing.T) {
 			t.Fatalf("after chaos Get(%q)=%q want %q", k, v, want)
 		}
 	}
+
+	// 额外守护：配置稳定后迁移中间态必须全部清空，否则即便未冻结也已破坏一致性
+	// （孤儿 pendingIn/incoming 会在后续配置下指向错误 owner）。
+	cfg.assertNoMigrationOrphans(t)
+}
+
+// assertNoMigrationOrphans 在 churn 结束后轮询一小段时间，确认所有副本的
+// pendingIn/pendingOut/incoming 都归零。若残留则判失败——这是比"配置冻结"更隐蔽的
+// 状态机泄漏信号（迁移卡在半途但不阻断配置推进）。
+func (cfg *skvConfig) assertNoMigrationOrphans(t *testing.T) {
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		clean := true
+		for g := 0; g < cfg.nGroups; g++ {
+			for r := 0; r < cfg.nReplicas; r++ {
+				pin, pout, inc := cfg.groups[g][r].orphanCounts()
+				if pin != 0 || pout != 0 || inc != 0 {
+					clean = false
+				}
+			}
+		}
+		if clean {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	for g := 0; g < cfg.nGroups; g++ {
+		for r := 0; r < cfg.nReplicas; r++ {
+			pin, pout, inc := cfg.groups[g][r].orphanCounts()
+			if pin != 0 || pout != 0 || inc != 0 {
+				t.Fatalf("group %d replica %d has migration orphans after churn: pendingIn=%d pendingOut=%d incoming=%d",
+					g, r, pin, pout, inc)
+			}
+		}
+	}
 }
 
 // LeaderKillRecover 最小复现：多次（无配置 churn）杀主后应在每轮数秒内重新选出
@@ -215,4 +250,7 @@ func TestChaosLongRun(t *testing.T) {
 			t.Fatalf("after long chaos Get(%q)=%q want %q", k, v, want)
 		}
 	}
+
+	// 配置稳定后迁移中间态必须归零（同 TestChaosLeaderKillDuringMigration 的守护）。
+	cfg.assertNoMigrationOrphans(t)
 }
