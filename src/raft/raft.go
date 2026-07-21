@@ -146,8 +146,12 @@ type Raft struct {
 	lastContact []time.Time
 
 	// ---- 选举/心跳计时 ----
+	// timerMu 保护 electionTimer/heartbeatTimer 的 Reset/Stop：ticker 与选举/心跳
+	// goroutine 都会改动这两个 Timer，而 time.Timer 并非并发安全；不加锁在 -race 下
+	// 会被判为数据竞争。注意锁序始终 timerMu 在外、与 rf.mu 不形成环（见 reset 函数）。
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
+	timerMu        sync.Mutex
 
 	// ---- 快照（2D）----
 	lastIncludedIndex int
@@ -311,6 +315,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) resetElectionTimer() {
 	d := ElectionTimeoutMin + time.Duration(rand.Int63n(int64(ElectionTimeoutMax-ElectionTimeoutMin)))
+	rf.timerMu.Lock()
+	defer rf.timerMu.Unlock()
 	if !rf.electionTimer.Stop() {
 		select {
 		case <-rf.electionTimer.C:
@@ -435,6 +441,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // ============================== 日志复制 ==============================
 
 func (rf *Raft) resetHeartbeatTimer() {
+	rf.timerMu.Lock()
+	defer rf.timerMu.Unlock()
 	if !rf.heartbeatTimer.Stop() {
 		select {
 		case <-rf.heartbeatTimer.C:
