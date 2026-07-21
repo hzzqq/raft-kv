@@ -396,3 +396,26 @@ func TestClientSessionGC(t *testing.T) {
 		t.Fatalf("recent session 3 should be retained")
 	}
 }
+
+// TestKVReadLease 验证 Get 的 ReadIndex 快路径在稳定集群下被实际命中：leader 持租约时
+// 直接本地读、跳过 Raft 日志追加，read_leases 计数随之增长（mirror shardkv 的同类优化）。
+func TestKVReadLease(t *testing.T) {
+	ck := makeKVConfig(t, 3)
+	defer ck.cleanup()
+
+	ck.clerks[0].Put("rl", "v")
+	if v := ck.clerks[0].Get("rl"); v != "v" {
+		t.Fatalf("Get(rl)=%q, want \"v\"", v)
+	}
+	// 连续多次读，leader 稳定持租约，应走快路径。
+	for i := 0; i < 10; i++ {
+		if v := ck.clerks[0].Get("rl"); v != "v" {
+			t.Fatalf("Get(rl)=%q, want \"v\"", v)
+		}
+	}
+
+	before := Metrics.Counter("read_leases").Value()
+	if before <= 0 {
+		t.Fatalf("read_leases counter = %d, want > 0 (ReadIndex fast-path not exercised on stable cluster)", before)
+	}
+}

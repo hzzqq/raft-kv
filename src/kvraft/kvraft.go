@@ -77,6 +77,11 @@ type KVServer struct {
 	sessions map[int64]*clientSession // 每个 client 的去重状态 + 最近访问时间（GC 回收）
 	notify   map[int]chan applyResult
 
+	// appliedIndex 是本 KV 状态机已应用的最后一条日志绝对索引（与 raft 的
+	// lastApplied 对齐）。ReadIndex 快路径用它判断「本地是否已达 commitIndex 对应的
+	// 已提交状态」，从而安全地跳过一次 Raft 日志追加直接本地读（见 Get）。
+	appliedIndex int
+
 	gcTTL      time.Duration // 空闲超过该时长的 client 会话被 GC 回收
 	gcInterval time.Duration // GC 扫描周期
 	killCh     chan struct{} // GC goroutine 退出信号（仅由 Kill 关闭一次）
@@ -132,6 +137,7 @@ func (kv *KVServer) applier() {
 		if msg.SnapshotValid {
 			// 落后 follower 或重启节点通过快照追平状态机。
 			kv.installSnapshot(msg.Snapshot)
+			kv.appliedIndex = msg.SnapshotIndex
 			Metrics.Counter("snapshots_installed").Inc()
 			continue
 		}
@@ -168,6 +174,7 @@ func (kv *KVServer) applier() {
 		}
 		s.lastAccess = time.Now()
 		idx := msg.CommandIndex
+		kv.appliedIndex = idx
 		ch := kv.notify[idx]
 		delete(kv.notify, idx)
 		// maxraftstate > 0 且 Raft 状态超过阈值时主动压缩快照（Lab 2D ↔ KV 集成）。
@@ -211,6 +218,25 @@ func (kv *KVServer) installSnapshot(data []byte) {
 	kv.sessions = st.Sessions
 }
 
+// waitAppliedIndex 轮询等待本服务器状态机已应用到索引 idx（ReadIndex 快路径用），
+// 超时返回 false。本地读前确保读到 commitIndex 对应的已提交状态；appliedIndex 的
+// 读写均在 kv.mu 保护下进行（applier 在持锁时写入）。
+func (kv *KVServer) waitAppliedIndex(idx int) bool {
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		kv.mu.Lock()
+		applied := kv.appliedIndex
+		kv.mu.Unlock()
+		if applied >= idx {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // waitApplied 等待本服务器把 op 提交到状态机并返回结果。
 // 若超时、或该位置被别的命令占据（leader 切换），返回 WrongLeader 让客户端重试。
 func (kv *KVServer) waitApplied(op Op, index int) OpResult {
@@ -245,6 +271,26 @@ func (kv *KVServer) startOp(op Op) (int, bool) {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	start := time.Now()
+	// 线性一致读优化（ReadIndex 快路径）：仅当本副本是 leader 且持有合法 leader
+	// 租约（HasLeaderLease，多数派近期有心跳接触）时，才跳过日志追加、直接读本地
+	// 状态机。租约保证该 leader 期间无更新任期产生、commitIndex 不会被回滚，故等待
+	// 本服务器 apply 到 commitIndex 后本地读是线性一致的。租约失效（分区/刚上任）
+	// 时一律回退 propose 路径，绝不牺牲正确性。mirror shardkv 的同类优化。
+	if kv.rf.HasLeaderLease() {
+		if commitIdx, isLeader := kv.rf.ReadIndex(); isLeader {
+			if kv.waitAppliedIndex(commitIdx) {
+				kv.mu.Lock()
+				v := kv.data[args.Key]
+				kv.mu.Unlock()
+				Metrics.Counter("read_leases").Inc()
+				reply.Value = v
+				Metrics.Counter("ops_total").Inc()
+				Metrics.Histogram("op_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
+				return
+			}
+		}
+	}
+	// 回退路径：始终走 propose（经 Raft 共识，绝对线性一致）。
 	op := Op{Key: args.Key, OpType: "Get", ClientId: args.ClientId, Seq: args.Seq}
 	index, ok := kv.startOp(op)
 	if !ok {
