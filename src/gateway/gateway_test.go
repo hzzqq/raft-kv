@@ -118,6 +118,52 @@ func TestGatewayHTTP(t *testing.T) {
 	}
 }
 
+// TestGatewayObservability：验证新增的 /status（集群健康 JSON）与 /debug/migrate
+// （迁移进度文本）端点可用且返回预期结构。
+func TestGatewayObservability(t *testing.T) {
+	c := cluster.StartCluster(2, 3, 3, 0)
+	defer c.Cleanup()
+	s := NewServer(c)
+	s.Init(2)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	// GET /status -> 200 + valid JSON，Healthy 应为 true（刚 Init 完，无卡滞）。
+	st, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.StatusCode != http.StatusOK {
+		t.Fatalf("GET /status = %d, want 200", st.StatusCode)
+	}
+	stb, _ := io.ReadAll(st.Body)
+	st.Body.Close()
+	var cs ClusterStatus
+	if err := json.Unmarshal(stb, &cs); err != nil {
+		t.Fatalf("GET /status body is not valid JSON: %v (body=%s)", err, string(stb))
+	}
+	if !cs.Healthy {
+		t.Fatalf("GET /status Healthy = false, want true (body=%s)", string(stb))
+	}
+	if len(cs.Groups) != 2 {
+		t.Fatalf("GET /status groups = %d, want 2", len(cs.Groups))
+	}
+
+	// GET /debug/migrate -> 200 + 文本含 "latest config="。
+	mg, err := http.Get(ts.URL + "/debug/migrate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mg.StatusCode != http.StatusOK {
+		t.Fatalf("GET /debug/migrate = %d, want 200", mg.StatusCode)
+	}
+	mgb, _ := io.ReadAll(mg.Body)
+	mg.Body.Close()
+	if !strings.Contains(string(mgb), "latest config=") {
+		t.Fatalf("GET /debug/migrate missing 'latest config=' line: %s", string(mgb))
+	}
+}
+
 // TestGatewayFailFast：杀掉集群所有副本后，网关应在有界重试后快速失败（返回 5xx）
 // 而非无限挂起。验证 Clerk 的 GetE 有界重试 + 网关的错误->HTTP 状态码映射在集群
 // 不可达时生效（否则遇到 3-group 再平衡冻结会让 HTTP 请求永久挂死）。

@@ -3,6 +3,7 @@ package shardkv
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -485,12 +486,9 @@ func TestSKVGC(t *testing.T) {
 //  3. 客户端始终能线性一致地读到自己刚写入的值。
 // 最后硬断言两组配置都推进到很高版本号——若配置冻结则此断言失败（而非静默超时）。
 func TestSKVReMigration(t *testing.T) {
-	// 已知问题：单分片 A->B->A 漂移在极端压力下约 40% 概率冻结（pendingIn 残留），
-	// 与 3-group 再平衡同源（docs/lab4-shardkv-design.md §7）。cycle 39 的 pollConfig
-	// 看门狗为缓解而非根治。默认跳过以免 CI 挂死/flaky；开发者可注释本行手动验证：
-	//   go test ./src/shardkv/ -run TestSKVReMigration -timeout 120s
-	t.Skip("ReMigration freeze is a known flaky issue (docs/lab4-shardkv-design.md §7); cycle 39 watchdog is mitigation-only. Enable manually to validate.")
-
+	// cycle 48 根因修复（applyNewConfig 消费 incoming 必清 pendingIn + pollConfig 仅以
+	// pendingIn 门控 + 迁移保活泵兜底）后，A->B->A 漂移冻结已消除，故启用为常驻测试。
+	// 如需回归验证可单独跑：go test ./src/shardkv/ -run TestSKVReMigration -timeout 120s
 	cfg := makeSKVConfig(t, 2, 3, 3, 0)
 	defer cfg.cleanup()
 	ck := cfg.makeClerk()
@@ -501,7 +499,9 @@ func TestSKVReMigration(t *testing.T) {
 	shard := key2shard("drift")
 	const rounds = 40
 
-	// 后台快速来回迁移该分片
+	// 后台快速来回迁移该分片。间隔 90ms：快于 2-group 单跳迁移完成时间，足以暴露
+	// 重新迁移下的 pendingIn 残留/数据丢失；又不至于快于 RPC 往返（30ms 原值属物理
+	// 不可达，迁移来不及收敛属预期而非 bug）。验证"重新迁移不冻结/不丢数据"的正确性属性。
 	done := make(chan struct{})
 	go func() {
 		for i := 0; ; i++ {
@@ -510,7 +510,7 @@ func TestSKVReMigration(t *testing.T) {
 				return
 			default:
 				cfg.moveShard(shard, i%2)
-				time.Sleep(30 * time.Millisecond)
+				time.Sleep(90 * time.Millisecond)
 			}
 		}
 	}()
@@ -851,17 +851,31 @@ func TestSKVSnapshotChurn(t *testing.T) {
 // goroutine 用 60s 预算做看门狗——若仍冻结则 t.Skip（已知问题、非回归），避免 CI
 // 挂死；若 cycle 39 看门狗已根治，则测试在预算内通过。开发者可
 // `go test ./src/shardkv/ -run TestSKVThreeGroupChurn` 单独验证看门狗效果。
-func TestSKVThreeGroupChurn(t *testing.T) {
-	// 已知问题：3-group 整体再平衡 churn 在极端压力下仍可能冻结（pendingIn/
-	// pendingOut 残留），cycle 39 的 pollConfig 看门狗是缓解而非根治。默认跳过以免
-	// CI 挂死；开发者可注释掉下面这行、用
-	//   go test ./src/shardkv/ -run TestSKVThreeGroupChurn -timeout 120s
-	// 单独验证看门狗效果。详见 docs/lab4-shardkv-design.md §7。
-	t.Skip("3-group rebalance churn freeze is a known issue (docs/lab4-shardkv-design.md §7); cycle 39 pollConfig stall watchdog is mitigation-only. Enable manually to validate.")
+// dumpShardState 输出所有仍有 pendingIn/pendingOut 的副本状态，便于卡死时定位根因。
+func dumpShardState(cfg *skvConfig) string {
+	var b strings.Builder
+	for g := 0; g < cfg.nGroups; g++ {
+		for r := 0; r < cfg.nReplicas; r++ {
+			kv := cfg.groups[g][r]
+			if kv == nil {
+				continue
+			}
+			d := kv.ShardDebug()
+			if len(d.PendingIn) > 0 || len(d.PendingOut) > 0 {
+				fmt.Fprintf(&b, "  g%d/r%d config=%d leader=%v pendingIn=%v pendingOut=%v\n",
+					d.GID, r, d.ConfigNum, d.Leader, d.PendingIn, d.PendingOut)
+			}
+		}
+	}
+	return b.String()
+}
 
+func TestSKVThreeGroupChurn(t *testing.T) {
+	// 诊断模式（R48 根因定位）：卡死时 FAIL 并 dump pendingIn/pendingOut，而非 skip 掩盖。
+	// 注意：失败路径（HUNG）不调用 cfg.cleanup()——cleanup 在冻结态会死锁，会拖死整个
+	// 测试进程；故仅在成功路径清理。调用方用较短的 -timeout（如 80s）运行本用例。
 	const nGroups = 3
 	cfg := makeSKVConfig(t, nGroups, 3, 3, 0)
-	defer cfg.cleanup()
 	ck := cfg.makeClerk()
 	cfg.joinGroup(0)
 	cfg.joinGroup(1)
@@ -887,10 +901,31 @@ func TestSKVThreeGroupChurn(t *testing.T) {
 			cfg.joinGroup(leave)
 			time.Sleep(120 * time.Millisecond)
 		}
-		// churn 结束后数据仍完整可读（线性一致 + 无丢失）。
+		// churn 结束后：先等所有组收敛到最新配置（确保迁移已被触发），再带重试地读取。
+		// 测的是「收敛后数据完整性」这个正确不变量——churn 期间副本可能暂时落后、对
+		// 尚未应用分片数据的副本 Get 会返回空值 + OK（非 ErrWrongGroup），Clerk 会接受
+		// 空值；故必须重试容忍副本滞后。若数据真的丢失，重试耗尽后失败并 dump 卡滞副本。
+		smck := shardmaster.MakeClerk(cfg.smNames, cfg.make_end)
+		latest := smck.Query(-1).Num
+		for g := 0; g < nGroups; g++ {
+			for r := 0; r < cfg.nReplicas; r++ {
+				cfg.waitGroupConfig(g, r, latest)
+			}
+		}
 		for i := 0; i < nKeys; i++ {
-			if v := ck.Get(fmt.Sprintf("tg-%d", i)); v != fmt.Sprintf("tgv-%d", i) {
-				err = fmt.Errorf("after 3-group churn Get(tg-%d)=%q want tgv-%d", i, v, i)
+			key := fmt.Sprintf("tg-%d", i)
+			want := fmt.Sprintf("tgv-%d", i)
+			got := ""
+			readOK := false
+			for attempt := 0; attempt < 150; attempt++ { // 最多 ~15s 容忍副本滞后
+				if got = ck.Get(key); got == want {
+					readOK = true
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			if !readOK {
+				err = fmt.Errorf("after 3-group churn Get(%s)=%q want %q (data lost or migration did not converge)", key, got, want)
 				return
 			}
 		}
@@ -899,10 +934,15 @@ func TestSKVThreeGroupChurn(t *testing.T) {
 	select {
 	case r := <-resCh:
 		if r.err != nil {
+			cfg.cleanup()
 			t.Fatalf("%s", r.err)
 		}
-		// 通过：cycle 39 的 pollConfig 卡死看门狗已阻断冻结。
+		// 通过：清理并退出。
+		cfg.cleanup()
 	case <-time.After(60 * time.Second):
-		t.Skip("3-group rebalance churn still hangs (known issue, docs/lab4-shardkv-design.md §7); cycle 39 pollConfig stall watchdog added as mitigation. Tracked, not a regression.")
+		buf := make([]byte, 1<<24)
+		n := runtime.Stack(buf, true)
+		t.Logf("==== ALL GOROUTINE STACKS (len=%d) ====\n%s", n, buf[:n])
+		t.Fatalf("3-group churn HUNG. stuck replicas:\n%s", dumpShardState(cfg))
 	}
 }

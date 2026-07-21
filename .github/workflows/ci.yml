@@ -43,6 +43,24 @@ jobs:
         continue-on-error: true
         run: go test -race ./src/shardkv/ -run 'TestSKVSnapshotChurn' -count=1 -timeout 600s
 
+  # 迁移冻结压测：专跑 ReMigration（A→B→A 漂移）+ ThreeGroupChurn（3 组整体再平衡），
+  # 高 -count 放大冻结回归概率。冻结属 liveness/deadlock 问题，无需 -race 即可暴露
+  # （此前曾在 3-group churn 下确定性挂死）。本地无 gcc，故放 CI 侧、常驻必过。
+  migration-stress:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Migration stress (ReMigration + ThreeGroupChurn, -count=5)
+        run: go test ./src/shardkv/ -run 'TestSKVReMigration|TestSKVThreeGroupChurn' -count=5 -timeout 900s
+
   fullstack-smoke:
     runs-on: ubuntu-latest
     steps:

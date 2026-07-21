@@ -89,6 +89,8 @@ go run ./src/gateway :9090           # 自定义地址
 | `POST /kv/{key}/append` | 把 body 追加到 `key` 当前值之后 |
 | `GET /healthz` | 健康检查（200） |
 | `GET /metrics` | 返回 `shardkv.Metrics` 的 JSON 快照（counters + 直方图分位数） |
+| `GET /status` | 集群健康总览（JSON `ClusterStatus`）：每 group leader/config/持有/待收/待迁/孤儿中转计数 + 卡滞秒数 + 整体 `healthy` 标志（卡滞 >2s 判冻结），供监控/告警轮询 |
+| `GET /debug/migrate` | 纯文本迁移进度（每 group leader 副本的 pendingIn/pendingOut/incoming 分布 + 集群最新 config 号），供线下排障 |
 
 `Handler()` 返回 `http.Handler`，便于用 `httptest` 做单测而无需绑定端口。
 
@@ -151,3 +153,14 @@ reg.Reset()            // 跨用例重置，避免进程级指标累积
 make              # build + vet + shardkv test
 make demo         # 构建二进制并运行全栈 demo
 ```
+
+排障 / 观测子命令：
+
+```bash
+./start.sh migrate   # 实时迁移进度（对接 /debug/migrate，一眼看清再平衡是否卡住）
+./start.sh status    # 集群健康总览（对接 /status，JSON 经 statusfmt 渲染为可读表格）
+```
+
+`status` 子命令把 `/status` 的 JSON 输出渲染为表格（未安装 jq/python 也能用）；
+`migrate` 子命令直接打印 `/debug/migrate` 文本，pendingIn/pendingOut 有残留且 stall>0
+即配置冻结风险信号。

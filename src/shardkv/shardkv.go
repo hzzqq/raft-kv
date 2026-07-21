@@ -207,6 +207,7 @@ func MakeShardKV(gid int, masters []string, make_end func(string) *raft.ClientEn
 	}
 	// 初始：拉取最新配置（可能已有 group）
 	go kv.pollConfig()
+	go kv.migratePump()
 	go kv.applier()
 	return kv
 }
@@ -235,6 +236,12 @@ func (kv *ShardKV) pollConfig() {
 		kv.mu.Lock()
 		cur := kv.config.Num
 		hasPending := len(kv.pendingIn) > 0 || len(kv.pendingOut) > 0
+		// 配置推进仅以 pendingIn（本组待收分片）门控：收到数据前本组无法正确服务该
+		// 分片，必须先等；pendingOut（本组待迁出、等待 GC）不再阻塞推进——旧 owner 在
+		// 配置推进后将不再"拥有"该分片（applyCmd 返回 ErrWrongGroup），不会错误服务，
+		// 迁出/GC 由后台 sendShard 完成即可。这消除了 3-group churn 下"发送侧
+		// pendingOut 与接收侧 pendingIn 互相卡住"的两侧死锁（cycle 48 根因修复）。
+		blockAdvance := len(kv.pendingIn) > 0
 		now := time.Now()
 		if !hasPending {
 			// 无未决迁移：重置看门狗计时，并允许推进到下一配置。
@@ -297,8 +304,8 @@ func (kv *ShardKV) pollConfig() {
 		if latest.Num <= cur {
 			continue
 		}
-		if hasPending {
-			continue // 等当前迁移完成再推进
+		if blockAdvance {
+			continue // 本组仍有待收分片，先完成迁移再推进配置
 		}
 		next := kv.mck.Query(cur + 1)
 		if next.Num != cur+1 {
@@ -308,6 +315,73 @@ func (kv *ShardKV) pollConfig() {
 	}
 }
 
+// migratePump 是迁移的「保活泵」：周期性扫描 pendingIn/pendingOut，对长时间无进展的
+// 分片重新拉起 fetchShard/sendShard（bump fetchEpoch 让陈旧协程自退），与 applyNewConfig
+// 在配置推进时的一次性拉起互补——泵兜底处理「拉取协程意外退出 / 源瞬时不可达 /
+// 配置推进快于单跳迁移」导致的残留 pending，避免依赖单一触发点。限频（每分片每 500ms
+// 最多重拉一次）以避免 goroutine 风暴（cycle 48 健壮性增强）。
+func (kv *ShardKV) migratePump() {
+	for !kv.killed() {
+		time.Sleep(150 * time.Millisecond)
+		kv.mu.Lock()
+		// 收方已拥有分片 s、但数据迟到在 incoming（applyNewConfig 已先行跑过、未消费到）
+		// 时，直接消费 incoming → 清 pendingIn，解除「配置推进被 pendingIn 阻塞」的冻结。
+		// 仅作用于「本组拥有 s」的情形、不前向转发——避免与双向漂移的 pendingIn 状态冲突
+		// （cycle 55 教训：独立 goroutine 改写 shards/pendingIn 会清掉合法待拉取标记）。
+		// 数据本就由旧 owner 通过 InstallShard 推到本组 incoming（旧 owner 在收到 ACK 后
+		// 才 GC，故数据不会丢），只是 applyNewConfig 的临界区没赶上，泵在此补消费即可。
+		for s := range kv.pendingIn {
+			if kv.config.Shards[s] == kv.gid {
+				if data, ok := kv.incoming[s]; ok {
+					if _, exists := kv.shards[s]; exists {
+						kv.mergeShardData(s, data)
+					} else {
+						kv.shards[s] = data
+					}
+					delete(kv.incoming, s)
+					delete(kv.pendingIn, s)
+				}
+			}
+		}
+		now := time.Now()
+		for s := range kv.pendingIn {
+			if t, ok := kv.pendingInSince[s]; !ok || now.Sub(t) > 500*time.Millisecond {
+				kv.pendingInSince[s] = now
+				oldG := kv.prevConfig.Shards[s]
+				if oldG == kv.gid || oldG == 0 {
+					// 上一版配置已无旧 owner：尝试最新配置 owner 兜底（多跳迁移链找回）。
+					if cur := kv.mck.Query(-1); cur.Num > 0 {
+						if co := cur.Shards[s]; co != kv.gid && co != 0 {
+							kv.fetchEpoch[s]++
+							epoch := kv.fetchEpoch[s]
+							servers := append([]string{}, cur.Groups[co]...)
+							kv.mu.Unlock()
+							go kv.fetchShard(s, servers, epoch)
+							kv.mu.Lock()
+						}
+					}
+					continue
+				}
+				kv.fetchEpoch[s]++
+				epoch := kv.fetchEpoch[s]
+				servers := append([]string{}, kv.prevConfig.Groups[oldG]...)
+				kv.mu.Unlock()
+				go kv.fetchShard(s, servers, epoch)
+				kv.mu.Lock()
+			}
+		}
+		for s := range kv.pendingOut {
+			if t, ok := kv.pendingOutSince[s]; !ok || now.Sub(t) > 500*time.Millisecond {
+				kv.pendingOutSince[s] = now
+				newG := kv.config.Shards[s]
+				kv.mu.Unlock()
+				go kv.sendShard(s, newG)
+				kv.mu.Lock()
+			}
+		}
+		kv.mu.Unlock()
+	}
+}
 // rekickStuckMigrations 仅由 pollConfig 看门狗在迁移卡死时调用（调用方持有 kv.mu）。
 // 对每个仍 pending 的分片：若最新配置下本组已是其 owner 或无主，清掉残留标记让配置
 // 继续推进；否则以最新配置的 owner 重拉取（pendingIn）/重推送（pendingOut），并 bump
@@ -470,6 +544,22 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
 	kv.mu.Lock()
 	sd, ok := kv.shards[args.Shard]
 	if !ok {
+		// 回退：本组当前不"拥有"该分片，但可能缓冲了它的迁移数据（incoming）。
+		// 多跳 rebalance（A→B→C 连跳）下，中间组 B 在失去所有权前收到旧 owner A
+		// 的迟到推送，被 applyInstallShard 缓冲进 incoming[s]；真正的主人 C 的
+		// fetchShard 按 prevConfig 去问 B 要 s——若 GetShard 只服务 shards，永远
+		// 返回 ErrWrongGroup，C 的 pendingIn[s] 清不掉、配置冻结（3-group churn
+		// 根因之一）。故此处仅在本组 shards[s] 缺失时回退返回 incoming[s]：该数据
+		// 由合法旧 owner 推送、真实有效，新 owner 拉走后即安装，无需任何后台转发
+		// 协程（避免孤儿转发打爆网络/选举、造成整集群冻结的回归）。若 shards[s]
+		// 已存在则优先返回它（已结算态），不会误返回陈旧 incoming，故 ReMigration
+		// 等回摆场景不会回归。
+		if data, ok2 := kv.incoming[args.Shard]; ok2 {
+			reply.Data = data.copy()
+			kv.mu.Unlock()
+			reply.Err = OK
+			return
+		}
 		kv.mu.Unlock()
 		reply.Err = ErrWrongGroup
 		return
@@ -650,6 +740,11 @@ func (kv *ShardKV) applyNewConfig(cfg shardmaster.Config) {
 						kv.shards[s] = data
 					}
 					delete(kv.incoming, s)
+					// 关键修复（cycle 48 根因）：数据已从 incoming 装入本组分片，
+					// 必须清除 pendingIn[s]，否则 pollConfig 被 pendingIn 门控而
+					// 无法推进配置——形成"收方等配置推进清 pendingIn / 配置推进
+					// 又被 pendingIn 阻塞"的死锁，3-group / ReMigration churn 冻结。
+					delete(kv.pendingIn, s)
 				} else if !have {
 					// 既未持有也未在 incoming 中缓冲：从上一版配置记录的旧 owner 拉取。
 					kv.pendingIn[s] = true
@@ -678,6 +773,8 @@ func (kv *ShardKV) applyNewConfig(cfg shardmaster.Config) {
 					kv.shards[s] = data
 				}
 				delete(kv.incoming, s)
+				// 同样清除 pendingIn：该分片数据已装入，无论后续归属如何都不再"待收"。
+				delete(kv.pendingIn, s)
 				kv.pendingOut[s] = true
 				go kv.sendShard(s, cfg.Shards[s])
 			} else {
@@ -714,7 +811,7 @@ func (kv *ShardKV) applyInstallShard(op Op, res *applyResult) {
 		kv.shards[s] = incoming
 		delete(kv.pendingIn, s)
 	} else {
-		// 配置尚未推进到"拥有该分片"，先缓冲，待 NewConfig 生效时安装。
+		// 配置尚未推进到"拥有该分片"，先缓冲，待 applyNewConfig 消费并安装。
 		kv.incoming[s] = incoming
 	}
 	if res != nil {
@@ -802,8 +899,13 @@ func (kv *ShardKV) fetchShard(s int, oldServers []string, epoch int64) {
 						}
 					}
 				} else if curOwner == kv.gid {
+					// 仅当我们确实已持有该分片数据时才清 pendingIn；否则保留
+					// pendingIn 让配置推进保持阻塞，避免"配置推进但服务空分片"
+					// 的数据丢失（cycle 48 加固）。
 					kv.mu.Lock()
-					delete(kv.pendingIn, s)
+					if _, ok := kv.shards[s]; ok {
+						delete(kv.pendingIn, s)
+					}
 					kv.mu.Unlock()
 					return
 				}
@@ -870,8 +972,23 @@ func (kv *ShardKV) sendShard(s, newG int) {
 			}
 		}
 		if sent {
-			// 对方已提交该分片数据，本组可安全回收。
-			kv.propose(Op{Kind: "GCShard", GCShard: s})
+			// 对方已提交该分片数据，本组可安全回收。GCShard 的 propose 可能因
+			// 瞬时负载触发内置 3s 超时（ErrTimeout），必须重试直至提交成功，
+			// 否则 pendingOut[s] 残留会留下脏状态（cycle 48 加固）。循环至
+			// pendingOut[s] 被 GC 处理器清除为止。
+			for !kv.killed() {
+				kv.mu.Lock()
+				if !kv.pendingOut[s] {
+					kv.mu.Unlock()
+					return
+				}
+				kv.mu.Unlock()
+				r := kv.propose(Op{Kind: "GCShard", GCShard: s})
+				if r.err == OK {
+					return
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
 			return
 		}
 		time.Sleep(50 * time.Millisecond)

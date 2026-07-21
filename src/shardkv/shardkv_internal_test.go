@@ -131,3 +131,43 @@ func TestApplyInstallShardIdempotent(t *testing.T) {
 		t.Fatalf("applyInstallShard 未深拷贝，运行态与 Raft 日志共享同一 ShardData 指针")
 	}
 }
+
+// TestApplyNewConfigClearsPendingInOnIncoming：applyNewConfig 在把缓冲于 incoming 的
+// 分片数据装入本组 shards 时，必须清除 pendingIn[s]——否则 pollConfig 被 pendingIn 门控
+// 而无法推进配置，形成"收方等配置推进清 pendingIn / 配置推进又被 pendingIn 阻塞"的死锁
+// （cycle 48 根因修复的回归护栏）。这是 3-group / ReMigration churn 冻结的核心修复点。
+func TestApplyNewConfigClearsPendingInOnIncoming(t *testing.T) {
+	kv := &ShardKV{
+		gid:        1,
+		config:     shardmaster.Config{Num: 0, Shards: [NShards]int{}},
+		prevConfig: shardmaster.Config{Num: 0, Shards: [NShards]int{}},
+		shards:     map[int]*ShardData{},
+		incoming:   map[int]*ShardData{},
+		pendingIn:  map[int]bool{},
+		pendingOut: map[int]bool{},
+		fetchEpoch: map[int]int64{},
+	}
+	// 模拟"配置尚未推进到拥有 s 时就收到 InstallShard，数据缓冲在 incoming"。
+	kv.incoming[7] = &ShardData{
+		Data:       map[string]string{"k": "v7"},
+		LastSeq:    map[int64]int64{1: 1},
+		LastResult: map[int64]string{1: "v7"},
+	}
+	// 注意：applyNewConfig 会先把 kv.prevConfig = kv.config，故"上一版 owner"设在
+	// 旧配置（kv.config）上；新配置 cfg 让本组拥有分片 7。
+	kv.config.Shards[7] = 2 // 旧配置下分片 7 的 owner 是 group 2
+	// 配置推进到 1：本组现在拥有分片 7（但数据仍在 incoming，尚未装入 shards）。
+	cfg := shardmaster.Config{Num: 1, Shards: [NShards]int{}}
+	cfg.Shards[7] = 1
+	kv.applyNewConfig(cfg)
+
+	if kv.shards[7] == nil || kv.shards[7].Data["k"] != "v7" {
+		t.Fatalf("分片 7 未从 incoming 装入: shards[7]=%v", kv.shards[7])
+	}
+	if _, ok := kv.incoming[7]; ok {
+		t.Fatalf("incoming[7] 未清除")
+	}
+	if _, ok := kv.pendingIn[7]; ok {
+		t.Fatalf("cycle 48 回归: applyNewConfig 消费 incoming 后未清除 pendingIn[7]，将导致配置死锁")
+	}
+}

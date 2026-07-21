@@ -82,6 +82,15 @@ case "$cmd" in
   cli)
     "$GO" run ./src/kvcli "$@"
     ;;
+  migrate)
+    # 实时迁移进度：对接网关 /debug/migrate，一眼看清再平衡是否卡住
+    # （pendingIn/pendingOut 有残留且 stall>0 即配置冻结风险）。
+    curl -s "http://localhost${ADDR}/debug/migrate" || echo ">> 网关未运行？先 ./start.sh bg 或 ./start.sh serve"
+    ;;
+  status)
+    # 集群健康总览：对接网关 /status（JSON），便于监控/告警轮询。
+    curl -s "http://localhost${ADDR}/status" | "$GO" run ./src/statusfmt || echo ">> 网关未运行？先 ./start.sh bg 或 ./start.sh serve"
+    ;;
   *)
     echo "用法: ./start.sh [serve|bg|stop|build|demo|test|cli]"
     exit 1
