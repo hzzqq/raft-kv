@@ -63,10 +63,11 @@
 | 配置服务 | `src/shardmaster` | 维护 `Config` 序列（Join/Leave/Move/Query），自身跑在 Raft 上 | `ShardMaster` · `Config` |
 | 数据面 | `src/shardkv` | 分片路由、迁移状态机、线性一致读、快照压缩 | `ShardKV` · `MakeShardKV` |
 | 集群工具 | `src/cluster` | 可复用的 in-process labrpc 集群封装（测试 / 演示 / 网关都用它起集群） | `StartCluster` · `Clerk` |
-| HTTP 网关 | `src/gateway` | 把集群暴露成 REST：`/kv/{key}` · `/healthz` · `/metrics` · `/debug/shards` | `Handler` · `main` |
+| HTTP 网关 | `src/gateway` | 把集群暴露成 REST：`/kv/{key}`(GET/PUT/POST-append) · `/healthz`(存活) · `/readyz`(就绪) · `/metrics`(JSON/Prometheus 协商) · `/status`(集群健康) · `/debug/shards` · `/debug/migrate` · `/debug/configs` · `/debug/groups` · `/debug/accesslog` | `Handler` · `main` |
 | 客户端 | `src/kvcli` | HTTP 客户端 + 命令行（get/put/append/bench） | `Client` · `main` |
 | 演示 | `src/demo` | 全栈冒烟：Clerk 路径 + HTTP 网关路径 | `main` |
 | 可观测 | `src/metrics` | 零依赖 Counter + 有界直方图（p50/p95/p99） | `Registry` · `Snapshot` |
+| 状态渲染 | `src/statusfmt` | 把网关 `/status` JSON 渲染为可读表格（CLI `start.sh status` 调用，无 jq/python 依赖） | `main` |
 
 ---
 
@@ -192,7 +193,7 @@ Raft 从 Persister 恢复：currentTerm / votedFor / log[] / snapshot
 
 | 层 | 手段 | 覆盖 |
 |----|------|------|
-| 单元 | `go test ./...`（9 个包） | raft / kvraft / shardmaster / shardkv / cluster / gateway / kvcli / demo / metrics |
+| 单元 | `go test ./...`（10 个包） | raft / kvraft / shardmaster / shardkv / cluster / gateway / kvcli / demo / metrics / statusfmt |
 | 并发 | 内置 map 检测器 + `-count=1` 多轮；CI 在 GitHub（有 gcc）跑 `-race` | kvraft / shardmaster / shardkv(Basic+Move+Concurrent+ReadIndex) |
 | 迁移 | 专用矩阵：`ReMigration` · `ConfigProgress`(2组) · `LinearizableAppend` · `SnapshotChurn` · `PersistRestart` | ShardKV 迁移状态机 |
 | 全栈 | `make build-binaries` + demo 冒烟；CI `fullstack-smoke` job | cluster → gateway → kvcli |
