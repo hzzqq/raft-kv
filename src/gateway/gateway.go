@@ -261,8 +261,21 @@ func (s *Server) handleDebugConfigs(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleMetrics 返回 shardkv.Metrics 的 JSON 快照（counters + histograms 分位数）。
+// handleMetrics 返回 shardkv.Metrics 的快照。按客户端 Accept 协商输出格式：
+//   - Accept 含 text/plain 或 prometheus → Prometheus 文本 exposition 格式
+//     （便于被 Prometheus / scrape 客户端采集）；
+//   - 其它（含 application/json 或缺省）→ JSON 快照（counters + histograms 分位数）。
+// 两种格式数据源相同，差异仅在序列化方式，零行为影响。
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	accept := r.Header.Get("Accept")
+	if strings.Contains(accept, "text/plain") || strings.Contains(accept, "prometheus") {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		if err := shardkv.Metrics.WritePrometheus(w); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
 	snap := shardkv.Metrics.Snapshot()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

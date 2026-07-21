@@ -12,6 +12,7 @@ package metrics
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"sort"
@@ -219,6 +220,58 @@ func (r *Registry) Reset() {
 // DumpJSON 把当前快照序列化为 JSON 字节，便于网关 / 演示程序直接输出。
 func (r *Registry) DumpJSON() ([]byte, error) {
 	return json.Marshal(r.Snapshot())
+}
+
+// WritePrometheus 把注册表以 Prometheus 文本 exposition 格式写入 w，便于被
+// Prometheus / 任意 scrape 客户端采集。轻量级实现：
+//   - counter / gauge 直接输出为同名序列；
+//   - histogram 输出 _count / _sum 及 p50/p95/p99 四个分位数序列（以 gauge 形式，
+//     便于直接画图；完整的 native histogram 超出本库范围）。
+// 序列名按字母序稳定输出，便于测试断言。Content-Type 由调用方设置。
+func (r *Registry) WritePrometheus(w io.Writer) error {
+	snap := r.Snapshot()
+	counters, _ := snap["counters"].(map[string]int64)
+	gauges, _ := snap["gauges"].(map[string]float64)
+	hists, _ := snap["histograms"].(map[string]HistSnapshot)
+
+	names := make([]string, 0, len(counters)+len(gauges))
+	for k := range counters {
+		names = append(names, k)
+	}
+	for k := range gauges {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+
+	// 先输出纯 counter/gauge 序列
+	for _, name := range names {
+		if v, ok := counters[name]; ok {
+			if _, err := fmt.Fprintf(w, "# TYPE %s counter\n%s %d\n", name, name, v); err != nil {
+				return err
+			}
+			continue
+		}
+		if v, ok := gauges[name]; ok {
+			if _, err := fmt.Fprintf(w, "# TYPE %s gauge\n%s %g\n", name, name, v); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 直方图序列（顺序稳定）
+	hnames := make([]string, 0, len(hists))
+	for k := range hists {
+		hnames = append(hnames, k)
+	}
+	sort.Strings(hnames)
+	for _, name := range hnames {
+		h := hists[name]
+		if _, err := fmt.Fprintf(w, "# TYPE %s histogram\n%s_count %d\n%s_sum %g\n%s_p50 %g\n%s_p95 %g\n%s_p99 %g\n",
+			name, name, h.Count, name, h.Sum, name, h.P50, name, h.P95, name, h.P99); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // StartPeriodicReporter 起一个后台 goroutine，每隔 interval 把快照 JSON 写入 w，

@@ -120,6 +120,71 @@ func TestGatewayHTTP(t *testing.T) {
 	}
 }
 
+// TestGatewayMetricsPrometheus：验证 /metrics 按 Accept 协商输出 Prometheus 文本
+// 格式（Accept 含 text/plain 或 prometheus）。该格式便于被 Prometheus / scrape 客户端
+// 采集，是 cycle 14 新增的监控集成能力。
+func TestGatewayMetricsPrometheus(t *testing.T) {
+	c := cluster.StartCluster(2, 3, 3, 0)
+	defer c.Cleanup()
+	s := NewServer(c)
+	s.Init(2)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	// 先产生一些指标：一次写入 + 一次读取。
+	putReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/kv/m", strings.NewReader("v"))
+	if pr, err := http.DefaultClient.Do(putReq); err != nil {
+		t.Fatal(err)
+	} else {
+		pr.Body.Close()
+	}
+	if _, err := http.Get(ts.URL + "/kv/m"); err != nil {
+		t.Fatal(err)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/metrics", nil)
+	req.Header.Set("Accept", "text/plain; version=0.0.4")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /metrics (prometheus) = %d, want 200", resp.StatusCode)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "text/plain") {
+		t.Fatalf("GET /metrics Content-Type = %q, want text/plain", ct)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	body := string(b)
+
+	// Prometheus 输出须含 TYPE 声明与已知 counter（ops_total 由每次操作累计）。
+	if !strings.Contains(body, "# TYPE ops_total counter") {
+		t.Fatalf("GET /metrics (prometheus) missing '# TYPE ops_total counter':\n%s", body)
+	}
+	if !strings.Contains(body, "\nops_total ") {
+		t.Fatalf("GET /metrics (prometheus) missing ops_total series:\n%s", body)
+	}
+	// 默认（JSON）格式仍可用：不带 Accept 时应返回 JSON。
+	j, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Header.Get("Content-Type") != "application/json; charset=utf-8" {
+		t.Fatalf("GET /metrics (default) Content-Type = %q, want application/json", j.Header.Get("Content-Type"))
+	}
+	jb, _ := io.ReadAll(j.Body)
+	j.Body.Close()
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(jb, &parsed); err != nil {
+		t.Fatalf("GET /metrics (default) not valid JSON: %v\nbody=%s", err, string(jb))
+	}
+	if _, ok := parsed["counters"]; !ok {
+		t.Fatalf("GET /metrics (default) missing counters key: %s", string(jb))
+	}
+}
+
 // TestGatewayObservability：验证新增的 /status（集群健康 JSON）与 /debug/migrate
 // （迁移进度文本）端点可用且返回预期结构。
 func TestGatewayObservability(t *testing.T) {
