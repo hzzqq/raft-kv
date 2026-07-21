@@ -14,21 +14,21 @@ import (
 )
 
 type skvConfig struct {
-	mu        sync.Mutex
-	net       *raft.Network
-	sm        []*shardmaster.ShardMaster
-	smNames   []string
-	nameToID  map[string]int
-	cache     map[string]*raft.ClientEnd
-	make_end  func(string) *raft.ClientEnd
-	groups    [][]*ShardKV
-	groupNames [][]string
-	kvPersist [][]*raft.Persister // 每个副本的持久化器（崩溃恢复测试用：重启时复用同一 persister 恢复状态）
-	nGroups   int
-	nReplicas int
-	nSM       int
+	mu           sync.Mutex
+	net          *raft.Network
+	sm           []*shardmaster.ShardMaster
+	smNames      []string
+	nameToID     map[string]int
+	cache        map[string]*raft.ClientEnd
+	make_end     func(string) *raft.ClientEnd
+	groups       [][]*ShardKV
+	groupNames   [][]string
+	kvPersist    [][]*raft.Persister // 每个副本的持久化器（崩溃恢复测试用：重启时复用同一 persister 恢复状态）
+	nGroups      int
+	nReplicas    int
+	nSM          int
 	maxraftstate int
-	t         testing.TB
+	t            testing.TB
 }
 
 // makeSKVConfig 构建一组 ShardKV replica group + 一个 ShardMaster 集群（均运行在
@@ -102,23 +102,23 @@ func makeSKVConfig(t testing.TB, nGroups, nReplicas, nSM, maxraftstate int) *skv
 	// ---- shardkv 各 group ----
 	for g := 0; g < nGroups; g++ {
 		for r := 0; r < nReplicas; r++ {
-		name := fmt.Sprintf("g%d-%d", g, r)
-		id := serverId(g, r)
-		cfg.nameToID[name] = id
-		cfg.groupNames[g] = append(cfg.groupNames[g], name)
+			name := fmt.Sprintf("g%d-%d", g, r)
+			id := serverId(g, r)
+			cfg.nameToID[name] = id
+			cfg.groupNames[g] = append(cfg.groupNames[g], name)
 
-		peers := make([]*raft.ClientEnd, nReplicas)
-		for r2 := 0; r2 < nReplicas; r2++ {
-			e := net.MakeEnd(id*nReplicas+r2, id)
-			net.Connect(id*nReplicas+r2, serverId(g, r2))
-			peers[r2] = e
-		}
-		applyCh := make(chan raft.ApplyMsg, 4000)
-		p := raft.MakeEmptyPersister()
-		rf := raft.Make(peers, r, p, applyCh)
-		kv := MakeShardKV(g+1, cfg.smNames, make_end, rf, applyCh, maxraftstate)
-		cfg.groups[g] = append(cfg.groups[g], kv)
-		cfg.kvPersist[g] = append(cfg.kvPersist[g], p)
+			peers := make([]*raft.ClientEnd, nReplicas)
+			for r2 := 0; r2 < nReplicas; r2++ {
+				e := net.MakeEnd(id*nReplicas+r2, id)
+				net.Connect(id*nReplicas+r2, serverId(g, r2))
+				peers[r2] = e
+			}
+			applyCh := make(chan raft.ApplyMsg, 4000)
+			p := raft.MakeEmptyPersister()
+			rf := raft.Make(peers, r, p, applyCh)
+			kv := MakeShardKV(g+1, cfg.smNames, make_end, rf, applyCh, maxraftstate)
+			cfg.groups[g] = append(cfg.groups[g], kv)
+			cfg.kvPersist[g] = append(cfg.kvPersist[g], p)
 
 			net.AddServer(id, func(method string, args, reply interface{}) {
 				switch method {
@@ -491,6 +491,7 @@ func TestSKVGC(t *testing.T) {
 //     否则 pollConfig 会永久认为"有未决迁移"而冻结配置，客户端读到空/陈旧分片；
 //  2. 迁移窗口内本组直接接收的客户端写不会被覆盖/丢弃（合并而非覆盖）；
 //  3. 客户端始终能线性一致地读到自己刚写入的值。
+//
 // 最后硬断言两组配置都推进到很高版本号——若配置冻结则此断言失败（而非静默超时）。
 func TestSKVReMigration(t *testing.T) {
 	// cycle 48 根因修复（applyNewConfig 消费 incoming 必清 pendingIn + pollConfig 仅以

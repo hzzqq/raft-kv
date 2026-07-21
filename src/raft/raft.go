@@ -115,12 +115,12 @@ type InstallSnapshotReply struct {
 // ============================== Raft 结构体 ==============================
 
 type Raft struct {
-	mu      sync.Mutex
-	peers   []*ClientEnd
+	mu        sync.Mutex
+	peers     []*ClientEnd
 	persister *Persister
-	me      int
-	dead    int32
-	applyCh chan ApplyMsg
+	me        int
+	dead      int32
+	applyCh   chan ApplyMsg
 
 	applyCond *sync.Cond
 	killCh    chan struct{}
@@ -128,12 +128,12 @@ type Raft struct {
 	// ---- 持久化状态（论文 Figure 2 的 persistent state）----
 	currentTerm int
 	votedFor    int
-	log          []LogEntry
+	log         []LogEntry
 
 	// ---- 易失状态 ----
 	commitIndex int
 	lastApplied int
-	role         Role
+	role        Role
 
 	nextIndex  []int
 	matchIndex []int
@@ -512,9 +512,9 @@ func (rf *Raft) broadcastAppendEntries() {
 					rf.stepDown(reply.Term)
 					return
 				}
-			if rf.role == Leader && args.Term == rf.currentTerm {
-				rf.lastContact[i] = time.Now()
-				rf.matchIndex[i] = args.LastIncludedIndex
+				if rf.role == Leader && args.Term == rf.currentTerm {
+					rf.lastContact[i] = time.Now()
+					rf.matchIndex[i] = args.LastIncludedIndex
 					rf.nextIndex[i] = args.LastIncludedIndex + 1
 				}
 			}(i, args)
@@ -801,21 +801,21 @@ func (rf *Raft) applier() {
 
 func Make(peers []*ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{
-		peers:         peers,
-		persister:     persister,
-		me:            me,
-		applyCh:       applyCh,
-		role:          Follower,
-		currentTerm:   0,
-		votedFor:      -1,
-		commitIndex:   0,
-		lastApplied:   0,
+		peers:             peers,
+		persister:         persister,
+		me:                me,
+		applyCh:           applyCh,
+		role:              Follower,
+		currentTerm:       0,
+		votedFor:          -1,
+		commitIndex:       0,
+		lastApplied:       0,
 		lastIncludedIndex: 0,
 		lastIncludedTerm:  0,
 		lastContact:       make([]time.Time, len(peers)),
-		electionTimer:  time.NewTimer(ElectionTimeoutMax),
-		heartbeatTimer: time.NewTimer(HeartbeatInterval),
-		killCh:        make(chan struct{}),
+		electionTimer:     time.NewTimer(ElectionTimeoutMax),
+		heartbeatTimer:    time.NewTimer(HeartbeatInterval),
+		killCh:            make(chan struct{}),
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
 

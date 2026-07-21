@@ -12,10 +12,10 @@ import (
 func TestLeaderLease(t *testing.T) {
 	mk := func(role Role, contacts []time.Time) *Raft {
 		return &Raft{
-			mu:         sync.Mutex{},
-			peers:      make([]*ClientEnd, len(contacts)),
-			me:         0,
-			role:       role,
+			mu:          sync.Mutex{},
+			peers:       make([]*ClientEnd, len(contacts)),
+			me:          0,
+			role:        role,
 			lastContact: contacts,
 		}
 	}

@@ -40,19 +40,19 @@ const (
 // InstallShard = 接收他组推送的分片数据；GCShard = 本组已迁出分片的回收。
 // NotifyId 在 Start 前分配，用于唤醒等待者，避免丢失唤醒竞态。
 type Op struct {
-	Kind      string
-	ClientId  int64
-	Seq       int64
-	Shard     int
-	Key       string
-	Value     string
-	OpType    string // "Get" / "Put" / "Append"
-	NotifyId  int64
-	Config    shardmaster.Config
+	Kind             string
+	ClientId         int64
+	Seq              int64
+	Shard            int
+	Key              string
+	Value            string
+	OpType           string // "Get" / "Put" / "Append"
+	NotifyId         int64
+	Config           shardmaster.Config
 	MigrateShard     int
 	MigrateData      *ShardData
 	MigrateConfigNum int
-	GCShard  int
+	GCShard          int
 }
 
 // ShardData 是一个分片的完整状态，随分片一起迁移。
@@ -116,9 +116,9 @@ type GetReply struct {
 }
 
 type PutAppendArgs struct {
-	Key    string
-	Value  string
-	OpType string // "Put" / "Append"
+	Key      string
+	Value    string
+	OpType   string // "Put" / "Append"
 	ClientId int64
 	Seq      int64
 }
@@ -146,23 +146,23 @@ type GetShardReply struct {
 // ============================== ShardKV 结构体 ==============================
 
 type ShardKV struct {
-	mu      sync.Mutex
-	gid     int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
+	mu       sync.Mutex
+	gid      int
+	rf       *raft.Raft
+	applyCh  chan raft.ApplyMsg
 	make_end func(string) *raft.ClientEnd
-	mck     *shardmaster.Clerk
+	mck      *shardmaster.Clerk
 
 	config     shardmaster.Config
 	prevConfig shardmaster.Config
 
-	shards     map[int]*ShardData // 本 group 拥有且已生效的分片
-	incoming   map[int]*ShardData // 收到但尚未生效（配置尚未推进到拥有它）
-	pendingIn  map[int]bool       // 需要接收（失->我）且尚未收到
-	pendingOut map[int]bool       // 需要迁出（我->失）且尚未 GC
-	fetchEpoch map[int]int64      // 每个分片当前拉取任务的版本号：配置推进时自增，使为同一分片服务的旧 fetcher 协程及时退出
-	pendingInSince  map[int]time.Time // 卡死看门狗：每个 pendingIn 分片首次进入未决态的时间戳（用于 /debug/shards 暴露卡滞时长 + 驱动 rekick）
-	pendingOutSince map[int]time.Time // 同上，针对 pendingOut
+	shards          map[int]*ShardData // 本 group 拥有且已生效的分片
+	incoming        map[int]*ShardData // 收到但尚未生效（配置尚未推进到拥有它）
+	pendingIn       map[int]bool       // 需要接收（失->我）且尚未收到
+	pendingOut      map[int]bool       // 需要迁出（我->失）且尚未 GC
+	fetchEpoch      map[int]int64      // 每个分片当前拉取任务的版本号：配置推进时自增，使为同一分片服务的旧 fetcher 协程及时退出
+	pendingInSince  map[int]time.Time  // 卡死看门狗：每个 pendingIn 分片首次进入未决态的时间戳（用于 /debug/shards 暴露卡滞时长 + 驱动 rekick）
+	pendingOutSince map[int]time.Time  // 同上，针对 pendingOut
 
 	// 迁移幂等 / 配置推进去重辅助状态。
 	installedCfgNum   map[int]int // 每个分片「已安装/已拥有」时对应的配置号，InstallShard 幂等去重依据（I2）
@@ -192,24 +192,24 @@ type applyResult struct {
 func MakeShardKV(gid int, masters []string, make_end func(string) *raft.ClientEnd,
 	rf *raft.Raft, applyCh chan raft.ApplyMsg, maxraftstate int) *ShardKV {
 	kv := &ShardKV{
-		gid:          gid,
-		rf:           rf,
-		applyCh:      applyCh,
-		make_end:     make_end,
-		mck:          shardmaster.MakeClerk(masters, make_end),
-		config:       shardmaster.Config{Num: 0, Groups: map[int][]string{}},
-		prevConfig:   shardmaster.Config{Num: 0, Groups: map[int][]string{}},
-		shards:       map[int]*ShardData{},
-		incoming:     map[int]*ShardData{},
-		pendingIn:    map[int]bool{},
-		pendingOut:   map[int]bool{},
+		gid:             gid,
+		rf:              rf,
+		applyCh:         applyCh,
+		make_end:        make_end,
+		mck:             shardmaster.MakeClerk(masters, make_end),
+		config:          shardmaster.Config{Num: 0, Groups: map[int][]string{}},
+		prevConfig:      shardmaster.Config{Num: 0, Groups: map[int][]string{}},
+		shards:          map[int]*ShardData{},
+		incoming:        map[int]*ShardData{},
+		pendingIn:       map[int]bool{},
+		pendingOut:      map[int]bool{},
 		pendingInSince:  map[int]time.Time{},
 		pendingOutSince: map[int]time.Time{},
-		installedCfgNum:   map[int]int{},
-		fetchEpoch:   map[int]int64{},
-		notified:     map[int64]chan applyResult{},
-		maxraftstate: maxraftstate,
-		killCh:       make(chan struct{}),
+		installedCfgNum: map[int]int{},
+		fetchEpoch:      map[int]int64{},
+		notified:        map[int64]chan applyResult{},
+		maxraftstate:    maxraftstate,
+		killCh:          make(chan struct{}),
 	}
 	// 初始：拉取最新配置（可能已有 group）
 	go kv.pollConfig()
@@ -404,6 +404,7 @@ func (kv *ShardKV) migratePump() {
 		kv.mu.Unlock()
 	}
 }
+
 // rekickStuckMigrations 仅由 pollConfig 看门狗在迁移卡死时调用（调用方持有 kv.mu）。
 // 对每个仍 pending 的分片：若最新配置下本组已是其 owner 或无主，清掉残留标记让配置
 // 继续推进；否则以最新配置的 owner 重拉取（pendingIn）/重推送（pendingOut），并 bump
@@ -1366,7 +1367,7 @@ func (ck *Clerk) PutAppend(key, value, opType string) {
 	}
 }
 
-func (ck *Clerk) Put(key, value string)   { ck.PutAppend(key, value, "Put") }
+func (ck *Clerk) Put(key, value string)    { ck.PutAppend(key, value, "Put") }
 func (ck *Clerk) Append(key, value string) { ck.PutAppend(key, value, "Append") }
 
 // clerkBoundedRetries 是有界重试窗口：GetE/PutE/AppendE 在此窗口内重试，超时即
