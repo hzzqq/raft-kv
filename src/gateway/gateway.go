@@ -117,6 +117,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /kv/{key}", s.wrap(s.handlePut))
 	mux.HandleFunc("POST /kv/{key}/append", s.wrap(s.handleAppend))
 	mux.HandleFunc("GET /healthz", s.wrap(s.handleHealthz))
+	// 就绪探针（I18）：集群可正常服务读写时 200，否则 503，供 k8s readinessProbe 直用。
+	mux.HandleFunc("GET /readyz", s.wrap(s.handleReadyz))
 	// 可观测性：把进程内 ShardKV 的 Metrics 注册表 JSON 序列化暴露出来。
 	// 指标由 cycle 11 的 metrics 包在热路径上以纯原子操作累计，零行为影响。
 	mux.HandleFunc("GET /metrics", s.wrap(s.handleMetrics))
@@ -275,6 +277,30 @@ type ClusterStatus struct {
 // 3s），使 /status 的 healthy 标志能先于看门狗触发即暴露冻结，又不误报正常瞬时迁移。
 const stallUnhealthySec = 2.0
 
+// clusterHealthy 计算集群是否整体健康：每个 group 都有「持租约的 leader」（仅
+// isLeader 不够——分区失联的旧 leader 仍自认 leader 却无法提交，必须 HasLeaderLease
+// 为真才表示能正常服务读写），且无任何分片的迁移卡滞（StallSeconds 超阈值视为冻结
+// 风险）。是 /status 与 /readyz 共用的健康判据（I18 就绪探针）。
+func (s *Server) clusterHealthy() bool {
+	for g := range s.c.KVs {
+		ready := false
+		for r := range s.c.KVs[g] {
+			d := s.c.KVs[g][r].ShardDebug()
+			if d.Leader && d.Lease {
+				ready = true
+				if d.StallSeconds > stallUnhealthySec {
+					return false
+				}
+				break
+			}
+		}
+		if !ready {
+			return false
+		}
+	}
+	return true
+}
+
 // handleStatus 返回集群健康总览（JSON），便于监控/告警系统轮询判断再平衡是否冻结。
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	st := ClusterStatus{Groups: []GroupStatus{}}
@@ -311,6 +337,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(st); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+// handleReadyz 是「就绪探针」：集群所有 group 均有 leader 且无迁移卡滞时返回 200，
+// 否则返回 503。与 /healthz（存活，恒 200）区分——/readyz 表示集群是否已能正常
+// 服务读写，可直接作为 k8s readinessProbe 使用，无需解析 JSON 体。
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if s.clusterHealthy() {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
 }
 
 // handleDebugMigrate 返回每个 group leader 副本的实时迁移进度（纯文本），供 CLI 直接展示。

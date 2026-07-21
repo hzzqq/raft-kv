@@ -1647,6 +1647,7 @@ func (kv *ShardKV) DebugState() string {
 type ShardDebug struct {
 	GID        int
 	Leader     bool
+	Lease      bool // leader 是否持有合法租约（多数派近期有心跳接触）；分区/刚上任为 false
 	ConfigNum  int
 	Owned      []int
 	Incoming   []int
@@ -1663,6 +1664,7 @@ func (kv *ShardKV) ShardDebug() ShardDebug {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	_, isLeader := kv.rf.GetState()
+	hasLease := isLeader && kv.rf.HasLeaderLease()
 	owned := []int{}
 	for s := range kv.shards {
 		owned = append(owned, s)
@@ -1697,6 +1699,7 @@ func (kv *ShardKV) ShardDebug() ShardDebug {
 	return ShardDebug{
 		GID:             kv.gid,
 		Leader:          isLeader,
+		Lease:           hasLease,
 		ConfigNum:       kv.config.Num,
 		Owned:           owned,
 		Incoming:        incoming,

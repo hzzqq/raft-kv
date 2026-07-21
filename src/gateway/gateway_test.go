@@ -277,6 +277,53 @@ func TestGatewayRequestTimeout(t *testing.T) {
 	}
 }
 
+// TestGatewayReadyz：验证 I18 的就绪探针——集群健康（Init 后）返回 200，杀光所有
+// 副本（无 leader）时返回 503，与存活探针 /healthz（恒 200）语义区分。
+func TestGatewayReadyz(t *testing.T) {
+	c := cluster.StartCluster(2, 3, 3, 0)
+	defer c.Cleanup()
+	s := NewServer(c)
+	s.Init(2)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	rd, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rd.StatusCode != http.StatusOK {
+		t.Fatalf("GET /readyz (healthy) = %d, want 200", rd.StatusCode)
+	}
+	rd.Body.Close()
+
+	// /healthz 始终 200（存活探针），与就绪探针区分。
+	h, err := http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.StatusCode != http.StatusOK {
+		t.Fatalf("GET /healthz = %d, want 200", h.StatusCode)
+	}
+	h.Body.Close()
+
+	// 杀光所有副本：clusterHealthy 返回 false -> /readyz 503。
+	for g := range c.KVs {
+		for r := range c.KVs[g] {
+			c.Net.Enable(1000+g*100+r, false)
+		}
+	}
+	time.Sleep(1200 * time.Millisecond) // 等 leader 失联、各副本退位（无 leader）
+	rd2, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := rd2.StatusCode
+	rd2.Body.Close()
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("GET /readyz (no leader) = %d, want 503", code)
+	}
+}
+
 // TestGatewayObservability：验证新增的 /status（集群健康 JSON）与 /debug/migrate
 // （迁移进度文本）端点可用且返回预期结构。
 func TestGatewayObservability(t *testing.T) {
