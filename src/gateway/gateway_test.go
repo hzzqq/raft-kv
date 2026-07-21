@@ -806,3 +806,74 @@ func TestGatewayClientLimit(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+// TestGatewayCORS：验证 CORS 中间件（I50）——普通跨域请求注入 ACAO，OPTIONS 预检
+// 返回 204 + 头，受限 origins 不匹配时不注入（等效拒绝）。cluster-free 构造。
+func TestGatewayCORS(t *testing.T) {
+	base := func() http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, "ok")
+		})
+	}
+
+	// 1) 允许所有源（corsOrigins 空）。
+	s := &Server{}
+	h := s.corsHandler(base())
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/x", nil)
+	req.Header.Set("Origin", "https://example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Header.Get("Access-Control-Allow-Origin") == "" {
+		t.Fatalf("expected Access-Control-Allow-Origin header")
+	}
+	resp.Body.Close()
+
+	// OPTIONS 预检 -> 204 + Allow-Methods。
+	pre, _ := http.NewRequest(http.MethodOptions, ts.URL+"/x", nil)
+	pre.Header.Set("Origin", "https://example.com")
+	prep, err := http.DefaultClient.Do(pre)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prep.StatusCode != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", prep.StatusCode)
+	}
+	if prep.Header.Get("Access-Control-Allow-Methods") == "" {
+		t.Fatalf("preflight missing Access-Control-Allow-Methods")
+	}
+	prep.Body.Close()
+
+	// 2) 受限 origins（仅允许 a.com）：b.com 不应注入 ACAO。
+	s2 := &Server{corsOrigins: []string{"https://a.com"}}
+	h2 := s2.corsHandler(base())
+	ts2 := httptest.NewServer(h2)
+	defer ts2.Close()
+	req3, _ := http.NewRequest(http.MethodGet, ts2.URL+"/x", nil)
+	req3.Header.Set("Origin", "https://b.com")
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp3.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("disallowed origin should not get ACAO header")
+	}
+	resp3.Body.Close()
+
+	// 匹配 a.com 应正常注入。
+	req4, _ := http.NewRequest(http.MethodGet, ts2.URL+"/x", nil)
+	req4.Header.Set("Origin", "https://a.com")
+	resp4, err := http.DefaultClient.Do(req4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp4.Header.Get("Access-Control-Allow-Origin"); got != "https://a.com" {
+		t.Fatalf("matched origin ACAO = %q, want https://a.com", got)
+	}
+	resp4.Body.Close()
+}

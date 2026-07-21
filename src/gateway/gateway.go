@@ -71,6 +71,9 @@ type Server struct {
 	clientLimiters map[string]*tokenBucket
 	clientRate     float64 // 每客户端每秒补充令牌数（<=0 表示关闭限流）
 	clientBurst    float64 // 每客户端桶容量（突发上限）
+
+	// I50：CORS 配置（可空，空表示允许所有源 "*"）。供浏览器前端直连网关。
+	corsOrigins []string
 }
 
 // tokenBucket 是单客户端的令牌桶：按时间补充令牌，桶满截断；取用时需至少 1 枚令牌。
@@ -109,6 +112,43 @@ func (s *Server) SetClientRateLimit(rps float64, burst int) {
 		s.clientLimiters = make(map[string]*tokenBucket)
 	}
 	s.limitMu.Unlock()
+}
+
+// SetCORS 配置允许跨域的源列表（生产可用）。空切片表示允许任意源（"*"）。
+func (s *Server) SetCORS(origins []string) { s.corsOrigins = origins }
+
+// corsHandler 是 CORS 中间件：注入 Access-Control-* 响应头，并处理 OPTIONS 预检
+// （直接返回 204，不进入路由）。corsOrigins 为空时允许所有源；非空时仅回显匹配的
+// 源（不匹配则不注入头，等效拒绝跨域）。使网关可被浏览器前端直连。
+func (s *Server) corsHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		allow := "*"
+		if len(s.corsOrigins) > 0 {
+			allow = "" // 默认拒绝；仅当匹配才回显
+			for _, o := range s.corsOrigins {
+				if o == "*" {
+					allow = "*"
+					break
+				}
+				if o == origin {
+					allow = origin
+					break
+				}
+			}
+		}
+		if allow != "" {
+			w.Header().Set("Access-Control-Allow-Origin", allow)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Request-ID, X-Client-ID")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // clientKey 从请求推导客户端标识：优先 X-Client-ID 头，否则取 RemoteAddr 的 IP 部分
@@ -298,7 +338,8 @@ func (s *Server) Handler() http.Handler {
 	// I16：以 http.TimeoutHandler 兜底单请求最大时长，避免后端 Raft 操作在迁移抖动
 	// 下长时间不返回时 HTTP 连接无限挂起。超时返回 503；内层 handler 仍在后台跑完
 	// （其写入被丢弃），不会破坏状态机，与 Clerk 有界重试互补。requestTimeout 默认 30s。
-	return http.TimeoutHandler(mux, s.requestTimeout, "request timed out")
+	// I50：外层套 CORS 中间件，使浏览器前端可直连网关（含 OPTIONS 预检处理）。
+	return s.corsHandler(http.TimeoutHandler(mux, s.requestTimeout, "request timed out"))
 }
 
 // wrap 给每个 handler 套上并发限制（I12）与在途请求计数（I13 优雅关闭用）。
