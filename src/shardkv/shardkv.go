@@ -80,6 +80,22 @@ func (sd *ShardData) copy() *ShardData {
 	return c
 }
 
+// shardVersion 返回分片状态的逻辑版本：所有 client LastSeq 的最大值（无 client 时为 0）。
+// 用作迁移传输的二次判据——同源在「同一迁移配置号」下可能发出数据不同的两份传输
+// （源端在两次发送间又提交了本组未见过的写），版本更高者才是更完整的快照。
+func shardVersion(sd *ShardData) int64 {
+	if sd == nil {
+		return 0
+	}
+	var v int64
+	for _, seq := range sd.LastSeq {
+		if seq > v {
+			v = seq
+		}
+	}
+	return v
+}
+
 // kvSnapshot 是压缩进 Raft 快照的 KV 状态。
 type kvSnapshot struct {
 	Shards     map[int]*ShardData
@@ -139,8 +155,9 @@ type GetShardArgs struct {
 	Shard int
 }
 type GetShardReply struct {
-	Err  Err
-	Data *ShardData
+	Err    Err
+	Data   *ShardData
+	Config int // 来源当前生效配置号：拉取端据此判断来源是否已"安定"
 }
 
 // ============================== ShardKV 结构体 ==============================
@@ -568,6 +585,7 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
 		return
 	}
 	reply.Data = data.copy()
+	reply.Config = kv.config.Num
 	kv.mu.Unlock()
 	reply.Err = OK
 }
@@ -740,6 +758,19 @@ func (kv *ShardKV) applier() {
 // 根因分析于 docs/lab4-shardkv-design.md §7，待 redesign 专项修复。
 
 func (kv *ShardKV) applyCmd(op Op, res *applyResult) {
+	// 关键正确性守卫（修复 A→B→A 高频再平衡下的丢写）：命令被 apply 时，若本组
+	// 已因配置变迁失去该分片所有权，即使本地仍残留旧副本（applyNewConfig 在"失去
+	// 所有权"分支不会清除 kv.shards[s]，以便 GetShard 向新 owner 传输），也绝不可把
+	// 写入落到陈舊本地副本并返回 OK——那样数据无法到达新 owner，而客户端已收到 OK
+	// 不再重试，造成静默丢写（TestSKVClientLiveDuringMigration 复现：append 在"提交晚
+	// 于迁移配置"窗口内被写入旧 owner 陈舊副本）。必须返回 ErrWrongGroup，由客户端
+	// 重读配置后把请求重投到当前 owner。此检查与 applyNewConfig 的"重新夺回时清除
+	// 本地陈舊副本"互为补充：前者防"提交晚于迁移"的写入落空，后者防"重新夺回后窗口
+	// 内本地写被权威迁移整体替换"。
+	if kv.config.Shards[op.Shard] != kv.gid {
+		res.err = ErrWrongGroup
+		return
+	}
 	sd, owned := kv.shards[op.Shard]
 	if !owned {
 		res.err = ErrWrongGroup
@@ -797,13 +828,15 @@ func (kv *ShardKV) applyNewConfig(cfg shardmaster.Config) {
 						LastResult: map[int64]string{},
 					}
 				} else if data, ok := kv.incoming[s]; ok {
-					if _, exists := kv.shards[s]; exists {
-						// 本组在配置推进前已直接写入该分片：合并而非覆盖，
-						// 否则会把新 owner 的本地写冲掉（测试见 c0_k3 丢失）。
-						kv.mergeShardData(s, data)
-					} else {
-						kv.shards[s] = data
-					}
+					// 本组成为 owner 且 incoming 已缓冲该分片的权威副本（来自上一版
+					// 配置 owner 的拉取）：整体替换为权威数据。注意此处必须「替换」
+					// 而非「合并保留本地值」——在 A→B→A 高频来回再平衡下，本地
+					// kv.shards[s] 是上一轮所有权的陈旧残留，mergeShardData「仅补缺失
+					// key、不覆盖已有值」会用陈旧值覆盖权威数据，导致 LastSeq 被推高而
+					// Data 停留在旧值、后续 Append 被去重丢弃（TestSKVClientLiveDuring
+					// Migration 复现丢写）。本函数整体在 kv.mu 下执行（applier 持锁），
+					// 不存在与并发客户端写的竞争，故直接替换安全。
+					kv.shards[s] = data
 					delete(kv.incoming, s)
 					// 关键修复（cycle 48 根因）：数据已从 incoming 装入本组分片，
 					// 必须清除 pendingIn[s]，否则 pollConfig 被 pendingIn 门控而
@@ -818,8 +851,23 @@ func (kv *ShardKV) applyNewConfig(cfg shardmaster.Config) {
 					kv.fetchEpoch[s]++
 					epoch := kv.fetchEpoch[s]
 					go kv.fetchShard(s, oldServers, epoch)
+				} else {
+					// have==true：本组仍持有上一轮所有权的陈舊副本（A→B→A 来回再平衡下，
+					// 分组失去分片后并未丢弃本地副本）。重新夺回所有权时该副本已非权威——
+					// 权威数据在旧 owner 处，且可能含本组从未见过的新写入。若保留它，窗口内
+					// 客户端写会被追加到陈舊副本，随后到达的权威迁移（按迁移配置号整体替换）
+					// 会把这段本地写冲掉，造成丢写（TestSKVClientLiveDuringMigration 在套件
+					// 上下文复现 18/20）。故此处清除本地陈舊副本：① shards[s] 缺席使窗口内
+					// 写入返回 ErrWrongGroup、由客户端重试，直到权威迁移装入；② 随后
+					// applyInstallShard 以「空分片 + 迁移配置号 LWW」干净替换，绝不残留陈舊值。
+					// 连续持有（prevConfig.Shards[s]==gid）不会进入本分支，故不会误清有效数据。
+					delete(kv.shards, s)
+					kv.pendingIn[s] = true
+					oldServers := append([]string{}, kv.prevConfig.Groups[oldG]...)
+					kv.fetchEpoch[s]++
+					epoch := kv.fetchEpoch[s]
+					go kv.fetchShard(s, oldServers, epoch)
 				}
-				// have==true：分片已在上一轮迁移中到位，无需动作。
 			}
 			delete(kv.pendingOut, s) // 本组现在拥有 s，不再迁出它
 			// I2：记录安装配置号（幂等去重依据）。
@@ -882,27 +930,41 @@ func (kv *ShardKV) applyInstallShard(op Op, res *applyResult) {
 		return
 	}
 	if kv.config.Shards[s] == kv.gid {
-		// 本组拥有该分片：数据已到位，无论是否已持有都必须清除 pendingIn[s] 解除冻结
-		// （I2 之前的实现在"已持有"分支提前 return 漏清 pendingIn，正是 ReMigration 冻结
-		// 的根因）。已持有则合并（保住迁移窗口内的本地写），未持有则直接安装；均按
-		// installedCfgNum 去重避免重复触发迁移耗时计数（I2 / 幂等），但去重绝不阻止清
-		// pendingIn——这是 liveness 关键。
-		if _, exists := kv.shards[s]; exists {
-			if installed := kv.installedCfgNum[s]; installed >= op.MigrateConfigNum {
-				kv.mergeShardData(s, incoming)
-				delete(kv.pendingIn, s)
-				kv.recordMigrationLatency(s)
-				if res != nil {
-					res.err = OK
-				}
-				return
+		// 本组拥有该分片：以「迁移配置号」做 LWW（后写胜出）决定如何并入，杜绝
+		// 迟到/陈旧传输把已提交的更新数据冲掉（A→B→A 高频来回再平衡下，旧实现用
+		// mergeShardData「仅补缺失 key、不覆盖已有值」会用陈旧快照覆盖新写入，导致
+		// LastSeq 被推高而 Data 停留在旧值，后续 Append 被去重丢弃——TestSKVClientLive
+		// DuringMigration 复现丢写）。
+		installed := kv.installedCfgNum[s]
+		if op.MigrateConfigNum < installed {
+			// 迟到/陈旧传输：比本组已装入的配置号更旧，直接丢弃，保留当前（更新）数据。
+			if res != nil {
+				res.err = OK
 			}
-			kv.mergeShardData(s, incoming)
-			kv.installedCfgNum[s] = op.MigrateConfigNum
-		} else {
-			kv.shards[s] = incoming
-			kv.installedCfgNum[s] = op.MigrateConfigNum
+			return
 		}
+		if op.MigrateConfigNum == installed && kv.shards[s] != nil {
+			// 同一配置号的重复/迟到传输：正常情况下源端在该配置下失去所有权后不再
+			// 服务写，两次传输应完全一致；但迁移竞态下源端可能在两次发送间又应用了
+			// 本组从未见过的写（极窄窗口），故以「版本」(各 client LastSeq 最大值)
+			// 做二次判据：传入副本版本更高 → 整体替换为更完整的快照，避免「陈旧传输
+			// 先到、完整传输后被盲目跳过」造成丢写；版本不更高 → 跳过，保留本地
+			// （可能含窗口内本地写，且不会覆盖更高版本数据）。
+			if shardVersion(incoming) > shardVersion(kv.shards[s]) {
+				kv.shards[s] = incoming
+				kv.installedCfgNum[s] = op.MigrateConfigNum
+				kv.recordShardBytes(s)
+			}
+			delete(kv.pendingIn, s)
+			kv.recordMigrationLatency(s)
+			if res != nil {
+				res.err = OK
+			}
+			return
+		}
+		// 更新（或更早未持有）：以迁移来的权威副本整体替换，并记录其配置号。
+		kv.shards[s] = incoming
+		kv.installedCfgNum[s] = op.MigrateConfigNum
 		delete(kv.pendingIn, s)
 		kv.recordMigrationLatency(s)
 		kv.recordShardBytes(s) // I15：记录分片字节大小 + 超大分片告警
@@ -1019,8 +1081,10 @@ func (kv *ShardKV) fetchShard(s int, oldServers []string, epoch int64) {
 			return
 		}
 		// 每次循环重新计算「上一版配置」的 owner：配置推进后 prevConfig 会随之
-		// 更新，本组需要的数据始终由「当前 prevConfig 的 owner」提供。
+		// 更新，本组需要的数据始终由「当前 prevConfig 的 owner」提供。同时记录
+		// 当前配置号，作为本次拉取安装的配置版本（LWW 依据，见 applyInstallShard）。
 		oldG := kv.prevConfig.Shards[s]
+		curNum := kv.config.Num
 		kv.mu.Unlock()
 		if oldG == kv.gid || oldG == 0 {
 			// prevConfig 已不含该分片的旧 owner：无需拉取。若当前配置下本组就是
@@ -1035,40 +1099,56 @@ func (kv *ShardKV) fetchShard(s int, oldServers []string, epoch int64) {
 		for _, srv := range oldServers {
 			end := kv.make_end(srv)
 			reply := &GetShardReply{}
-			if end.Call("ShardKV.GetShard", &GetShardArgs{Shard: s}, reply) && reply.Err == OK && reply.Data != nil {
-				kv.propose(Op{Kind: "InstallShard", MigrateShard: s, MigrateData: reply.Data})
+			if end.Call("ShardKV.GetShard", &GetShardArgs{Shard: s}, reply) && reply.Err == OK && reply.Data != nil && reply.Config >= kv.config.Num {
+				kv.propose(Op{Kind: "InstallShard", MigrateShard: s, MigrateData: reply.Data, MigrateConfigNum: curNum})
 				got = true
 				break
 			}
 		}
 		if !got {
-			// 自愈回源（cycle 27/33，本轮增强）：记录的旧 owner 不可达（快速再平衡下可能已
-			// 因更新的配置把该分片 GC 掉并转发给更靠后的 group），改回源 ShardMaster 取「最新」
-			// 配置的 owner 重新拉取——比仅查 prevConfig.Num 更 live，可跨多跳迁移链找回数据；
-			// 若最新配置下本组已是 owner 或无主，清掉残留 pendingIn 让配置推进（否则 have==false
-			// 且 pendingIn 残留会永久卡死）。
+			// 自愈回源（cycle 27/33 + n=33 加固）：记录的旧 owner 不可达时，先尝试用
+			// ShardMaster「最新」配置 owner 重新拉取，跨多跳迁移链找回数据。但若最新
+			// 配置下本组自己就是 owner（curOwner==kv.gid）却仍无数据，说明数据其实还
+			// 在「上一版配置」的 owner 手中——绝不能就此放弃（旧实现在此直接 return，
+			// 导致 pendingIn 永久残留、配置冻结，TestSKVClientLiveDuringMigration 在
+			// 高频 A→B→A 来回再平衡下复现）。一律回退到 prevConfig owner 作为权威来源
+			// 拉取；仅当 prevConfig 也无 owner（全新分配 oldG==0）才清 pendingIn 让配置
+			// 推进，避免残留冻结。
 			if cur := kv.mck.Query(-1); cur.Num > 0 {
 				curOwner := cur.Shards[s]
 				if curOwner != kv.gid && curOwner != 0 {
 					for _, srv := range cur.Groups[curOwner] {
 						end := kv.make_end(srv)
 						reply := &GetShardReply{}
-						if end.Call("ShardKV.GetShard", &GetShardArgs{Shard: s}, reply) && reply.Err == OK && reply.Data != nil {
-							kv.propose(Op{Kind: "InstallShard", MigrateShard: s, MigrateData: reply.Data})
+						if end.Call("ShardKV.GetShard", &GetShardArgs{Shard: s}, reply) && reply.Err == OK && reply.Data != nil && reply.Config >= kv.config.Num {
+							kv.propose(Op{Kind: "InstallShard", MigrateShard: s, MigrateData: reply.Data, MigrateConfigNum: curNum})
 							got = true
 							break
 						}
 					}
-				} else if curOwner == kv.gid {
-					// 仅当我们确实已持有该分片数据时才清 pendingIn；否则保留
-					// pendingIn 让配置推进保持阻塞，避免"配置推进但服务空分片"
-					// 的数据丢失（cycle 48 加固）。
-					kv.mu.Lock()
-					if _, ok := kv.shards[s]; ok {
-						delete(kv.pendingIn, s)
+				}
+			}
+			if !got {
+				kv.mu.Lock()
+				pg := kv.prevConfig.Shards[s]
+				kv.mu.Unlock()
+				if pg != kv.gid && pg != 0 {
+					for _, srv := range kv.prevConfig.Groups[pg] {
+						end := kv.make_end(srv)
+						reply := &GetShardReply{}
+						if end.Call("ShardKV.GetShard", &GetShardArgs{Shard: s}, reply) && reply.Err == OK && reply.Data != nil && reply.Config >= kv.config.Num {
+							kv.propose(Op{Kind: "InstallShard", MigrateShard: s, MigrateData: reply.Data, MigrateConfigNum: curNum})
+							got = true
+							break
+						}
 					}
+				} else {
+					// prevConfig 无旧 owner：全新分配或已回流到本组但无来源，清
+					// pendingIn（数据由 applyNewConfig 的 oldG==0 路径 / 后续 incoming
+					// 负责），避免残留冻结。
+					kv.mu.Lock()
+					delete(kv.pendingIn, s)
 					kv.mu.Unlock()
-					return
 				}
 			}
 		}
