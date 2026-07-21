@@ -58,12 +58,12 @@
 
 | 层 | 包 | 职责 | 关键类型 / 入口 |
 |----|----|------|----------------|
-| 共识核心 | `src/raft` | 领导者选举、日志复制、持久化、快照、ReadIndex | `raft.Make` · `ReadIndex` · `Start` |
+| 共识核心 | `src/raft` | 领导者选举（Pre-Vote 预投票）、日志复制、持久化、快照、ReadIndex、LeadershipTransfer 领导权转移 | `raft.Make` · `ReadIndex` · `Start` · `RequestPreVote` · `TimeoutNow` |
 | 单组 KV | `src/kvraft` | Lab 3 线性一致 KV（本仓库作为 Raft 落地的早期验证，ShardKV 复用了其模式） | `KVServer` · `Op` |
 | 配置服务 | `src/shardmaster` | 维护 `Config` 序列（Join/Leave/Move/Query），自身跑在 Raft 上 | `ShardMaster` · `Config` |
 | 数据面 | `src/shardkv` | 分片路由、迁移状态机、线性一致读、快照压缩 | `ShardKV` · `MakeShardKV` |
 | 集群工具 | `src/cluster` | 可复用的 in-process labrpc 集群封装（测试 / 演示 / 网关都用它起集群） | `StartCluster` · `Clerk` |
-| HTTP 网关 | `src/gateway` | 把集群暴露成 REST：`/kv/{key}`(GET/PUT/POST-append) · `/healthz`(存活) · `/readyz`(就绪) · `/metrics`(JSON/Prometheus 协商) · `/status`(集群健康) · `/debug/shards` · `/debug/migrate` · `/debug/configs` · `/debug/groups` · `/debug/accesslog` | `Handler` · `main` |
+| HTTP 网关 | `src/gateway` | 把集群暴露成 REST：`/kv/{key}`(GET/PUT/POST-append) · `/healthz`(存活) · `/readyz`(就绪) · `/metrics`(JSON/Prometheus 协商) · `/status`(集群健康) · `/debug/shards` · `/debug/migrate` · `/debug/configs` · `/debug/groups` · `/debug/accesslog` · `/debug/log`(分级结构化日志) · `/debug/config`(生效配置快照) | `Handler` · `main` |
 | 客户端 | `src/kvcli` | HTTP 客户端 + 命令行（get/put/append/bench） | `Client` · `main` |
 | 演示 | `src/demo` | 全栈冒烟：Clerk 路径 + HTTP 网关路径 | `main` |
 | 可观测 | `src/metrics` | 零依赖 Counter + 有界直方图（p50/p95/p99） | `Registry` · `Snapshot` |

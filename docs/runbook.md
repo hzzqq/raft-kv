@@ -15,9 +15,11 @@
 | `GET /debug/configs` | shardmaster 完整配置历史（初始 → 最新），复盘 rebalance 轨迹，确认分片在哪些 group 间迁移。 |
 | `GET /debug/groups` | 各 replica group 的 `gid` / 副本数 / leader / 当前 config 号 / 持有分片数，快速核对「哪个 group 当前拥有哪些分片」。 |
 | `GET /metrics` | 计数器 + 直方图 + 瞬时 Gauge（含 `shard_migration_ms` 迁移延迟、`op_latency_ms` 操作延迟、`config_stalls` 冻结计数、`config_changes` 配置变更次数、`config_num` 当前生效配置号 Gauge、`apply_lag` 应用滞后 Gauge、`shard_bytes` 分片字节直方图、`shard_bytes_overflow` 超大分片告警、`send_shard_latency` 每跳迁移延迟、`read_leases` ReadIndex 快读命中计数）。**格式协商**：`Accept` 含 `text/plain`/`prometheus` 时输出 Prometheus 文本 exposition（可被 scrape 客户端采集），否则默认 JSON。 |
-| `GET /debug/accesslog?limit=N` | 进程内访问日志环形缓冲（最近 N 条，默认 50）：每请求的方法 / 路径 / 状态码 / 延迟，供审计排障（无需外部日志采集）。 |
+| `GET /debug/accesslog?limit=N` | 进程内访问日志环形缓冲（最近 N 条，默认 50）：每请求的方法 / 路径 / 状态码 / 延迟 / `request_id`，供审计排障（无需外部日志采集）。 |
 | `GET /readyz` | **就绪探针**：集群每个 group 都有「持租约的 leader」且无迁移卡滞时返回 `200`，否则 `503`；与恒 `200` 的存活探针 `/healthz` 区分，可直接作 k8s `readinessProbe`。 |
 | `GET /healthz` | 存活探针，恒 `200`。 |
+| `GET /debug/log?level=&limit=N` | 进程内分级结构化日志环形缓冲（最近 N 条，按 `level` 过滤 `debug`/`info`/`warn`/`error`，默认 `info`）：每请求一条带级别日志，统一排障入口（取代散落 `fmt.Println`）。 |
+| `GET /debug/config` | 当前生效网关配置快照（脱敏）：`listen_addr` / `request_timeout_sec` / `max_concurrent` / `client_rate` / `client_burst` / `cors_origins`，确认配置文件加载结果。 |
 
 CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh configs`。
 
@@ -45,10 +47,8 @@ CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh conf
 - 否则 `sendShard` 重试推送，成功后 `propose(GCShard)` 清理。
 
 ### 症状 D：网关在迁移抖动 / 压测下返回 `429 Too Many Requests`
-**含义**：网关并发上限（默认 64，`Server.sem` 信号量）被占满，新请求被限流保护而非雪崩。
-**排查**：属预期保护行为；若常态性触顶，说明上游并发过高或后端迁移期变慢。可经 `main.go`
-的 `maxConcurrent` 调大，或降低 `kvcli bench` 的并发 worker 数。限流仅作用在网关入口，
-不丢数据——客户端按 429 退避重试即可。
+**含义**：两种限流其一触发——① 全局并发上限（默认 64，`Server.sem` 信号量）被占满；② 单客户端令牌桶（`client_rate`/`client_burst`，默认 200 rps / 突发 40，按 `X-Client-ID` 或 `RemoteAddr` IP 区分）超量。后者可针对性限制个别失控客户端而不影响其他客户端。
+**排查**：属预期保护行为；若常态性触顶，说明上游并发过高或后端迁移期变慢。可经 `main.go` 的 `maxConcurrent` 调大，或降低 `kvcli bench` 的并发 worker 数；单客户端限流可用 `SetClientRateLimit` 调高 rps / burst 或设 `rps<=0` 关闭。限流仅作用在网关入口，不丢数据——客户端按 429 + `Retry-After` 退避重试即可。
 
 ## 3. kvraft 包「flaky 挂死」说明（非代码 bug）
 

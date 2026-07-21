@@ -107,12 +107,15 @@ curl http://localhost:8080/metrics           # -> JSON 指标快照
 - **持久化（2C）**：`persist()` 保存 `currentTerm` / `votedFor` / `log` / 快照边界；`readPersist()` 容忍损坏数据。日志以 `interface{}` 形式 gob 编码，KV 层在 `init()` 中 `gob.Register(Op{})`，否则重启后日志反序列化失败、命令丢失。
 - **快照（2D）**：`Snapshot` / `CondInstallSnapshot` / `InstallSnapshot`，落后节点通过快照追赶。
 - **leader lease（本轮新增）**：每个节点维护 `lastContact[peer]`（收到合法 `AppendEntries` / `InstallSnapshot` 时刷新），`HasLeaderLease()` 统计在 `ElectionTimeoutMin` 窗口内联系到多数派的节点——leader 仅在有 lease 时才对外提供 ReadIndex 线性一致读，避免无 lease 保证下的陈旧读（详见 shardkv ReadIndex）。
+- **Pre-Vote 预投票（本轮新增 #44）**：候选人正式自增任期前，先以意向任期 `currentTerm+1` 用 `RequestPreVote` 征求多数派意向，不抬升 `currentTerm`、不持久化 `votedFor`；`startElection` 改为「预投票 → 多数授权 → 正式选举（`doRealElection`）」两段式，`preVoteWon` 守卫保证同一轮预投票只转化一次正式选举。核心收益：日志落后或处于少数派分区的节点永远拿不到多数预投票，因此永远不会抬升任期去扰动一个稳定的 leader——显著降低网络抖动 / 短暂分区下的无效重新选举与 tail latency。配套 `TestPreVoteStillElects` / `TestPreVoteDeniesStaleLog` / `TestPreVoteNoDisrupt`。
+- **LeadershipTransfer 领导权转移（本轮新增 #45）**：新增 `TimeoutNow` RPC（接收方立即越过选举超时发起选举）与 `LeadershipTransfer(target)`（leader 先把目标副本同步到已提交位置，再发 `TimeoutNow`，最后以更高任期主动退位让路），用于负载再平衡与计划内维护时的「平滑换主」。`leadership_transfers` 指标记录转移次数。配套 `TestLeadershipTransfer`。
 - **并发**：所有状态访问走 `rf.mu`；复制由心跳计时器（~110ms）触发，避免持锁发 RPC 造成死锁。
 
 ### kvraft（KV 层）—— Lab 3
 - 复用 `raft` 包的 `Network` / `ClientEnd` / `Raft` / `Make` / `ApplyMsg`。
 - `Op` 携带 `ClientId` + `Seq`，`applier` 据此做**幂等去重**；重复命令直接复用上次结果。
 - `Clerk` 轮询各节点，遇到 `WrongLeader` 自动切换 `leaderHint` 重试。
+- **Clerk 指数退避（本轮新增 #46）**：`Get`/`PutAppend` 的重试休眠由固定 50ms 改为**指数退避**（10ms 起步、每轮翻倍、上限 500ms），减少迁移抖动 / 换主窗口下的无效重试风暴；`leaderHint` 仍作为 leader 缓存加速收敛。
 - `waitApplied` 用带缓冲的 `notify` channel + 1s 超时，防止 leader 切换导致结果错位。
 - `applier` 对 leader 的 no-op（nil 命令）直接跳过，不更新状态机。
 - **客户端会话 GC（本轮新增）**：以 `sessions[clientId] → clientSession{LastSeq, LastResult, lastAccess}` 取代旧的 `lastSeq/lastResult` 两个扁平 map，后台 `gc()` 按 TTL（默认 1h）清理空闲会话，避免长期运行内存无限增长；`Kill()` 经 `sync.Once` 关闭 `killCh` 停用 GC，配套 `TestClientSessionGC` 回归。
@@ -130,6 +133,7 @@ curl http://localhost:8080/metrics           # -> JSON 指标快照
 
 ### shardkv（分片 KV）—— Lab 4 数据面
 - 每个 replica group 按**当前配置**只服务归属自己的分片集合；`Get` / `Put` / `Append` 在分片不归本组（含迁移中）时返回 `ErrWrongGroup`，由 `Clerk` 重新查配置后重试。
+- **Clerk 指数退避 + leader 缓存（本轮新增 #46）**：`Clerk` 新增 per-gid leader 缓存 `leaderOf` map——成功返回 `OK` 的 server 即记为该 gid 的缓存 leader；`orderServers` 把缓存 leader 前置优先重试，命中即免去一轮轮询；失败走**指数退避**（10ms→翻倍→500ms 上限）而非固定 50ms。`Get`/`PutAppend`/`GetE`/`putAppendE` 四路径统一应用该策略，迁移 churn 下客户端收敛更快、RPC 更少。
 - **分片迁移（双路）**：旧 owner 推送（`SendShard`）+ 新 owner 拉取（`GetShard` / `fetchShard`）。旧 owner 收到新 owner 的 ack（即新组已在本地 Raft 提交该分片数据）后才在本组提交 `GCShard` 回收——保证数据在对方落盘前不丢失。
 - **串行推进配置**：`pollConfig` 仅在「本组无未决迁移」且「最新配置恰好比当前领先 1 步」时才推进 `NewConfig`，避免迁移重叠引发的竞态。
 - **`applyNewConfig` 边界**：新归属分片若上一版未分配（哨兵 `gid == 0`）则直接初始化空 `ShardData`；否则从 `prevConfig` 中记录的旧 owner 名单拉取（本版配置里该 gid 可能已被 `Leave` 移除，故必须取上一版）。
@@ -158,6 +162,11 @@ curl http://localhost:8080/metrics           # -> JSON 指标快照
   - **`GET /readyz`**：k8s 就绪探针——要求每个 replica group 都有「持 leader 租约（`HasLeaderLease()`）」的 leader 且无迁移卡滞才返回 `200`，否则 `503`；与 `GET /healthz`（liveness，进程存活即 `200`）明确区分，避免把「自认 leader 但已分区失联、无法提交」的节点误判为就绪。配套 `TestGatewayReadyz`。`ShardDebug` 新增 `Lease` 字段以支撑该判定。
   - **`http.TimeoutHandler` 请求超时兜底**：`Handler()` 以 `http.TimeoutHandler(mux, 30s, "request timed out")` 包裹，单请求超期返回 `503`，防止个别慢请求拖垮网关；`SetRequestTimeout` 可配置。配套 `TestGatewayRequestTimeout`。
   - `/metrics` 的 **Prometheus 文本格式**：`metrics.Registry.WritePrometheus` 按字母序稳定输出 counter/gauge 直接序列化、histogram 输出 `_count`/`_sum`/`_p50`/`_p95`/`_p99` 分位，`/metrics` 按 `Accept` 头协商（Prometheus → 文本，其余 → JSON）。配套 `TestGatewayMetricsPrometheus`。
+  - **分级结构化日志 + `GET /debug/log`（本轮新增 #47）**：每请求经 `wrap` 中间件产生恰好一条分级日志（`debug`/`info`/`warn`/`error`，成功=`info`、4xx=`warn`、5xx=`error`），存入容量 256 的环形缓冲；`GET /debug/log?level=&limit=` 可按级别过滤、按条数分页回看，统一排障入口（取代散落 `fmt.Println`）。配套 `TestGatewayLogLevel`。
+  - **`X-Request-ID` 请求链路透传（本轮新增 #48）**：`wrap` 在入站缺 `X-Request-ID` 时以 `crypto/rand` 生成 16 位 hex（存在则沿用），并统一写入响应头；访问日志与结构化日志均记录该 ID，便于跨请求 / 跨服务链路追踪。配套 `TestGatewayRequestID`。
+  - **每客户端令牌桶限流（本轮新增 #49）**：在全局并发 `429` 之上新增按客户端标识（`X-Client-ID` 或 `RemoteAddr` IP）的令牌桶（默认 200 rps、突发 40），超限返回 `429 + Retry-After`，防止单个客户端拖垮网关；桶 map 超 4096 自动重置防内存膨胀。`SetClientRateLimit` 可配置。配套 `TestGatewayClientLimit`。
+  - **CORS 中间件（本轮新增 #50，浏览器直连）**：`corsHandler` 注入 `Access-Control-Allow-*` 头，`OPTIONS` 预检直接返回 `204`；`corsOrigins` 为空允许所有源、非空仅回显匹配源。`SetCORS` 可配置。配套 `TestGatewayCORS`。
+  - **YAML 配置加载 + `GET /debug/config`（本轮新增 #51/#52）**：零依赖极简 YAML 子集解析器（`ParseGatewayConfig`/`LoadGatewayConfig`，沙箱不可联网装 yaml 库故自包含）支持 `listen_addr`/`request_timeout_sec`/`max_concurrent`/`client_rate`/`client_burst`/`cors_origins` 覆盖默认值；`GatewayConfig.Apply` 在 `NewServer` 后将配置写入 `Server`，`GET /debug/config` 返回当前生效配置快照（脱敏）便于确认加载结果。配套 `TestGatewayConfigLoad` / `TestGatewayDebugConfig`。
 - **`kvcli`**（`src/kvcli`）：HTTP 客户端 + 压测工具，`get`/`put`/`append` 子命令外，
   另有 `bench [op] [ops] [workers]` 报告端到端吞吐与 `p50/p95/p99` 延迟。
 - **`metrics`**（`src/metrics`）：零依赖并发安全指标库（Counter + **Gauge（瞬时值，如当前 config 号 / apply 滞后，原子位模式存储 float64）** + 有界环形 Histogram + Registry），
@@ -215,6 +224,8 @@ export GO111MODULE=on
 - 自动化纪律：每次改动本地提交、验收不过绝不提交；**前多轮自主迭代（cycle 1–28、cycle 29–38、cycle 39–48、cycle 49–57、cycle 58–67）已按用户授权执行 `git push origin master`（仅普通推送、不 --force、不 `rm -rf`）**（见 `docs/lab4-shardkv-design.md` 与 `.workbuddy/self-driving/state.json`）。**本轮迭代（cycle 68–87，「照刚刚的迭代20次」：raft leader lease + ShardKV ReadIndex 快读复活 / 配置号幂等 `installedCfgNum` + ReMigration 冻结修复 / shardmaster 最小搬动 + 输入校验 `ErrInvalid` / 网关并发限流 429 + 优雅退出 `Shutdown` + `/debug/groups` / kvraft 客户端会话 GC / metrics 新增 Gauge 与多项指标 / 混沌测试 I16/I18 + CI 竞态与长时 job）同样获得用户授权，将在全量 `build+vet+test` 通过后执行 `git push origin master`（仅 fast-forward）**。
 
 **最新一轮自主迭代（用户授权「迭代20次，方向是新增功能 / 完善旧功能 / 解决显性与隐性问题」，对应内部迭代 n=35–42）已全部本地提交**：含选举窗口跨迁移丢写修复（`GetShard` 三条件守卫 + raft `committedCurrentTerm` 标记）、网关可观测性（Prometheus `/metrics` 协商、访问日志 `/debug/accesslog`、`/readyz` 就绪探针、`http.TimeoutHandler` 请求超时兜底）、kvraft `Get` ReadIndex 快路径、`raft.HasCommittedCurrentTerm` 确定性守护测试；全仓 `go test ./...` 验证通过。因沙箱网络阻断 `github.com:443`，`git push origin master` 暂未完成，待联网环境补推（仅 fast-forward、绝不 `--force`、绝不 `rm -rf`）。
+
+**最近一轮自主迭代（用户授权「迭代10次，方向=新增功能 / 完善旧功能 / 解决显性与隐性问题」，对应内部迭代 n=44–#53）已全部本地提交**：在 Raft 层新增 **Pre-Vote 预投票**（#44，候选人正式选举前先征求多数派意向，日志落后的少数派分区节点永不扰动稳定 leader）与 **LeadershipTransfer 领导权转移**（#45，平滑换主，用于负载再平衡 / 计划内维护）；Clerk 层新增 **指数退避 + per-gid leader 缓存**（#46，kvraft / shardkv 双 Clerk，迁移 churn 下收敛更快、RPC 更少）；网关层新增 **分级结构化日志 + `/debug/log`**（#47，并顺带修复 #44/#45 引入但被挂起掩盖的集群分发器未注册 `RequestPreVote`/`TimeoutNow` 真实回归）、**`X-Request-ID` 请求链路透传**（#48）、**每客户端令牌桶限流**（#49）、**CORS 中间件**（#50）、**YAML 配置文件加载 + `/debug/config` 生效配置快照**（#51/#52）。全仓 `go build ./...` + 网关 cluster-free 测试套件验证通过，因沙箱网络阻断 `github.com:443`，`git push origin master` 暂未完成，待联网环境补推（仅 fast-forward、绝不 `--force`、绝不 `rm -rf`）。
 
 ## 说明
 - 这是面向学习的实验性实现，重点在正确性与可读性，非生产级部署。
