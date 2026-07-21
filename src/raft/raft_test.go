@@ -68,6 +68,8 @@ func (cfg *config) addServerHandler(i int, rf *Raft) {
 		switch method {
 		case "RequestVote":
 			rf.RequestVote(args.(*RequestVoteArgs), reply.(*RequestVoteReply))
+		case "RequestPreVote":
+			rf.RequestPreVote(args.(*RequestPreVoteArgs), reply.(*RequestPreVoteReply))
 		case "AppendEntries":
 			rf.AppendEntries(args.(*AppendEntriesArgs), reply.(*AppendEntriesReply))
 		case "InstallSnapshot":

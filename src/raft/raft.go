@@ -78,6 +78,21 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+// RequestPreVoteArgs / RequestPreVoteReply 是 Pre-Vote（预投票）扩展的 RPC
+// 参数（Diego Ongaro 的 Raft 扩展）。候选人在正式自增任期、广播 RequestVote 之前，
+// 先以"意向任期" currentTerm+1 征求多数派意向，从而避免抬升任期去扰动稳定 leader。
+type RequestPreVoteArgs struct {
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type RequestPreVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
+
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
@@ -140,6 +155,10 @@ type Raft struct {
 	// 于上一任 leader 已提交的位置、旧任期已提交写尚未 apply——此时若对外服务
 	// 读/迁移传输，会传出陈旧快照造成丢写。GetShard 据此守卫（详见 shardkv）。
 	committedCurrentTerm bool
+
+	// preVoteWon 标记本轮"预投票"是否已转化为正式选举，用于防止同一轮预投票的
+	// 多个多数派回包并发触发两次正式选举（doRealElection 的 exactly-once 守卫）。
+	preVoteWon bool
 
 	nextIndex  []int
 	matchIndex []int
@@ -343,16 +362,76 @@ func (rf *Raft) resetElectionTimer() {
 	rf.electionTimer.Reset(d)
 }
 
+// startElection 进入选举流程。先发起 Pre-Vote（预投票）：以"意向任期" currentTerm+1
+// 征求多数派意向，不抬升自身任期、不持久化 votedFor。仅当拿到多数派预投票授权后，
+// 才调用 doRealElection 真正自增任期并广播 RequestVote。这样，日志落后或处于少数派
+// 分区的节点永远拿不到多数预投票，也就永远不会抬升任期去扰动稳定 leader。
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
-	rf.currentTerm++
-	rf.role = Candidate
-	rf.votedFor = rf.me
-	rf.persist()
-	term := rf.currentTerm
+	// 预投票意向任期：当前任期 +1。整个预投票阶段不修改 currentTerm。
+	preTerm := rf.currentTerm + 1
+	rf.preVoteWon = false
 	lastIdx := rf.lastLogIndex()
 	lastTerm := rf.lastLogTerm()
 	me := rf.me
+	rf.mu.Unlock()
+
+	rf.resetElectionTimer()
+
+	preVotes := 1 // 自己默认算一票
+	var pmu sync.Mutex
+	for i := range rf.peers {
+		if i == me {
+			continue
+		}
+		args := &RequestPreVoteArgs{
+			Term:         preTerm,
+			CandidateId:  me,
+			LastLogIndex: lastIdx,
+			LastLogTerm:  lastTerm,
+		}
+		go func(i int, args *RequestPreVoteArgs) {
+			reply := &RequestPreVoteReply{}
+			ok := rf.peers[i].Call("RequestPreVote", args, reply)
+			if !ok {
+				return
+			}
+			rf.mu.Lock()
+			if reply.Term > rf.currentTerm {
+				rf.stepDown(reply.Term)
+			}
+			rf.mu.Unlock()
+			if !reply.VoteGranted {
+				return
+			}
+			pmu.Lock()
+			preVotes++
+			got := preVotes
+			pmu.Unlock()
+			if got == len(rf.peers)/2+1 {
+				rf.doRealElection(preTerm, lastIdx, lastTerm, me)
+			}
+		}(i, args)
+	}
+}
+
+// doRealElection 仅在 Pre-Vote 获得多数派授权后才进入正式选举：真正抬升任期、
+// 自投、广播 RequestVote。期间若出现更高任期（其他节点已成 leader）则放弃。
+// preVoteWon 守卫保证同一轮预投票只转化一次正式选举。
+func (rf *Raft) doRealElection(preTerm int, lastIdx, lastTerm, me int) {
+	rf.mu.Lock()
+	// 仅当本节点任期仍等于"预投票意向任期 - 1"时方可推进；否则说明期间出现了
+	// 更高任期（其他节点已成 leader），放弃本次选举，避免重复/冲突的正式选举。
+	if rf.currentTerm != preTerm-1 || rf.preVoteWon {
+		rf.mu.Unlock()
+		return
+	}
+	rf.preVoteWon = true
+	rf.currentTerm = preTerm
+	rf.role = Candidate
+	rf.votedFor = me
+	rf.persist()
+	term := rf.currentTerm
 	rf.mu.Unlock()
 
 	rf.resetElectionTimer()
@@ -402,6 +481,7 @@ func (rf *Raft) becomeLeader() {
 	// 新任期必须重新提交一条当前任期 no-op 才能提交旧任期条目；重置该标记，
 	// 确保 GetShard 等传输守卫在重新提交 no-op 之前不会传出陈旧快照。
 	rf.committedCurrentTerm = false
+	rf.preVoteWon = false
 	rf.lastContact[rf.me] = time.Now()
 	Metrics.Counter("leader_changes").Inc()
 	// 任期开始时追加一条 no-op（空命令）。按 Raft 提交规则，leader 只能
@@ -429,6 +509,7 @@ func (rf *Raft) stepDown(term int) {
 		rf.persist()
 	}
 	rf.role = Follower
+	rf.preVoteWon = false
 	rf.resetElectionTimer()
 }
 
@@ -456,6 +537,26 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = grant
+}
+
+// RequestPreVote 处理 Pre-Vote（预投票）请求。与 RequestVote 的关键区别：不持久化
+// votedFor、不抬升 currentTerm。仅当候选人日志至少与自己一样新、且意向任期 >= 当前
+// 任期时才授权。这样，日志落后或处于少数派分区的节点永远拿不到多数预投票，也就永远
+// 不会抬升任期去扰动稳定 leader（避免无谓的 leader 翻腾与客户端请求被重定向）。
+// 只有确实能与多数派通信且日志够新的节点才会获得预投票、进而进入正式选举。
+func (rf *Raft) RequestPreVote(args *RequestPreVoteArgs, reply *RequestPreVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+	// 预投票不持久化任何状态、不抬升 currentTerm（区别于正式 RequestVote）。
+	upToDate := (args.LastLogTerm > rf.lastLogTerm()) ||
+		(args.LastLogTerm == rf.lastLogTerm() && args.LastLogIndex >= rf.lastLogIndex())
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = upToDate
 }
 
 // ============================== 日志复制 ==============================
