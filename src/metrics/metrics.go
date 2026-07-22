@@ -16,6 +16,7 @@ import (
 	"io"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -167,6 +168,7 @@ type Registry struct {
 	counters   map[string]*Counter
 	histograms map[string]*Histogram
 	gauges     map[string]*Gauge
+	descs      map[string]string // 指标 HELP 描述（Prometheus 规范推荐）
 }
 
 // NewRegistry 创建一个空的指标注册表。
@@ -175,6 +177,7 @@ func NewRegistry() *Registry {
 		counters:   map[string]*Counter{},
 		histograms: map[string]*Histogram{},
 		gauges:     map[string]*Gauge{},
+		descs:      map[string]string{},
 	}
 }
 
@@ -214,6 +217,49 @@ func (r *Registry) Gauge(name string) *Gauge {
 	return g
 }
 
+// CounterWithHelp 取得命名计数器并登记 HELP 描述（供 WritePrometheus 输出 # HELP）。
+func (r *Registry) CounterWithHelp(name, help string) *Counter {
+	c := r.Counter(name)
+	r.setDesc(name, help)
+	return c
+}
+
+// GaugeWithHelp 取得命名瞬时值并登记 HELP 描述。
+func (r *Registry) GaugeWithHelp(name, help string) *Gauge {
+	g := r.Gauge(name)
+	r.setDesc(name, help)
+	return g
+}
+
+// HistWithHelp 取得命名直方图并登记 HELP 描述。
+func (r *Registry) HistWithHelp(name, help string) *Histogram {
+	h := r.Histogram(name)
+	r.setDesc(name, help)
+	return h
+}
+
+// setDesc 登记指标的 HELP 描述（多行归一成单行，避免破坏 exposition）。
+func (r *Registry) setDesc(name, help string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.descs[name] = strings.ReplaceAll(help, "\n", " ")
+}
+
+// desc 返回指标描述（无则空串）。调用方须在 Snapshot 释放锁后调用。
+func (r *Registry) desc(name string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.descs[name]
+}
+
+// helpLine 返回指标的 # HELP 行（含换行）；无描述时返回空串。
+func (r *Registry) helpLine(name, sn string) string {
+	if d := r.desc(name); d != "" {
+		return "# HELP " + sn + " " + d + "\n"
+	}
+	return ""
+}
+
 // Snapshot 返回 JSON 友好结构：{"counters": {...}, "histograms": {...}}。
 func (r *Registry) Snapshot() map[string]interface{} {
 	r.mu.Lock()
@@ -244,6 +290,7 @@ func (r *Registry) Reset() {
 	r.counters = map[string]*Counter{}
 	r.histograms = map[string]*Histogram{}
 	r.gauges = map[string]*Gauge{}
+	r.descs = map[string]string{}
 }
 
 // DumpJSON 把当前快照序列化为 JSON 字节，便于网关 / 演示程序直接输出。
@@ -303,12 +350,18 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 	for _, name := range names {
 		sn := sanitizeMetricName(name)
 		if v, ok := counters[name]; ok {
+			if _, err := io.WriteString(w, r.helpLine(name, sn)); err != nil {
+				return err
+			}
 			if _, err := fmt.Fprintf(w, "# TYPE %s counter\n%s %d\n", sn, sn, v); err != nil {
 				return err
 			}
 			continue
 		}
 		if v, ok := gauges[name]; ok {
+			if _, err := io.WriteString(w, r.helpLine(name, sn)); err != nil {
+				return err
+			}
 			if _, err := fmt.Fprintf(w, "# TYPE %s gauge\n%s %g\n", sn, sn, v); err != nil {
 				return err
 			}
@@ -324,6 +377,9 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 	for _, name := range hnames {
 		sn := sanitizeMetricName(name)
 		h := hists[name]
+		if _, err := io.WriteString(w, r.helpLine(name, sn)); err != nil {
+			return err
+		}
 		if _, err := fmt.Fprintf(w,
 			"# TYPE %s_count counter\n%s_count %d\n"+
 				"# TYPE %s_sum gauge\n%s_sum %g\n"+

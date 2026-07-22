@@ -19,6 +19,41 @@ func TestCounter(t *testing.T) {
 	}
 }
 
+// TestPrometheusHelp 验证：带 HELP 描述的指标在 exposition 中输出 # HELP 行，
+// 无描述的指标不输出 # HELP（保持向后兼容）。
+func TestPrometheusHelp(t *testing.T) {
+	r := NewRegistry()
+	r.CounterWithHelp("http_requests_total", "Total HTTP requests served")
+	r.GaugeWithHelp("shardkv_config_num", "Current applied config number")
+	r.HistWithHelp("http_request_latency_ms", "HTTP request latency in milliseconds")
+	r.Counter("no_help_counter") // 无描述
+
+	var buf bytes.Buffer
+	if err := r.WritePrometheus(&buf); err != nil {
+		t.Fatalf("WritePrometheus: %v", err)
+	}
+	out := buf.String()
+
+	wantHelp := []string{
+		"# HELP http_requests_total Total HTTP requests served",
+		"# HELP shardkv_config_num Current applied config number",
+		"# HELP http_request_latency_ms HTTP request latency in milliseconds",
+	}
+	for _, line := range wantHelp {
+		if !bytes.Contains(buf.Bytes(), []byte(line)) {
+			t.Fatalf("期望输出 %q，实际：\n%s", line, out)
+		}
+	}
+	// 无描述指标不应出现 # HELP no_help_counter
+	if bytes.Contains(buf.Bytes(), []byte("# HELP no_help_counter")) {
+		t.Fatalf("无描述指标不应输出 # HELP：\n%s", out)
+	}
+	// TYPE 行仍正确存在
+	if !bytes.Contains(buf.Bytes(), []byte("# TYPE http_requests_total counter")) {
+		t.Fatalf("缺少 # TYPE 行：\n%s", out)
+	}
+}
+
 func TestHistogramPercentiles(t *testing.T) {
 	h := NewHistogram(100)
 	for i := 1; i <= 1000; i++ {
