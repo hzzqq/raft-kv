@@ -10,6 +10,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/rand"
@@ -105,6 +106,17 @@ type Server struct {
 	// I56：安全响应头开关。开启时 wrap 注入 X-Content-Type-Options / X-Frame-Options /
 	// Referrer-Policy 等基线安全头，缓解 MIME 嗅探 / 点击劫持 / 引用泄露。默认开启。
 	secHeaders bool
+
+	// I68：响应缓存（仅 GET）。缓存 200 成功响应与 5xx 负响应（短 TTL，缓解惊群），
+	// 降低热点只读接口的回源压力。按 method+path+Accept-Encoding 维度缓存（gzip 与明文
+	// 分开），TTL 过期自动失效，容量满按 FIFO 淘汰最旧。零集群依赖，cluster-free 可验证。
+	cacheMu     sync.Mutex
+	cacheOn     bool
+	cacheTTL    time.Duration
+	cacheNegTTL time.Duration
+	cacheMax    int
+	cacheStore  map[string]*cacheEntry
+	cacheOrder  []string
 
 	// I57：IP 白名单（CIDR 列表）。非空时仅允许列表内客户端 IP 访问，其余返回 403。
 	// 为空表示不限制。用于网关仅对内网/特定来源开放的场景。
@@ -449,6 +461,141 @@ type gzipResponseWriter struct {
 
 func (g *gzipResponseWriter) Write(p []byte) (int, error) { return g.gz.Write(p) }
 
+// ---- I68：响应缓存 ----
+
+// cacheVal 是一份可被直接回放的缓存响应（状态码 + 响应头 + 响应体字节）。
+// 响应体按客户端实际收到的形式存储（gzip 压缩或明文），回放时原样写出即可。
+type cacheVal struct {
+	Status int
+	Header http.Header
+	Body   []byte
+}
+
+// cacheEntry 是带过期时间的缓存槽位。
+type cacheEntry struct {
+	val *cacheVal
+	exp time.Time
+}
+
+// capturingRecorder 在 statusRecorder 之上额外缓冲响应体，供缓存落盘。
+// 嵌入 *statusRecorder，故 WriteHeader/Write 透传到原 ResponseWriter（客户端照常收到响应），
+// 同时把写出的字节累积到 buf。
+type capturingRecorder struct {
+	*statusRecorder
+	buf *bytes.Buffer
+}
+
+// Write 透传到底层并缓冲一份，用于缓存。
+func (c *capturingRecorder) Write(b []byte) (int, error) {
+	c.buf.Write(b)
+	return c.statusRecorder.Write(b)
+}
+
+// SetCache 开启响应缓存：ttl 为成功响应缓存时长，maxKeys 为最大缓存条目（FIFO 淘汰）。
+// 负缓存（5xx）时长固定为 min(ttl/10, 2s)，仅用于缓解后端抖动期的惊群。生产可用。
+func (s *Server) SetCache(ttl time.Duration, maxKeys int) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.cacheOn = true
+	if ttl <= 0 {
+		ttl = 5 * time.Second
+	}
+	s.cacheTTL = ttl
+	s.cacheNegTTL = ttl / 10
+	if s.cacheNegTTL > 2*time.Second {
+		s.cacheNegTTL = 2 * time.Second
+	}
+	if maxKeys <= 0 {
+		maxKeys = 256
+	}
+	s.cacheMax = maxKeys
+	if s.cacheStore == nil {
+		s.cacheStore = make(map[string]*cacheEntry)
+		s.cacheOrder = nil
+	}
+}
+
+// cacheKey 以 method+path+Accept-Encoding 维度生成缓存键（gzip 与明文分开存储/回放）。
+func (s *Server) cacheKey(r *http.Request) string {
+	enc := "plain"
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		enc = "gzip"
+	}
+	return r.Method + " " + r.URL.Path + " " + enc
+}
+
+// cacheGet 命中且未过期则返回缓存值（调用方不得修改返回值）；过期则顺手清理并返回 nil。
+func (s *Server) cacheGet(key string) *cacheVal {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	e, ok := s.cacheStore[key]
+	if !ok {
+		return nil
+	}
+	if time.Now().After(e.exp) {
+		delete(s.cacheStore, key)
+		s.evictOrder(key)
+		return nil
+	}
+	return e.val
+}
+
+// cacheSet 写入成功响应（TTL=cacheTTL），容量满时 FIFO 淘汰最旧。
+func (s *Server) cacheSet(key string, v *cacheVal) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.cacheStore[key] = &cacheEntry{val: v, exp: time.Now().Add(s.cacheTTL)}
+	s.pushOrder(key)
+}
+
+// cacheSetNeg 写入负缓存（TTL=cacheNegTTL），容量满时同样 FIFO 淘汰。
+func (s *Server) cacheSetNeg(key string, v *cacheVal) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.cacheStore[key] = &cacheEntry{val: v, exp: time.Now().Add(s.cacheNegTTL)}
+	s.pushOrder(key)
+}
+
+// pushOrder 维护 FIFO 顺序，超出容量则淘汰最旧条目。
+func (s *Server) pushOrder(key string) {
+	s.cacheOrder = append(s.cacheOrder, key)
+	if len(s.cacheOrder) > s.cacheMax {
+		old := s.cacheOrder[0]
+		s.cacheOrder = s.cacheOrder[1:]
+		delete(s.cacheStore, old)
+	}
+}
+
+// evictOrder 从 FIFO 顺序中移除指定 key（过期清理用）。
+func (s *Server) evictOrder(key string) {
+	for i, k := range s.cacheOrder {
+		if k == key {
+			s.cacheOrder = append(s.cacheOrder[:i], s.cacheOrder[i+1:]...)
+			return
+		}
+	}
+}
+
+// replayCache 把缓存响应原样回放给客户端（X-Request-ID 沿用本次请求，不被旧值覆盖），
+// 并补齐访问日志与基础指标，使缓存命中在观测面与真实请求一致。
+func (s *Server) replayCache(w http.ResponseWriter, cv *cacheVal, start time.Time, r *http.Request) {
+	for k, vs := range cv.Header {
+		if k == "X-Request-ID" {
+			continue // 保留本次请求的关联 ID
+		}
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(cv.Status)
+	w.Write(cv.Body)
+	reqID := w.Header().Get("X-Request-ID")
+	s.recordAccess(r.Method, r.URL.Path, cv.Status, time.Since(start), reqID)
+	Metrics.Counter("http_requests_total").Inc()
+	Metrics.Counter(fmt.Sprintf("http_responses_%d", cv.Status)).Inc()
+	Metrics.Histogram("http_request_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
+}
+
 // SetTestDelay 仅供单测注入人为延迟，使 429 路径可被稳定复现。生产不可用。
 func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 
@@ -651,6 +798,13 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			s.logf(levelWarn, "route rate limit exceeded", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
 			return
 		}
+		// I68：GET 命中响应缓存则直接回放，跳过并发信号量与回源（限流/安全语义已于上方校验）。
+		if s.cacheOn && r.Method == http.MethodGet {
+			if cv := s.cacheGet(s.cacheKey(r)); cv != nil {
+				s.replayCache(w, cv, start, r)
+				return
+			}
+		}
 		record := func(status int, d time.Duration) {
 			s.recordAccess(r.Method, r.URL.Path, status, d, reqID)
 		}
@@ -682,10 +836,27 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			w = &gzipResponseWriter{ResponseWriter: w, gz: gz}
 		}
 		rec := &statusRecorder{ResponseWriter: w}
-		h(rec, r)
-		st := rec.status
-		if st == 0 {
-			st = http.StatusOK
+		var st int
+		if s.cacheOn && r.Method == http.MethodGet {
+			// 缓存可命中路径：用 capturingRecorder 透传响应并缓冲，供落缓存。
+			crec := &capturingRecorder{statusRecorder: rec, buf: &bytes.Buffer{}}
+			h(crec, r)
+			st = rec.status
+			if st == 0 {
+				st = http.StatusOK
+			}
+			ck := s.cacheKey(r)
+			if st == http.StatusOK {
+				s.cacheSet(ck, &cacheVal{Status: st, Header: w.Header().Clone(), Body: append([]byte(nil), crec.buf.Bytes()...)})
+			} else if st >= 500 {
+				s.cacheSetNeg(ck, &cacheVal{Status: st, Header: w.Header().Clone(), Body: append([]byte(nil), crec.buf.Bytes()...)})
+			}
+		} else {
+			h(rec, r)
+			st = rec.status
+			if st == 0 {
+				st = http.StatusOK
+			}
 		}
 		// 结构化记录每请求一条日志：成功=info，4xx=warn，5xx=error，便于 /debug/log 排障。
 		fields := map[string]string{"method": r.Method, "path": r.URL.Path, "status": strconv.Itoa(st), "request_id": reqID}
