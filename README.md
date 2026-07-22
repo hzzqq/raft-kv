@@ -227,6 +227,19 @@ export GO111MODULE=on
 
 **最近一轮自主迭代（用户授权「迭代10次，方向=新增功能 / 完善旧功能 / 解决显性与隐性问题」，对应内部迭代 n=44–#53）已全部本地提交**：在 Raft 层新增 **Pre-Vote 预投票**（#44，候选人正式选举前先征求多数派意向，日志落后的少数派分区节点永不扰动稳定 leader）与 **LeadershipTransfer 领导权转移**（#45，平滑换主，用于负载再平衡 / 计划内维护）；Clerk 层新增 **指数退避 + per-gid leader 缓存**（#46，kvraft / shardkv 双 Clerk，迁移 churn 下收敛更快、RPC 更少）；网关层新增 **分级结构化日志 + `/debug/log`**（#47，并顺带修复 #44/#45 引入但被挂起掩盖的集群分发器未注册 `RequestPreVote`/`TimeoutNow` 真实回归）、**`X-Request-ID` 请求链路透传**（#48）、**每客户端令牌桶限流**（#49）、**CORS 中间件**（#50）、**YAML 配置文件加载 + `/debug/config` 生效配置快照**（#51/#52）。全仓 `go build ./...` + 网关 cluster-free 测试套件验证通过，因沙箱网络阻断 `github.com:443`，`git push origin master` 暂未完成，待联网环境补推（仅 fast-forward、绝不 `--force`、绝不 `rm -rf`）。
 
+### R3 自主迭代交付（#54–#67，网关/可观测性/客户端/工程化）
+
+用户授权「迭代50次」后的 R3 轮次（内部迭代 n=#54–#67，状态以 `.workbuddy/self-driving/state.json` 为准）。本轮聚焦网关与周边组件，全部本地提交 + cluster-free 测试验证（沙箱 raft 选举偶发挂死，故网关/客户端/工具测试一律 cluster-free，绕开真实集群）：
+
+- **网关（#54–#62）**：请求体大小上限（413 + MaxBytesReader 兜底）、响应 gzip 压缩（含 Vary 头）、基线安全响应头（nosniff/DENY/Referrer-Policy）、IP 白名单（403）、`/debug/routes` 路由清单、`/debug/version` 版本与 uptime、配置加载校验告警（越界值记 warn）、后端健康熔断（连续 5xx 快速失败 503）、按路由前缀限流（路由级令牌桶 + 修复 tokenBucket data race）。
+- **可观测性（#63）**：`metrics.WritePrometheus` 修复 Prometheus exposition 格式违规——直方图原错误声明 `# TYPE xxx histogram` 却输出自定义 p50/p95/p99 序列（scrape 客户端解析失败），改为每个派生序列声明正确 TYPE（`_count`=counter、`_sum`/`_p50`/`_p95`/`_p99`=gauge），并新增 `sanitizeMetricName` 清洗非法指标名（点/连字符→_），确保被 scrape 客户端正确采集。
+- **客户端（#64）**：kvcli `Get/Put/Append` 在网关返回非 200 时把（截断后的）响应体纳入 error（排障可见真实错误，不再静默丢弃）；`Bench` 新增整体墙钟超时（默认 30s）+ 内部 ctx，后端挂死时不再无限拖尾。
+- **工具（#65）**：`statusfmt` 渲染逻辑抽取为可测函数 + 白盒测试（nil 切片归一显示 `[]` 而非 `<nil>`）。
+- **演示（#66）**：`demo` HTTP 演示段增加整体超时兜底 + 优雅关闭（`srv.Shutdown`），并补 `key2shard` 确定性白盒测试（分片映射不变量）。
+- **工程化（#67）**：Makefile 新增 `test-all`（覆盖全部包，含本轮新增的 cluster-free 测试）/`fmt`（gofmt 检查，不重写上游 6.824 代码）/`bench`（raft 基准）目标；原 `test` 语义保留（仅 shardkv）以兼容 CI。
+
+全部变更已本地提交；R3 #54–#62 已按授权 `git push origin master`（仅 fast-forward），#63–#67 待批量 push。
+
 ## 说明
 - 这是面向学习的实验性实现，重点在正确性与可读性，非生产级部署。
 - 持久化、RPC、网络均使用 MIT 6.824 提供的实验脚手架（`persister.go` / `labrpc.go`）。
