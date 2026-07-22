@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -131,10 +132,62 @@ func LoadGatewayConfig(path string) (GatewayConfig, error) {
 	return ParseGatewayConfig(data)
 }
 
+// Validate 校验网关配置的自洽性，返回问题列表（空切片=通过）。纯函数、cluster-free，
+// 风格对齐 shardmaster.ValidateConfig：在 Apply 前做硬守卫，把结构性错误（非法监听地址、
+// 非法端口、超时/并发/限流/体量为非正、非法 CIDR）集中暴露，便于调用方在真正应用前拦截。
+// 注意：与本方法互补，Apply 内仍保留「越界但可用」的软告警（levelWarn，如超时过大、并发过低）；
+// 本方法只报告硬错误（levelError 级别，真正会让监听/限流失效的取值）。
+func (c GatewayConfig) Validate() []string {
+	var problems []string
+	// listen_addr 必须非空且为合法 host:port，端口落在 1..65535。
+	if c.ListenAddr == "" {
+		problems = append(problems, "listen_addr empty")
+	} else {
+		_, portStr, err := net.SplitHostPort(c.ListenAddr)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("listen_addr %q not host:port: %v", c.ListenAddr, err))
+		} else if p, err := strconv.Atoi(portStr); err != nil || p < 1 || p > 65535 {
+			problems = append(problems, fmt.Sprintf("listen_addr port %q out of range 1..65535", portStr))
+		}
+	}
+	if c.RequestTimeout <= 0 {
+		problems = append(problems, "request_timeout_sec must be > 0")
+	} else if c.RequestTimeout > 600 {
+		problems = append(problems, "request_timeout_sec > 600s (unusually large)")
+	}
+	if c.MaxConcurrent < 1 {
+		problems = append(problems, "max_concurrent must be >= 1")
+	}
+	if c.ClientRate < 0 {
+		problems = append(problems, "client_rate must be >= 0")
+	}
+	if c.ClientBurst < 0 {
+		problems = append(problems, "client_burst must be >= 0")
+	}
+	if c.ClientBurst > 0 && c.ClientRate <= 0 {
+		problems = append(problems, "client_burst > 0 but client_rate <= 0 (rate limiting ineffective)")
+	}
+	if c.MaxBodySize <= 0 {
+		problems = append(problems, "max_body_size must be > 0")
+	}
+	for _, cidr := range c.AllowCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			problems = append(problems, fmt.Sprintf("allow_cidrs %q invalid CIDR: %v", cidr, err))
+		}
+	}
+	return problems
+}
+
 // Apply 把配置应用到 Server（仅在显式非零时覆盖，避免把默认值反向清零）。
 // 在 NewServer 之后、Handler() 之前调用。越界/可疑值会记 warn 日志（经 s.logf），
-// 便于在 /debug/log 中回看配置加载时的问题，但不阻断启动。
+// 便于在 /debug/log 中回看配置加载时的问题，但不阻断启动。应用前先跑 Validate 做硬守卫，
+// 任何结构性错误以 levelError 记录（不阻断，便于后续 Listen 失败时能回看原因）。
 func (c GatewayConfig) Apply(s *Server) {
+	if problems := c.Validate(); len(problems) > 0 {
+		for _, p := range problems {
+			s.logf(levelError, "config: validation problem", map[string]string{"problem": p})
+		}
+	}
 	if c.RequestTimeout > 0 {
 		if c.RequestTimeout > 600 {
 			s.logf(levelWarn, "config: request_timeout_sec unusually large", map[string]string{"value": strconv.Itoa(c.RequestTimeout)})
