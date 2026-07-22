@@ -78,3 +78,44 @@ func formatClusterStatus(st clusterStatus) string {
 	}
 	return b.String()
 }
+
+// clusterHealthScore 把集群状态折算为 0-100 健康分与一项摘要（纯函数，便于单测/阈值告警）。
+// 维度：① 有 leader 的 group 占比（无主=严重，权重最高）；② 平均 stall 秒数
+// （越高越差，每 10s 扣 10 分，封顶 50）；③ pending 积压（in/out/incoming
+// 总条目，每 10 条扣 5 分，封顶 30）。三项取加权和并钳制到 [0,100]。
+func clusterHealthScore(st clusterStatus) (score float64, summary string) {
+	if len(st.Groups) == 0 {
+		return 0, "no groups"
+	}
+	var leaderOK int
+	var stallSum float64
+	var backlog int
+	for _, g := range st.Groups {
+		if g.HasLeader {
+			leaderOK++
+		}
+		stallSum += g.StallSeconds
+		backlog += len(g.PendingIn) + len(g.PendingOut) + len(g.Incoming)
+	}
+	leaderRatio := float64(leaderOK) / float64(len(st.Groups))
+	avgStall := stallSum / float64(len(st.Groups))
+
+	stallPenalty := avgStall / 10.0 * 10.0
+	if stallPenalty > 50 {
+		stallPenalty = 50
+	}
+	backlogPenalty := float64(backlog) / 10.0 * 5.0
+	if backlogPenalty > 30 {
+		backlogPenalty = 30
+	}
+	score = 100*leaderRatio - stallPenalty - backlogPenalty
+	if score < 0 {
+		score = 0
+	}
+	if score > 100 {
+		score = 100
+	}
+	summary = fmt.Sprintf("%.0f%% groups healthy, avg_stall=%.1fs, backlog=%d",
+		leaderRatio*100, avgStall, backlog)
+	return score, summary
+}
