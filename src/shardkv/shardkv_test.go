@@ -83,7 +83,7 @@ func makeSKVConfig(t testing.TB, nGroups, nReplicas, nSM, maxraftstate int) *skv
 		jj := j
 		net.AddServer(j, func(method string, args, reply interface{}) {
 			switch method {
-			case "RequestVote", "AppendEntries", "InstallSnapshot":
+			case "RequestVote", "RequestPreVote", "AppendEntries", "InstallSnapshot", "TimeoutNow":
 				sm.RaftRPC(method, args, reply)
 			case "ShardMaster.Join":
 				sm.Join(args.(*shardmaster.JoinArgs), reply.(*shardmaster.JoinReply))
@@ -121,14 +121,18 @@ func makeSKVConfig(t testing.TB, nGroups, nReplicas, nSM, maxraftstate int) *skv
 			cfg.kvPersist[g] = append(cfg.kvPersist[g], p)
 
 			net.AddServer(id, func(method string, args, reply interface{}) {
-				switch method {
-				case "RequestVote":
-					rf.RequestVote(args.(*raft.RequestVoteArgs), reply.(*raft.RequestVoteReply))
-				case "AppendEntries":
-					rf.AppendEntries(args.(*raft.AppendEntriesArgs), reply.(*raft.AppendEntriesReply))
-				case "InstallSnapshot":
-					rf.InstallSnapshot(args.(*raft.InstallSnapshotArgs), reply.(*raft.InstallSnapshotReply))
-				case "ShardKV.Get":
+			switch method {
+			case "RequestVote":
+				rf.RequestVote(args.(*raft.RequestVoteArgs), reply.(*raft.RequestVoteReply))
+			case "RequestPreVote":
+				rf.RequestPreVote(args.(*raft.RequestPreVoteArgs), reply.(*raft.RequestPreVoteReply))
+			case "AppendEntries":
+				rf.AppendEntries(args.(*raft.AppendEntriesArgs), reply.(*raft.AppendEntriesReply))
+			case "InstallSnapshot":
+				rf.InstallSnapshot(args.(*raft.InstallSnapshotArgs), reply.(*raft.InstallSnapshotReply))
+			case "TimeoutNow":
+				rf.TimeoutNow(args.(*raft.TimeoutNowArgs), reply.(*raft.TimeoutNowReply))
+			case "ShardKV.Get":
 					kv.Get(args.(*GetArgs), reply.(*GetReply))
 				case "ShardKV.PutAppend":
 					kv.PutAppend(args.(*PutAppendArgs), reply.(*PutAppendReply))
@@ -165,6 +169,36 @@ func (cfg *skvConfig) leaveGroup(g int) {
 // g>=1 时重启副本的 RPC 会指向不存在的 server（静默返回 false -> 永久分裂投票）。
 // 所有注册/连接/分区操作都必须经由本函数，禁止再出现 1000+g*100+r 的散落字面量。
 func serverId(g, r int) int { return 1000 + g*100 + r }
+
+// TestServerIdDeterministic 守护 n=22 修复：serverId(g,r) 必须采用 1000+g*100+r
+// 编码。早期错误实现用过 1000+g*nReplicas+r2，对 g>=1 会与另一节点的 serverId
+// 碰撞，导致重启节点 RPC 静默黑洞（永久 split-vote 死锁、配置冻结）。本测试断言：
+// (1) 与既定方案一致；(2) 小规模网格内所有 (g,r) 编码唯一（无碰撞）；
+// (3) 同组不同副本 id 严格递增。纯函数、cluster-free，秒级运行。
+func TestServerIdDeterministic(t *testing.T) {
+	const nGroups, nReplicas = 3, 3
+	seen := map[int]struct{}{}
+	for g := 0; g < nGroups; g++ {
+		prev := -1
+		for r := 0; r < nReplicas; r++ {
+			id := serverId(g, r)
+			if id != 1000+g*100+r {
+				t.Fatalf("serverId(%d,%d)=%d, want %d", g, r, id, 1000+g*100+r)
+			}
+			if prev >= 0 && id <= prev {
+				t.Fatalf("serverId not strictly increasing within group: serverId(%d,%d)=%d <= serverId(%d,%d)=%d", g, r, id, g, r-1, prev)
+			}
+			prev = id
+			if _, dup := seen[id]; dup {
+				t.Fatalf("serverId collision at (%d,%d): id=%d already assigned", g, r, id)
+			}
+			seen[id] = struct{}{}
+		}
+	}
+	if len(seen) != nGroups*nReplicas {
+		t.Fatalf("expected %d unique serverIds, got %d", nGroups*nReplicas, len(seen))
+	}
+}
 
 // restartReplica 杀掉第 g 组第 r 个副本，并用「同一 persister」重建 Raft + ShardKV，
 // 模拟该副本崩溃后从持久化状态恢复（而非凭空新建）。网络 handler 通过 AddServer

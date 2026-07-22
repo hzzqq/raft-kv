@@ -46,7 +46,7 @@ func makeSMConfig(t *testing.T, n int) *smConfig {
 		jj := j
 		net.AddServer(j, func(method string, args, reply interface{}) {
 			switch method {
-			case "RequestVote", "AppendEntries", "InstallSnapshot":
+			case "RequestVote", "RequestPreVote", "AppendEntries", "InstallSnapshot", "TimeoutNow":
 				sm.RaftRPC(method, args, reply)
 			case "ShardMaster.Join":
 				sm.Join(args.(*JoinArgs), reply.(*JoinReply))

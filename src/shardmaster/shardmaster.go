@@ -136,10 +136,14 @@ func (sm *ShardMaster) RaftRPC(method string, args, reply interface{}) {
 	switch method {
 	case "RequestVote":
 		sm.rf.RequestVote(args.(*raft.RequestVoteArgs), reply.(*raft.RequestVoteReply))
+	case "RequestPreVote":
+		sm.rf.RequestPreVote(args.(*raft.RequestPreVoteArgs), reply.(*raft.RequestPreVoteReply))
 	case "AppendEntries":
 		sm.rf.AppendEntries(args.(*raft.AppendEntriesArgs), reply.(*raft.AppendEntriesReply))
 	case "InstallSnapshot":
 		sm.rf.InstallSnapshot(args.(*raft.InstallSnapshotArgs), reply.(*raft.InstallSnapshotReply))
+	case "TimeoutNow":
+		sm.rf.TimeoutNow(args.(*raft.TimeoutNowArgs), reply.(*raft.TimeoutNowReply))
 	}
 }
 func (sm *ShardMaster) killed() bool { return atomic.LoadInt32(&sm.dead) == 1 }
