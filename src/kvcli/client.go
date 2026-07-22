@@ -29,6 +29,10 @@ type Client struct {
 	cacheTTL time.Duration
 	cacheMax int
 	cacheLen int
+
+	// 重试：对网络错误与 503/504 瞬态最多重试 maxRetries 次，指数退避（retryBase 起，上限 2s）。
+	maxRetries int
+	retryBase  time.Duration
 }
 
 // cacheEntry 是单条缓存值及其绝对过期时刻。
@@ -213,6 +217,26 @@ func (c *Client) invalidateCache(key string) {
 	}
 }
 
+// SetRetry 配置客户端级重试：对网络错误与 503/504（瞬态）最多重试 max 次，
+// 指数退避（base 起，上限 2s）。max<=0 表示不重试（默认，保持历史行为）。
+// Put/Append 经网关 Clerk 幂等去重，重试安全；Get 天然幂等，可安全重试。
+func (c *Client) SetRetry(max int, base time.Duration) {
+	c.maxRetries = max
+	if base <= 0 {
+		base = 50 * time.Millisecond
+	}
+	c.retryBase = base
+}
+
+// backoffFor 计算第 attempt 次重试（attempt>=1）的退避时长：retryBase * 2^(attempt-1)，上限 2s。
+func (c *Client) backoffFor(attempt int) time.Duration {
+	d := c.retryBase * time.Duration(1<<uint(attempt-1))
+	if d > 2*time.Second {
+		d = 2 * time.Second
+	}
+	return d
+}
+
 // maxErrBody 是错误响应体在错误信息中保留的最大字节数，避免把巨大响应体塞进 error。
 const maxErrBody = 256
 
@@ -243,23 +267,35 @@ func (c *Client) getCtx(ctx context.Context, key string) (string, error) {
 		}
 		c.cacheMu.Unlock()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/kv/"+url.PathEscape(key), nil)
-	if err != nil {
-		return "", err
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(c.backoffFor(attempt))
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/kv/"+url.PathEscape(key), nil)
+		if err != nil {
+			return "", err
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err // 网络错误：瞬态，可重试
+			continue
+		}
+		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("retryable status %d for GET /kv/%s", resp.StatusCode, key)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			return "", respErr("GET", key, resp)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		if c.cache != nil {
+			c.storeCache(key, string(b))
+		}
+		return string(b), nil
 	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", respErr("GET", key, resp)
-	}
-	b, _ := io.ReadAll(resp.Body)
-	if c.cache != nil {
-		c.storeCache(key, string(b))
-	}
-	return string(b), nil
+	return "", lastErr
 }
 
 // Put 写入 key = value。网关返回非 200 时返回错误（含响应体）。
@@ -268,20 +304,32 @@ func (c *Client) Put(key, value string) error {
 }
 
 func (c *Client) putCtx(ctx context.Context, key, value string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.base+"/kv/"+url.PathEscape(key), strings.NewReader(value))
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(c.backoffFor(attempt))
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.base+"/kv/"+url.PathEscape(key), strings.NewReader(value))
+		if err != nil {
+			return err
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("retryable status %d for PUT /kv/%s", resp.StatusCode, key)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			return respErr("PUT", key, resp)
+		}
+		c.invalidateCache(key)
+		return nil
 	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return respErr("PUT", key, resp)
-	}
-	c.invalidateCache(key)
-	return nil
+	return lastErr
 }
 
 // Append 把 value 追加到 key 的当前值之后。网关返回非 200 时返回错误（含响应体）。
@@ -290,18 +338,30 @@ func (c *Client) Append(key, value string) error {
 }
 
 func (c *Client) appendCtx(ctx context.Context, key, value string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/kv/"+url.PathEscape(key)+"/append", strings.NewReader(value))
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(c.backoffFor(attempt))
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/kv/"+url.PathEscape(key)+"/append", strings.NewReader(value))
+		if err != nil {
+			return err
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("retryable status %d for POST /kv/%s/append", resp.StatusCode, key)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			return respErr("POST", key, resp)
+		}
+		c.invalidateCache(key)
+		return nil
 	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return respErr("POST", key, resp)
-	}
-	c.invalidateCache(key)
-	return nil
+	return lastErr
 }
