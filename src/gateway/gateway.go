@@ -75,6 +75,11 @@ type Server struct {
 	clientRate     float64 // 每客户端每秒补充令牌数（<=0 表示关闭限流）
 	clientBurst    float64 // 每客户端桶容量（突发上限）
 
+	// I62：按路由限流。对特定路由（如热点写路径）设独立令牌桶，比全局并发/每客户端
+	// 更细粒度保护单一路由不被打爆。key 为 "METHOD /path"（如 "POST /kv/{key}/append"）。
+	routeLimitMu  sync.Mutex
+	routeLimiters map[string]*tokenBucket
+
 	// I50：CORS 配置（可空，空表示允许所有源 "*"）。供浏览器前端直连网关。
 	corsOrigins []string
 
@@ -117,8 +122,10 @@ type Server struct {
 	breakerThreshold int
 }
 
-// tokenBucket 是单客户端的令牌桶：按时间补充令牌，桶满截断；取用时需至少 1 枚令牌。
+// tokenBucket 是令牌桶：按时间补充令牌，桶满截断；取用时需至少 1 枚令牌。
+// 由单客户端限流（I49）与按路由限流（I62）共用，内部持锁保证并发安全。
 type tokenBucket struct {
+	mu     sync.Mutex
 	tokens float64
 	last   time.Time
 	rate   float64
@@ -126,7 +133,10 @@ type tokenBucket struct {
 }
 
 // allow 按当前时刻补充令牌（elapsed*rate，截断到 burst），若 >=1 则消耗 1 枚并放行。
+// 持锁保证并发安全（多 goroutine 同时取用同一桶不会 data race）。
 func (b *tokenBucket) allow(now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	elapsed := now.Sub(b.last).Seconds()
 	b.last = now
 	b.tokens += elapsed * b.rate
@@ -266,6 +276,25 @@ func (s *Server) SetClientRateLimit(rps float64, burst int) {
 		s.clientLimiters = make(map[string]*tokenBucket)
 	}
 	s.limitMu.Unlock()
+}
+
+// SetRouteLimit 配置某路由（key="METHOD /path"，如 "POST /kv/{key}/append"）的令牌桶
+// 限流（rps 每秒补充、burst 桶容量）。用于比 per-client 更细粒度的单路由保护。
+func (s *Server) SetRouteLimit(route string, rps float64, burst int) {
+	s.routeLimitMu.Lock()
+	defer s.routeLimitMu.Unlock()
+	if s.routeLimiters == nil {
+		s.routeLimiters = make(map[string]*tokenBucket)
+	}
+	s.routeLimiters[route] = &tokenBucket{tokens: float64(burst), last: time.Now(), rate: rps, burst: float64(burst)}
+}
+
+// routeLimiterFor 返回该请求匹配路由的令牌桶（若存在）。key 为 "METHOD /path"。
+func (s *Server) routeLimiterFor(r *http.Request) *tokenBucket {
+	key := r.Method + " " + r.URL.Path
+	s.routeLimitMu.Lock()
+	defer s.routeLimitMu.Unlock()
+	return s.routeLimiters[key]
 }
 
 // SetCORS 配置允许跨域的源列表（生产可用）。空切片表示允许任意源（"*"）。
@@ -573,6 +602,15 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			w.WriteHeader(http.StatusTooManyRequests)
 			io.WriteString(w, `{"error":"client rate limit exceeded","code":429}`)
 			s.logf(levelWarn, "client rate limit exceeded", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
+			return
+		}
+		// I62：按路由限流。命中注册的路由令牌桶且超限则 429（早于并发信号量）。
+		if b := s.routeLimiterFor(r); b != nil && !b.allow(time.Now()) {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			io.WriteString(w, `{"error":"route rate limit exceeded","code":429}`)
+			s.logf(levelWarn, "route rate limit exceeded", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
 			return
 		}
 		record := func(status int, d time.Duration) {

@@ -1362,3 +1362,37 @@ func TestGatewayCircuitBreaker(t *testing.T) {
 	}
 	resp3.Body.Close()
 }
+
+// TestGatewayRouteLimit：验证按路由限流（I62）。cluster-free 构造 Server，对 "GET /x"
+// 设 rps=1/burst=1，连续请求第 1 个放行、后续因桶空 429。
+func TestGatewayRouteLimit(t *testing.T) {
+	s := &Server{
+		sem:            make(chan struct{}, maxConcurrent),
+		accessCap:      256,
+		logCap:         256,
+		requestTimeout: 30 * time.Second,
+		routeLimiters:  make(map[string]*tokenBucket),
+	}
+	s.SetRouteLimit("GET /x", 1, 1) // 1 rps, burst 1
+	inner := func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }
+	h := s.wrap(inner)
+	ts := httptest.NewServer(http.HandlerFunc(h))
+	defer ts.Close()
+	codes := make([]int, 0, 5)
+	for i := 0; i < 5; i++ {
+		resp, err := http.Get(ts.URL + "/x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		codes = append(codes, resp.StatusCode)
+		resp.Body.Close()
+	}
+	if codes[0] != http.StatusOK {
+		t.Fatalf("first req status=%d want 200", codes[0])
+	}
+	for _, c := range codes[1:] {
+		if c != http.StatusTooManyRequests {
+			t.Fatalf("subsequent req status=%d want 429 (codes=%v)", c, codes)
+		}
+	}
+}
