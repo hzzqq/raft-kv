@@ -63,6 +63,13 @@ type BenchResult struct {
 	LatP95    float64
 	LatP99    float64
 	Errors    int
+
+	// 缓存层可观测性（仅当客户端启用缓存时非零）：压测窗口内的
+	// 缓存命中/未命中/单飞合并次数，以及命中率（hits/(hits+misses)）。
+	CacheHits    int64
+	CacheMisses  int64
+	Coalesced    int64
+	CacheHitRate float64
 }
 
 // defaultBenchTimeout 是 Bench 的整体墙钟上限，防止后端挂死时压测无限拖尾。
@@ -103,6 +110,7 @@ func (c *Client) BenchWithTimeout(ops, workers int, op string, valueSize int, ti
 		_ = c.putCtx(ctx, fmt.Sprintf("bench-%d-0", w), value)
 	}
 
+	before := c.CacheStats() // 压测窗口起点快照（仅缓存开启时非零）
 	var mu sync.Mutex
 	var latencies []float64
 	var errCount int64
@@ -141,6 +149,15 @@ func (c *Client) BenchWithTimeout(ops, workers int, op string, valueSize int, ti
 	dur := time.Since(start)
 
 	res := BenchResult{Ops: ops, Workers: workers, Op: op, Duration: dur, Errors: int(errCount)}
+
+	// 压测窗口缓存指标（仅当客户端启用缓存时非零）。
+	after := c.CacheStats()
+	res.CacheHits = after.Hits - before.Hits
+	res.CacheMisses = after.Misses - before.Misses
+	res.Coalesced = after.Coalesced - before.Coalesced
+	if denom := res.CacheHits + res.CacheMisses; denom > 0 {
+		res.CacheHitRate = float64(res.CacheHits) / float64(denom)
+	}
 	if dur > 0 {
 		res.OpsPerSec = float64(ops) / dur.Seconds()
 	}
