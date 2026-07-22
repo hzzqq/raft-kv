@@ -256,6 +256,22 @@ R3 续批（内部迭代 n=#68–#82）。延续「网关/客户端/工具测试
 
 R3 #54–#82 全部本地提交；#54–#72 已按授权 fast-forward 推送，本批 #73–#82 在批次收尾时 fast-forward 推送（仅 fast-forward、绝不 `--force`、绝不 `rm -rf`）。
 
+### R3 自主迭代交付（#83–#103，kvcli 缓存防护 + 工具/可观测性/网关增强）
+
+延伸「网关/客户端/工具测试一律 cluster-free，绕开沙箱 raft 选举偶发挂死」的纪律，本批共 21 轮（内部 cycle 29–50 对应 #83–#103），全部本地提交 + 白盒测试验证；其中 #83–#100 已落地：
+
+- **kvcli 缓存击穿/穿透防护（#83–#87）**：`util.singleflight`（并发同 key 回源合并，防热点 key 同时失效打爆后端）、`Client.EnableSingleFlight`、读穿缓存命中/未命中/单飞合并/负向空值原子计数器 `CacheStats`、`BenchWithTimeout` 窗口快照统计缓存命中率、**MGet 并发批量读取**（复用连接/缓存/单飞/重试全链路，部分失败不阻断、重复 key 被单飞合并）；配套 client 级集成与压力缓存测试。
+- **util 工具包（#88–#91）**：有界信号量 `Semaphore`（支持加权获取 + ctx 取消回滚 + 防下溢）、滑动窗口限流器 `SlidingWindowLimiter`（按 key 限流、滑窗清扫、注入时钟便于测试）、并发任务组 `ErrGroup`（出错即取消全组）、`metrics` Prometheus 暴露补全 `# HELP` 描述注释（无描述指标向后兼容）。
+- **shardmaster（#92）**：`ValidateConfig` 单配置内部一致性校验（未知 gid / 空地址 / 负编号 / 无 group），与配置演进纯函数互补。
+- **statusfmt（#93–#94）**：`clusterHealthScore` 集群健康分（leader 占比 / stall / 积压加权，0–100）、`shardBalance` 分片均衡度（极差/总分片占比，0–100），均为纯函数、cluster-free 可测。
+- **demo（#96）**：cluster-free 启动诊断 `CollectStartupReport` / `FormatStartupReport`（环境采集 + 本地自检 + 可读报告），跑集群前打印，`RAFT_KV_DEMO_QUIET` 可静默。
+- **shardkv（#97）**：`PlanRebalance` 迁移计划纯函数（只读预览/审计，给出 From/To 步骤，与 shardmaster.rebalance 互补），便于配置提交前评估迁移代价、做 dry-run 审计。
+- **util（#98）**：`OnceFlag` 一次性开关（CAS 翻转，Trigger 返回是否本次触发，Done 可观测），用于 shutdown / migration 等「只做一次」护栏，防重复执行破坏性动作。
+- **metrics（#99）**：`Registry.Subsystem` 命名空间前缀（子表共享存储+锁，注册名自动加前缀、可嵌套累加，导出/快照按前缀过滤），单一注册表内按组件（raft / shardkv / gateway）分组命名空间，避免跨组件同名冲突且便于一次性 scrape。
+- **gateway（#100）**：`GatewayConfig.Validate()` 硬校验（接 ValidateConfig 模式：listen_addr 须合法 host:port 且端口 1..65535、超时/并发/体量须为正、限流不矛盾、CIDR 合法），`Apply` 开头调用，结构性错误记 levelError（与既有软告警 levelWarn 区分）。
+
+#101 README 同步本批、**#102 runbook §4 追加决策**、**#103 全量 build+vet+test 验收 + fast-forward 推送**，对应的收尾提交见 git 历史（cycle 29–50 / #83–#103）。
+
 ## 说明
 - 这是面向学习的实验性实现，重点在正确性与可读性，非生产级部署。
 - 持久化、RPC、网络均使用 MIT 6.824 提供的实验脚手架（`persister.go` / `labrpc.go`）。
