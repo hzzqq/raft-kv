@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 type groupStatus struct {
@@ -41,11 +42,18 @@ func main() {
 		fmt.Print(string(data))
 		return
 	}
+	fmt.Print(formatClusterStatus(st))
+}
+
+// formatClusterStatus 把集群状态渲染为人类可读总览字符串（末尾含换行）。
+// 从 main 抽离以便单测；对 nil 切片做归一（显示 [] 而非 <nil>），保证输出稳定可读。
+func formatClusterStatus(st clusterStatus) string {
+	var b strings.Builder
 	health := "HEALTHY"
 	if !st.Healthy {
 		health = "STALLED"
 	}
-	fmt.Printf("cluster: %s  latest_config=%d\n", health, st.MaxConfigNum)
+	fmt.Fprintf(&b, "cluster: %s  latest_config=%d\n", health, st.MaxConfigNum)
 	for _, g := range st.Groups {
 		leader := "none"
 		if g.HasLeader {
@@ -65,7 +73,8 @@ func main() {
 		if g.StallSeconds > 1.0 {
 			stall = fmt.Sprintf("  <-- STALL %.1fs", g.StallSeconds)
 		}
-		fmt.Printf("  group %d leader=%-4s config=%-3d owned=%d pendingIn=%v pendingOut=%v incoming=%v%s\n",
+		fmt.Fprintf(&b, "  group %d leader=%-4s config=%-3d owned=%d pendingIn=%v pendingOut=%v incoming=%v%s\n",
 			g.Group, leader, g.ConfigNum, g.OwnedCount, pi, po, inc, stall)
 	}
+	return b.String()
 }
