@@ -25,6 +25,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -110,6 +111,12 @@ type Server struct {
 	lis      net.Listener
 	quit     chan struct{}
 	closed   bool
+
+	connsActive atomic.Int64
+	rpcs        atomic.Int64
+	bytesSent   atomic.Int64
+	bytesRecv   atomic.Int64
+	errs        atomic.Int64
 }
 
 // NewServer 构造空 Server。
@@ -147,6 +154,8 @@ func (s *Server) Serve(lis net.Listener) error {
 
 func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
+	s.connsActive.Add(1)
+	defer s.connsActive.Add(-1)
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
 	// 每连接一个可取消 context：连接关闭（serveConn 退出）时取消，
@@ -178,10 +187,14 @@ func (s *Server) serveConn(conn net.Conn) {
 			continue
 		}
 		resp, herr := h(connCtx, reqData)
+		s.rpcs.Add(1)
+		s.bytesRecv.Add(int64(len(reqData)))
 		if herr != nil {
+			s.errs.Add(1)
 			_ = writeFrame(w, frameError, []byte(herr.Error()))
 			continue
 		}
+		s.bytesSent.Add(int64(len(resp)))
 		_ = writeFrame(w, frameData, resp)
 	}
 }
@@ -197,6 +210,26 @@ func (s *Server) Stop() {
 	close(s.quit)
 	if s.lis != nil {
 		_ = s.lis.Close()
+	}
+}
+
+// ServerMetrics 是 Server 的观测快照。
+type ServerMetrics struct {
+	ConnsActive int64 // 当前活动连接数
+	RPCs        int64 // 累计 RPC 次数
+	BytesSent   int64 // 累计响应字节
+	BytesRecv   int64 // 累计请求字节
+	Errs        int64 // 累计 handler 错误数
+}
+
+// Metrics 返回服务端累计观测指标（仅供观测/测试）。
+func (s *Server) Metrics() ServerMetrics {
+	return ServerMetrics{
+		ConnsActive: s.connsActive.Load(),
+		RPCs:        s.rpcs.Load(),
+		BytesSent:   s.bytesSent.Load(),
+		BytesRecv:   s.bytesRecv.Load(),
+		Errs:        s.errs.Load(),
 	}
 }
 
@@ -224,6 +257,11 @@ type ClientConn struct {
 	dials  int
 	reused int
 	closed bool
+
+	rpcs      atomic.Int64
+	bytesSent atomic.Int64
+	bytesRecv atomic.Int64
+	errs      atomic.Int64
 }
 
 // Dial 构造到 target 的客户端（不立即建链）。默认开启连接池（maxIdle=4，空闲 30s 回收）。
@@ -248,16 +286,28 @@ func (cc *ClientConn) SetPool(maxIdle int, idleTimeout time.Duration) {
 
 // ClientStats 是 ClientConn 的观测快照。
 type ClientStats struct {
-	Dials  int // 自建链次数
-	Reused int // 复用空闲连接次数
-	Idle   int // 当前空闲连接数
+	Dials     int // 自建链次数
+	Reused    int // 复用空闲连接次数
+	Idle      int // 当前空闲连接数
+	RPCs      int64
+	BytesSent int64
+	BytesRecv int64
+	Errs      int64
 }
 
 // Stats 返回客户端的连接池与调用统计（仅供观测/测试）。
 func (cc *ClientConn) Stats() ClientStats {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
-	return ClientStats{Dials: cc.dials, Reused: cc.reused, Idle: len(cc.idle)}
+	return ClientStats{
+		Dials:     cc.dials,
+		Reused:    cc.reused,
+		Idle:      len(cc.idle),
+		RPCs:      cc.rpcs.Load(),
+		BytesSent: cc.bytesSent.Load(),
+		BytesRecv: cc.bytesRecv.Load(),
+		Errs:      cc.errs.Load(),
+	}
 }
 
 // getConn 取一条可用连接：优先复用空闲池中的健康连接，否则新建。
@@ -318,14 +368,18 @@ func (cc *ClientConn) Close() error {
 // 返回响应体字节。ctx 取消或连接失败时返回错误。连接经池化复用。
 func (cc *ClientConn) Invoke(ctx context.Context, method string, reqData []byte) (respData []byte, err error) {
 	if err := ctx.Err(); err != nil {
+		cc.errs.Add(1)
 		return nil, err
 	}
+	cc.rpcs.Add(1)
 	pc, gerr := cc.getConn()
 	if gerr != nil {
+		cc.errs.Add(1)
 		return nil, gerr
 	}
 	defer func() {
 		if err != nil {
+			cc.errs.Add(1)
 			pc.conn.Close() // 出错的连接不再复用，避免半写状态污染池
 		} else {
 			cc.putConn(pc)
@@ -350,6 +404,7 @@ func (cc *ClientConn) Invoke(ctx context.Context, method string, reqData []byte)
 		}
 	}()
 	r, w := pc.r, pc.w
+	cc.bytesSent.Add(int64(len(method) + len(reqData)))
 	if err = writeFrame(w, frameData, []byte(method)); err != nil {
 		return nil, err
 	}
@@ -365,6 +420,7 @@ func (cc *ClientConn) Invoke(ctx context.Context, method string, reqData []byte)
 	if typ == frameError {
 		return nil, errors.New(string(resp))
 	}
+	cc.bytesRecv.Add(int64(len(resp)))
 	return resp, nil
 }
 
