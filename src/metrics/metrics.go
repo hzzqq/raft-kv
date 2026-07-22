@@ -164,16 +164,18 @@ func percentile(s []float64, q float64) float64 {
 
 // Registry 聚合一组命名计数器与直方图，对应一个组件的可观测性指标。
 type Registry struct {
-	mu         sync.Mutex
+	mu         *sync.Mutex
 	counters   map[string]*Counter
 	histograms map[string]*Histogram
 	gauges     map[string]*Gauge
 	descs      map[string]string // 指标 HELP 描述（Prometheus 规范推荐）
+	prefix     string            // 非空表示该表是某父表的子系统，所有名字加此前缀
 }
 
 // NewRegistry 创建一个空的指标注册表。
 func NewRegistry() *Registry {
 	return &Registry{
+		mu:         &sync.Mutex{},
 		counters:   map[string]*Counter{},
 		histograms: map[string]*Histogram{},
 		gauges:     map[string]*Gauge{},
@@ -181,8 +183,30 @@ func NewRegistry() *Registry {
 	}
 }
 
+// Subsystem 返回以 name 为前缀的子注册表，与父共享底层存储与锁。
+// 在子表上注册的指标名自动加 "name_" 前缀，导出（Snapshot/WritePrometheus）时
+// 以父表为真相源——便于按组件（raft / shardkv / gateway）分组命名空间，避免跨组件
+// 同名指标冲突，且保持单一注册表便于一次性 scrape。子表可再嵌套（前缀累加）。
+// 注意：子表与父表共享同一组 map，Reset() 对子表仅清除其前缀下的指标，不影响父表其余指标。
+func (r *Registry) Subsystem(name string) *Registry {
+	return &Registry{
+		mu:         r.mu,
+		counters:   r.counters,
+		histograms: r.histograms,
+		gauges:     r.gauges,
+		descs:      r.descs,
+		prefix:     r.prefix + name + "_",
+	}
+}
+
+// name 返回带本表前缀的指标名（子系统下自动加前缀，根表原样返回）。
+func (r *Registry) name(raw string) string {
+	return r.prefix + raw
+}
+
 // Counter 取得（不存在则创建）命名计数器。
 func (r *Registry) Counter(name string) *Counter {
+	name = r.name(name)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if c, ok := r.counters[name]; ok {
@@ -195,6 +219,7 @@ func (r *Registry) Counter(name string) *Counter {
 
 // Histogram 取得（不存在则创建）命名直方图。
 func (r *Registry) Histogram(name string) *Histogram {
+	name = r.name(name)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if h, ok := r.histograms[name]; ok {
@@ -207,6 +232,7 @@ func (r *Registry) Histogram(name string) *Histogram {
 
 // Gauge 取得（不存在则创建）命名瞬时值指标。
 func (r *Registry) Gauge(name string) *Gauge {
+	name = r.name(name)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if g, ok := r.gauges[name]; ok {
@@ -239,10 +265,11 @@ func (r *Registry) HistWithHelp(name, help string) *Histogram {
 }
 
 // setDesc 登记指标的 HELP 描述（多行归一成单行，避免破坏 exposition）。
+// 与注册方法一致加本表前缀，保证描述键与指标序列名（可能带 subsystem 前缀）对齐。
 func (r *Registry) setDesc(name, help string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.descs[name] = strings.ReplaceAll(help, "\n", " ")
+	r.descs[r.name(name)] = strings.ReplaceAll(help, "\n", " ")
 }
 
 // desc 返回指标描述（无则空串）。调用方须在 Snapshot 释放锁后调用。
@@ -261,20 +288,27 @@ func (r *Registry) helpLine(name, sn string) string {
 }
 
 // Snapshot 返回 JSON 友好结构：{"counters": {...}, "histograms": {...}}。
+// 子系统表仅返回其前缀下的指标（键保留前缀，作为完整序列名）。
 func (r *Registry) Snapshot() map[string]interface{} {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	counters := make(map[string]int64, len(r.counters))
 	for k, v := range r.counters {
-		counters[k] = v.Value()
+		if r.prefix == "" || strings.HasPrefix(k, r.prefix) {
+			counters[k] = v.Value()
+		}
 	}
 	hists := make(map[string]HistSnapshot, len(r.histograms))
 	for k, v := range r.histograms {
-		hists[k] = v.Snapshot()
+		if r.prefix == "" || strings.HasPrefix(k, r.prefix) {
+			hists[k] = v.Snapshot()
+		}
 	}
 	gauges := make(map[string]float64, len(r.gauges))
 	for k, v := range r.gauges {
-		gauges[k] = v.Value()
+		if r.prefix == "" || strings.HasPrefix(k, r.prefix) {
+			gauges[k] = v.Value()
+		}
 	}
 	return map[string]interface{}{
 		"counters":   counters,
@@ -283,14 +317,38 @@ func (r *Registry) Snapshot() map[string]interface{} {
 	}
 }
 
-// Reset 清空所有计数器与直方图，供独立运行间重置，避免进程级指标跨用例累积。
+// Reset 清空计数器与直方图。根表清空全部；子系统表仅清除其前缀下的指标，
+// 不影响父表其余指标（因共享同一组 map，逐键删除而非重建 map）。
 func (r *Registry) Reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.counters = map[string]*Counter{}
-	r.histograms = map[string]*Histogram{}
-	r.gauges = map[string]*Gauge{}
-	r.descs = map[string]string{}
+	if r.prefix == "" {
+		r.counters = map[string]*Counter{}
+		r.histograms = map[string]*Histogram{}
+		r.gauges = map[string]*Gauge{}
+		r.descs = map[string]string{}
+		return
+	}
+	for k := range r.counters {
+		if strings.HasPrefix(k, r.prefix) {
+			delete(r.counters, k)
+		}
+	}
+	for k := range r.histograms {
+		if strings.HasPrefix(k, r.prefix) {
+			delete(r.histograms, k)
+		}
+	}
+	for k := range r.gauges {
+		if strings.HasPrefix(k, r.prefix) {
+			delete(r.gauges, k)
+		}
+	}
+	for k := range r.descs {
+		if strings.HasPrefix(k, r.prefix) {
+			delete(r.descs, k)
+		}
+	}
 }
 
 // DumpJSON 把当前快照序列化为 JSON 字节，便于网关 / 演示程序直接输出。
