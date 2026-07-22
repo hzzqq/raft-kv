@@ -149,6 +149,10 @@ func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
+	// 每连接一个可取消 context：连接关闭（serveConn 退出）时取消，
+	// handler 可借 connCtx.Done() 感知对端断开并及早中止，避免空转。
+	connCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	for {
 		// 方法名帧
 		typ, method, err := readFrame(r)
@@ -173,7 +177,7 @@ func (s *Server) serveConn(conn net.Conn) {
 			_ = writeFrame(w, frameError, []byte(ErrMethodNotFound.Error()))
 			continue
 		}
-		resp, herr := h(context.Background(), reqData)
+		resp, herr := h(connCtx, reqData)
 		if herr != nil {
 			_ = writeFrame(w, frameError, []byte(herr.Error()))
 			continue
@@ -325,6 +329,24 @@ func (cc *ClientConn) Invoke(ctx context.Context, method string, reqData []byte)
 			pc.conn.Close() // 出错的连接不再复用，避免半写状态污染池
 		} else {
 			cc.putConn(pc)
+		}
+	}()
+	// ctx 截止时间传播到 TCP 连接：超时即中断在途读写，且不污染复用连接。
+	if dl, ok := ctx.Deadline(); ok {
+		if err = pc.conn.SetDeadline(dl); err != nil {
+			return nil, err
+		}
+	} else {
+		pc.conn.SetDeadline(time.Time{}) // 清除既往 deadline
+	}
+	// ctx 被主动取消（无 deadline）时关闭连接在途读写，尽快让 readFrame 返回。
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = pc.conn.Close()
+		case <-done:
 		}
 	}()
 	r, w := pc.r, pc.w
