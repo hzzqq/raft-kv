@@ -1,9 +1,10 @@
 // main.go —— kvcli 命令行入口
 //
 // 用法：
-//   kvcli [-addr http://localhost:8080] get KEY
-//   kvcli [-addr http://localhost:8080] put KEY VALUE
-//   kvcli [-addr http://localhost:8080] append KEY VALUE
+//
+//	kvcli [-addr http://localhost:8080] get KEY
+//	kvcli [-addr http://localhost:8080] put KEY VALUE
+//	kvcli [-addr http://localhost:8080] append KEY VALUE
 package main
 
 import (

@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,11 +36,21 @@ type BenchResult struct {
 	Errors    int
 }
 
+// defaultBenchTimeout 是 Bench 的整体墙钟上限，防止后端挂死时压测无限拖尾。
+const defaultBenchTimeout = 30 * time.Second
+
 // Bench 启动 workers 个并发客户端，共执行 ops 次指定类型的操作
 // （op 为 "get" / "put" / "mixed"），测量端到端吞吐与延迟分位数（毫秒）。
 // 每个 worker 操作自己独立的 key 命名空间，保证 mixed/get 下读到的都是本 worker
 // 写入的数据（不会被并发改写而读到空 / 陈旧值）。
+// 整体受 defaultBenchTimeout 墙钟约束；超时后所有在途请求被取消、本轮提前结束。
 func (c *Client) Bench(ops, workers int, op string, valueSize int) BenchResult {
+	return c.BenchWithTimeout(ops, workers, op, valueSize, defaultBenchTimeout)
+}
+
+// BenchWithTimeout 同 Bench，但允许调用方指定整体墙钟超时。超时后本轮提前结束，
+// 已完成的操作仍计入统计，在途请求因 ctx 取消而计入 Errors。
+func (c *Client) BenchWithTimeout(ops, workers int, op string, valueSize int, timeout time.Duration) BenchResult {
 	if workers < 1 {
 		workers = 1
 	}
@@ -47,6 +58,9 @@ func (c *Client) Bench(ops, workers int, op string, valueSize int) BenchResult {
 		ops = 1
 	}
 	value := strings.Repeat("x", valueSize)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	perWorker := make([]int, workers)
 	for i := 0; i < workers; i++ {
 		perWorker[i] = ops / workers
@@ -57,7 +71,7 @@ func (c *Client) Bench(ops, workers int, op string, valueSize int) BenchResult {
 
 	// 预热：为每个 worker 的 0 号 key 预写初值，保证 get/mixed 能读到数据。
 	for w := 0; w < workers; w++ {
-		_ = c.Put(fmt.Sprintf("bench-%d-0", w), value)
+		_ = c.putCtx(ctx, fmt.Sprintf("bench-%d-0", w), value)
 	}
 
 	var mu sync.Mutex
@@ -76,12 +90,12 @@ func (c *Client) Bench(ops, workers int, op string, valueSize int) BenchResult {
 				var err error
 				switch op {
 				case "get":
-					_, err = c.Get(key)
+					_, err = c.getCtx(ctx, key)
 				case "put":
-					err = c.Put(key, value)
+					err = c.putCtx(ctx, key, value)
 				default: // mixed
-					if err = c.Put(key, value); err == nil {
-						_, err = c.Get(key)
+					if err = c.putCtx(ctx, key, value); err == nil {
+						_, err = c.getCtx(ctx, key)
 					}
 				}
 				local = append(local, float64(time.Since(t0).Microseconds())/1000.0)
@@ -114,7 +128,7 @@ func percentile(s []float64, q float64) float64 {
 	if len(s) == 0 {
 		return 0
 	}
-	idx := int(float64(q) * float64(len(s)-1) + 0.5)
+	idx := int(float64(q)*float64(len(s)-1) + 0.5)
 	if idx < 0 {
 		idx = 0
 	}
@@ -132,23 +146,50 @@ func NewClient(base string) *Client {
 	}
 }
 
-// Get 读取 key 的当前值。网关返回非 200 时返回错误（而非静默返回空串）。
+// maxErrBody 是错误响应体在错误信息中保留的最大字节数，避免把巨大响应体塞进 error。
+const maxErrBody = 256
+
+// respErr 把一次失败的 HTTP 响应构造成带上下文的 error：包含方法、key、状态码，
+// 以及（截断后的）响应体。网关返回的业务错误（如 "key not found"）原本会被
+// 静默丢弃，导致排障时无据可查——这里把它显式带出来。
+func respErr(method, key string, resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrBody))
+	msg := strings.TrimSpace(string(body))
+	if msg == "" {
+		msg = "(no body)"
+	}
+	return fmt.Errorf("%s /kv/%s: status %d: %s", method, key, resp.StatusCode, msg)
+}
+
+// Get 读取 key 的当前值。网关返回非 200 时返回错误（含响应体），而非静默返回空串。
 func (c *Client) Get(key string) (string, error) {
-	resp, err := c.http.Get(c.base + "/kv/" + url.PathEscape(key))
+	return c.getCtx(context.Background(), key)
+}
+
+func (c *Client) getCtx(ctx context.Context, key string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/kv/"+url.PathEscape(key), nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("GET /kv/%s: status %d", key, resp.StatusCode)
+		return "", respErr("GET", key, resp)
 	}
+	b, _ := io.ReadAll(resp.Body)
 	return string(b), nil
 }
 
-// Put 写入 key = value。网关返回非 200 时返回错误。
+// Put 写入 key = value。网关返回非 200 时返回错误（含响应体）。
 func (c *Client) Put(key, value string) error {
-	req, err := http.NewRequest(http.MethodPut, c.base+"/kv/"+url.PathEscape(key), strings.NewReader(value))
+	return c.putCtx(context.Background(), key, value)
+}
+
+func (c *Client) putCtx(ctx context.Context, key, value string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.base+"/kv/"+url.PathEscape(key), strings.NewReader(value))
 	if err != nil {
 		return err
 	}
@@ -156,22 +197,30 @@ func (c *Client) Put(key, value string) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("PUT /kv/%s: status %d", key, resp.StatusCode)
+		return respErr("PUT", key, resp)
 	}
 	return nil
 }
 
-// Append 把 value 追加到 key 的当前值之后。网关返回非 200 时返回错误。
+// Append 把 value 追加到 key 的当前值之后。网关返回非 200 时返回错误（含响应体）。
 func (c *Client) Append(key, value string) error {
-	resp, err := c.http.Post(c.base+"/kv/"+url.PathEscape(key)+"/append", "text/plain", strings.NewReader(value))
+	return c.appendCtx(context.Background(), key, value)
+}
+
+func (c *Client) appendCtx(ctx context.Context, key, value string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/kv/"+url.PathEscape(key)+"/append", strings.NewReader(value))
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("POST /kv/%s/append: status %d", key, resp.StatusCode)
+		return respErr("POST", key, resp)
 	}
 	return nil
 }
