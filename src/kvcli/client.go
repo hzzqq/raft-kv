@@ -38,6 +38,12 @@ type Client struct {
 	// 单飞：启用后并发同 key 回源只打一次后端（防缓存击穿）。默认 nil = 关闭。
 	sfOnce sync.Once
 	sf     *util.Group
+
+	// 缓存可观测性计数器（原子自增，并发安全），经 CacheStats() 暴露。
+	hitC       int64
+	missC      int64
+	coalescedC int64
+	negC       int64
 }
 
 // cacheEntry 是单条缓存值及其绝对过期时刻。
@@ -307,17 +313,25 @@ func (c *Client) getCtx(ctx context.Context, key string) (string, error) {
 		c.cacheMu.Lock()
 		if e, ok := c.cache[key]; ok && time.Now().Before(e.exp) {
 			c.cacheMu.Unlock()
+			atomic.AddInt64(&c.hitC, 1)
+			if e.val == "" {
+				atomic.AddInt64(&c.negC, 1) // 命中空值 = 穿透已被缓解的负向结果
+			}
 			return e.val, nil
 		}
 		c.cacheMu.Unlock()
+		atomic.AddInt64(&c.missC, 1) // 缓存未命中，将回源
 	}
 	// 回源：若开启单飞，并发同 key 只回源一次（防缓存击穿）；否则直接回源。
 	var s string
 	var err error
 	if c.sf != nil {
-		v, ferr, _ := c.sf.Do(key, func() (interface{}, error) {
+		v, ferr, called := c.sf.Do(key, func() (interface{}, error) {
 			return c.fetchGet(ctx, key)
 		})
+		if !called {
+			atomic.AddInt64(&c.coalescedC, 1) // 并发同 key 被单飞合并，复用他人回源
+		}
 		if ferr == nil {
 			s = v.(string)
 		}
@@ -333,6 +347,24 @@ func (c *Client) getCtx(ctx context.Context, key string) (string, error) {
 		c.storeCache(key, s)
 	}
 	return s, nil
+}
+
+// CacheStats 汇总客户端缓存层的可观测指标（并发原子计数快照）。
+type CacheStats struct {
+	Hits      int64 // 缓存命中（含负向空值命中）
+	Misses    int64 // 缓存未命中、已回源
+	Coalesced int64 // 单飞合并：并发同 key 复用他人回源
+	Negative  int64 // 命中的空值条目数（穿透已被缓解的信号）
+}
+
+// CacheStats 返回当前缓存计数器快照，便于接入外部 metrics 或排障。
+func (c *Client) CacheStats() CacheStats {
+	return CacheStats{
+		Hits:      atomic.LoadInt64(&c.hitC),
+		Misses:    atomic.LoadInt64(&c.missC),
+		Coalesced: atomic.LoadInt64(&c.coalescedC),
+		Negative:  atomic.LoadInt64(&c.negC),
+	}
 }
 
 // Put 写入 key = value。网关返回非 200 时返回错误（含响应体）。
