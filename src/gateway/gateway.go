@@ -87,6 +87,10 @@ type Server struct {
 	// I55：响应 gzip 压缩开关。开启且客户端 Accept-Encoding 含 gzip 时，对响应体压缩
 	// （省带宽）；同时写 Vary: Accept-Encoding 避免共享缓存按错误编码缓存。默认开启。
 	compress bool
+
+	// I56：安全响应头开关。开启时 wrap 注入 X-Content-Type-Options / X-Frame-Options /
+	// Referrer-Policy 等基线安全头，缓解 MIME 嗅探 / 点击劫持 / 引用泄露。默认开启。
+	secHeaders bool
 }
 
 // tokenBucket 是单客户端的令牌桶：按时间补充令牌，桶满截断；取用时需至少 1 枚令牌。
@@ -122,6 +126,9 @@ func (s *Server) SetMaxBodySize(n int64) { s.maxBodySize = n }
 // SetCompress 配置是否对响应启用 gzip 压缩（生产可用）。仅当客户端 Accept-Encoding
 // 含 gzip 时压缩，并自动加 Vary: Accept-Encoding。
 func (s *Server) SetCompress(on bool) { s.compress = on }
+
+// SetSecurityHeaders 配置是否注入基线安全响应头（生产可用）。默认开启。
+func (s *Server) SetSecurityHeaders(on bool) { s.secHeaders = on }
 
 // SetClientRateLimit 配置每客户端令牌桶限流（生产可用）：rps 为每客户端每秒补充
 // 令牌数，burst 为桶容量（允许的最大突发请求数）。rps<=0 表示关闭限流。
@@ -263,7 +270,7 @@ func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 
 // NewServer 用给定集群构造网关（不立即加入 group，需先 Init）。
 func NewServer(c *cluster.Cluster) *Server {
-	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20, compress: true}
+	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20, compress: true, secHeaders: true}
 }
 
 // logLevel 是结构化日志级别，数值越大越严重。
@@ -385,6 +392,13 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			reqID = genRequestID()
 		}
 		w.Header().Set("X-Request-ID", reqID)
+		// I56：基线安全响应头（默认开启）。缓解 MIME 嗅探 / 点击劫持 / 引用泄露。
+		// 在 wrap 统一注入，所有路由自动受益，无需逐个 handler 重复。
+		if s.secHeaders {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("X-Frame-Options", "DENY")
+			w.Header().Set("Referrer-Policy", "no-referrer")
+		}
 		// I54：请求体大小上限。已知 Content-Length 超阈值直接 413 拒绝；并对 body 套
 		// MaxBytesReader 兜底（覆盖 chunked / 流式超发），避免超大 body 打爆内存或后端。
 		if s.maxBodySize > 0 {
@@ -557,14 +571,15 @@ func parseLogLevel(s string) (logLevel, bool) {
 
 // ConfigSnapshot 是 /debug/config 的响应体：当前生效的网关配置（脱敏，无敏感字段）。
 type ConfigSnapshot struct {
-	ListenAddr     string   `json:"listen_addr"`
-	RequestTimeout int      `json:"request_timeout_sec"`
-	MaxConcurrent  int      `json:"max_concurrent"`
-	ClientRate     float64  `json:"client_rate"`
-	ClientBurst    int      `json:"client_burst"`
-	CORSOrigins    []string `json:"cors_origins"`
-	MaxBodySize    int64    `json:"max_body_size"`
-	Compress       bool     `json:"compress"`
+	ListenAddr      string   `json:"listen_addr"`
+	RequestTimeout  int      `json:"request_timeout_sec"`
+	MaxConcurrent   int      `json:"max_concurrent"`
+	ClientRate      float64  `json:"client_rate"`
+	ClientBurst     int      `json:"client_burst"`
+	CORSOrigins     []string `json:"cors_origins"`
+	MaxBodySize     int64    `json:"max_body_size"`
+	Compress        bool     `json:"compress"`
+	SecurityHeaders bool     `json:"security_headers"`
 }
 
 // handleDebugConfig 返回网关当前生效配置快照（I52），便于排障确认配置加载结果。
@@ -572,14 +587,15 @@ type ConfigSnapshot struct {
 func (s *Server) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
 	c := s.curCfg
 	snap := ConfigSnapshot{
-		ListenAddr:     c.ListenAddr,
-		RequestTimeout: c.RequestTimeout,
-		MaxConcurrent:  c.MaxConcurrent,
-		ClientRate:     c.ClientRate,
-		ClientBurst:    c.ClientBurst,
-		CORSOrigins:    c.CORSOrigins,
-		MaxBodySize:    int64(c.MaxBodySize),
-		Compress:       c.Compress,
+		ListenAddr:      c.ListenAddr,
+		RequestTimeout:  c.RequestTimeout,
+		MaxConcurrent:   c.MaxConcurrent,
+		ClientRate:      c.ClientRate,
+		ClientBurst:     c.ClientBurst,
+		CORSOrigins:     c.CORSOrigins,
+		MaxBodySize:     int64(c.MaxBodySize),
+		Compress:        c.Compress,
+		SecurityHeaders: c.SecurityHeaders,
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

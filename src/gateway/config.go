@@ -14,27 +14,29 @@ import (
 // （ParseGatewayConfig），仅支持本项目所需的 top-level `key: value` 与 `[a, b]` 列表；
 // 生产环境建议改用 gopkg.in/yaml.v3 等成熟库，这里以自包含换取可构建性。
 type GatewayConfig struct {
-	ListenAddr     string   `yaml:"listen_addr"`
-	RequestTimeout int      `yaml:"request_timeout_sec"`
-	MaxConcurrent  int      `yaml:"max_concurrent"`
-	ClientRate     float64  `yaml:"client_rate"`
-	ClientBurst    int      `yaml:"client_burst"`
-	CORSOrigins    []string `yaml:"cors_origins"`
-	MaxBodySize    int      `yaml:"max_body_size"`
-	Compress       bool     `yaml:"compress"`
+	ListenAddr      string   `yaml:"listen_addr"`
+	RequestTimeout  int      `yaml:"request_timeout_sec"`
+	MaxConcurrent   int      `yaml:"max_concurrent"`
+	ClientRate      float64  `yaml:"client_rate"`
+	ClientBurst     int      `yaml:"client_burst"`
+	CORSOrigins     []string `yaml:"cors_origins"`
+	MaxBodySize     int      `yaml:"max_body_size"`
+	Compress        bool     `yaml:"compress"`
+	SecurityHeaders bool     `yaml:"security_headers"`
 }
 
 // DefaultGatewayConfig 返回代码内默认值。
 func DefaultGatewayConfig() GatewayConfig {
 	return GatewayConfig{
-		ListenAddr:     ":8080",
-		RequestTimeout: 30,
-		MaxConcurrent:  64,
-		ClientRate:     200,
-		ClientBurst:    40,
-		CORSOrigins:    nil,
-		MaxBodySize:    1 << 20,
-		Compress:       true,
+		ListenAddr:      ":8080",
+		RequestTimeout:  30,
+		MaxConcurrent:   64,
+		ClientRate:      200,
+		ClientBurst:     40,
+		CORSOrigins:     nil,
+		MaxBodySize:     1 << 20,
+		Compress:        true,
+		SecurityHeaders: true,
 	}
 }
 
@@ -82,6 +84,8 @@ func ParseGatewayConfig(data []byte) (GatewayConfig, error) {
 			}
 		case "compress":
 			cfg.Compress = (val == "true" || val == "1" || val == "yes")
+		case "security_headers":
+			cfg.SecurityHeaders = (val == "true" || val == "1" || val == "yes")
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -136,6 +140,7 @@ func (c GatewayConfig) Apply(s *Server) {
 		s.maxBodySize = int64(c.MaxBodySize)
 	}
 	s.compress = c.Compress
+	s.secHeaders = c.SecurityHeaders
 	if c.ClientBurst > 0 {
 		s.SetClientRateLimit(c.ClientRate, c.ClientBurst)
 	}

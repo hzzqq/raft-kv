@@ -1086,3 +1086,30 @@ func TestGatewayCompress(t *testing.T) {
 		t.Fatalf("uncompressed body mismatch (len=%d)", len(b2))
 	}
 }
+
+// TestGatewaySecurityHeaders：验证基线安全响应头（I56）。cluster-free 套 wrap +
+// no-op handler，断言响应带 X-Content-Type-Options / X-Frame-Options / Referrer-Policy。
+func TestGatewaySecurityHeaders(t *testing.T) {
+	s := &Server{
+		sem:            make(chan struct{}, maxConcurrent),
+		accessCap:      256,
+		logCap:         256,
+		requestTimeout: 30 * time.Second,
+		secHeaders:     true,
+	}
+	inner := func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }
+	h := s.wrap(inner)
+	ts := httptest.NewServer(http.HandlerFunc(h))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	for _, h := range []string{"X-Content-Type-Options", "X-Frame-Options", "Referrer-Policy"} {
+		if resp.Header.Get(h) == "" {
+			t.Fatalf("security header %s missing", h)
+		}
+	}
+}
