@@ -77,6 +77,11 @@ type Server struct {
 
 	// I52：当前生效配置快照（由 Apply 写入），供 /debug/config 展示排障。
 	curCfg GatewayConfig
+
+	// I54：单请求最大请求体字节数（防御超大 body 打爆内存/后端）。>0 时 wrap 对
+	// 已知 Content-Length 直接 413 拒绝，并对 body 套 MaxBytesReader 兜底（含 chunked）。
+	// 默认 1MB（与历史 handler 内 1<<20 限额一致），可由配置 max_body_size 覆盖。
+	maxBodySize int64
 }
 
 // tokenBucket 是单客户端的令牌桶：按时间补充令牌，桶满截断；取用时需至少 1 枚令牌。
@@ -104,6 +109,10 @@ func (b *tokenBucket) allow(now time.Time) bool {
 
 // SetRequestTimeout 仅供单测覆盖默认单请求超时（生产不可用）。
 func (s *Server) SetRequestTimeout(d time.Duration) { s.requestTimeout = d }
+
+// SetMaxBodySize 配置单请求最大请求体字节数（生产可用）。<=0 表示不限制。
+// 经 wrap 的 413 拒绝 + MaxBytesReader 兜底生效。
+func (s *Server) SetMaxBodySize(n int64) { s.maxBodySize = n }
 
 // SetClientRateLimit 配置每客户端令牌桶限流（生产可用）：rps 为每客户端每秒补充
 // 令牌数，burst 为桶容量（允许的最大突发请求数）。rps<=0 表示关闭限流。
@@ -236,7 +245,7 @@ func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 
 // NewServer 用给定集群构造网关（不立即加入 group，需先 Init）。
 func NewServer(c *cluster.Cluster) *Server {
-	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40}
+	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20}
 }
 
 // logLevel 是结构化日志级别，数值越大越严重。
@@ -358,6 +367,18 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			reqID = genRequestID()
 		}
 		w.Header().Set("X-Request-ID", reqID)
+		// I54：请求体大小上限。已知 Content-Length 超阈值直接 413 拒绝；并对 body 套
+		// MaxBytesReader 兜底（覆盖 chunked / 流式超发），避免超大 body 打爆内存或后端。
+		if s.maxBodySize > 0 {
+			if r.ContentLength > s.maxBodySize {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				io.WriteString(w, `{"error":"request body too large","code":413}`)
+				s.logf(levelWarn, "request body too large", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, s.maxBodySize)
+		}
 		// 每客户端令牌桶限流（I49）：超限直接 429 + Retry-After，不进入并发信号量。
 		if !s.allowClient(r) {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -514,6 +535,7 @@ type ConfigSnapshot struct {
 	ClientRate     float64  `json:"client_rate"`
 	ClientBurst    int      `json:"client_burst"`
 	CORSOrigins    []string `json:"cors_origins"`
+	MaxBodySize    int64    `json:"max_body_size"`
 }
 
 // handleDebugConfig 返回网关当前生效配置快照（I52），便于排障确认配置加载结果。
@@ -527,6 +549,7 @@ func (s *Server) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
 		ClientRate:     c.ClientRate,
 		ClientBurst:    c.ClientBurst,
 		CORSOrigins:    c.CORSOrigins,
+		MaxBodySize:    int64(c.MaxBodySize),
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -833,7 +856,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	val, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	val, _ := io.ReadAll(io.LimitReader(r.Body, s.maxBodySize))
 	if err := s.clerk.PutE(key, string(val)); err != shardkv.OK {
 		http.Error(w, string(err), statusForErr(err))
 		return
@@ -843,7 +866,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	val, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	val, _ := io.ReadAll(io.LimitReader(r.Body, s.maxBodySize))
 	if err := s.clerk.AppendE(key, string(val)); err != shardkv.OK {
 		http.Error(w, string(err), statusForErr(err))
 		return

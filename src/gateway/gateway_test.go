@@ -955,6 +955,7 @@ func TestGatewayDebugConfig(t *testing.T) {
 		ClientRate:     50,
 		ClientBurst:    10,
 		CORSOrigins:    []string{"https://a.com"},
+		MaxBodySize:    2097152,
 	}
 	cfg.Apply(s)
 
@@ -977,7 +978,56 @@ func TestGatewayDebugConfig(t *testing.T) {
 		t.Fatalf("body not valid JSON: %v (body=%s)", err, string(b))
 	}
 	if snap.ListenAddr != ":9090" || snap.RequestTimeout != 15 || snap.MaxConcurrent != 32 ||
-		snap.ClientRate != 50 || snap.ClientBurst != 10 || len(snap.CORSOrigins) != 1 || snap.CORSOrigins[0] != "https://a.com" {
+		snap.ClientRate != 50 || snap.ClientBurst != 10 || snap.MaxBodySize != 2097152 ||
+		len(snap.CORSOrigins) != 1 || snap.CORSOrigins[0] != "https://a.com" {
 		t.Fatalf("config snapshot mismatch: %+v", snap)
+	}
+}
+
+// TestGatewayMaxBodySize：验证请求体上限（I54）。cluster-free 直接构造 Server，
+// 用 httptest 套 wrap 中间件（内部 no-op handler，不依赖真实 clerk/集群），已知
+// Content-Length 超过 maxBodySize 必须返回 413，未超限则正常放行。
+func TestGatewayMaxBodySize(t *testing.T) {
+	s := &Server{
+		sem:            make(chan struct{}, maxConcurrent),
+		accessCap:      256,
+		logCap:         256,
+		requestTimeout: 30 * time.Second,
+	}
+	s.SetMaxBodySize(16) // 限制 16 字节
+	inner := func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }
+	h := s.wrap(inner)
+
+	ts := httptest.NewServer(http.HandlerFunc(h))
+	defer ts.Close()
+
+	// 超过上限：Content-Length=32 > 16 -> 期望 413
+	big := strings.Repeat("x", 32)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/x", strings.NewReader(big))
+	req.ContentLength = int64(len(big))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body status = %d, want 413", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 未超限：8 <= 16 -> 期望 200 且内部 handler 正常执行（body="ok"）
+	small := strings.Repeat("y", 8)
+	req2, _ := http.NewRequest(http.MethodPut, ts.URL+"/x", strings.NewReader(small))
+	req2.ContentLength = int64(len(small))
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("small body status = %d, want 200", resp2.StatusCode)
+	}
+	b, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if string(b) != "ok" {
+		t.Fatalf("small body inner handler output = %q, want ok", string(b))
 	}
 }

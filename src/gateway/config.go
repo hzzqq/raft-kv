@@ -20,6 +20,7 @@ type GatewayConfig struct {
 	ClientRate     float64  `yaml:"client_rate"`
 	ClientBurst    int      `yaml:"client_burst"`
 	CORSOrigins    []string `yaml:"cors_origins"`
+	MaxBodySize    int      `yaml:"max_body_size"`
 }
 
 // DefaultGatewayConfig 返回代码内默认值。
@@ -31,6 +32,7 @@ func DefaultGatewayConfig() GatewayConfig {
 		ClientRate:     200,
 		ClientBurst:    40,
 		CORSOrigins:    nil,
+		MaxBodySize:    1 << 20,
 	}
 }
 
@@ -72,6 +74,10 @@ func ParseGatewayConfig(data []byte) (GatewayConfig, error) {
 			}
 		case "cors_origins":
 			cfg.CORSOrigins = parseList(val)
+		case "max_body_size":
+			if n, err := strconv.Atoi(val); err == nil {
+				cfg.MaxBodySize = n
+			}
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -121,6 +127,9 @@ func (c GatewayConfig) Apply(s *Server) {
 	}
 	if c.MaxConcurrent > 0 {
 		s.sem = make(chan struct{}, c.MaxConcurrent)
+	}
+	if c.MaxBodySize > 0 {
+		s.maxBodySize = int64(c.MaxBodySize)
 	}
 	if c.ClientBurst > 0 {
 		s.SetClientRateLimit(c.ClientRate, c.ClientBurst)
