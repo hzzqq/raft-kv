@@ -197,6 +197,8 @@ func (s *Server) observeBackend(status int) {
 		if !s.breakerOpen && s.breakerErrs >= s.breakerThreshold {
 			s.breakerOpen = true
 			s.breakerOpenAt = time.Now()
+			Metrics.Counter("gateway_breaker_trips_total").Inc()
+			Metrics.Gauge("gateway_breaker_open").Set(1)
 			s.logf(levelWarn, "circuit breaker opened", map[string]string{"consecutive_errors": strconv.Itoa(s.breakerErrs)})
 		}
 		return
@@ -207,6 +209,7 @@ func (s *Server) observeBackend(status int) {
 	}
 	if s.breakerOpen {
 		s.breakerOpen = false
+		Metrics.Gauge("gateway_breaker_open").Set(0)
 		s.logf(levelInfo, "circuit breaker closed (recovered)", nil)
 	}
 }
@@ -593,6 +596,7 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			io.WriteString(w, `{"error":"circuit breaker open","code":503}`)
+			Metrics.Counter("gateway_breaker_rejects_total").Inc()
 			s.logf(levelWarn, "circuit breaker reject (open)", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
 			return
 		}
@@ -614,6 +618,7 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
 			io.WriteString(w, `{"error":"client rate limit exceeded","code":429}`)
+			Metrics.Counter("gateway_ratelimit_client_total").Inc()
 			s.logf(levelWarn, "client rate limit exceeded", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
 			return
 		}
@@ -623,6 +628,7 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
 			io.WriteString(w, `{"error":"route rate limit exceeded","code":429}`)
+			Metrics.Counter("gateway_ratelimit_route_total").Inc()
 			s.logf(levelWarn, "route rate limit exceeded", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
 			return
 		}
@@ -636,6 +642,7 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusTooManyRequests)
 			io.WriteString(w, `{"error":"too many concurrent requests","code":429}`)
+			Metrics.Counter("gateway_ratelimit_concurrent_total").Inc()
 			s.logf(levelWarn, "concurrency limit exceeded", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
 			record(http.StatusTooManyRequests, time.Since(start))
 			return
@@ -681,6 +688,10 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		s.observeBackend(st)
 	}
 }
+
+// Wrap 暴露限流/熔断中间件（包内 wrap 的导出封装），供测试在不依赖内存集群的情况下
+// 注入 stub handler 验证限流/熔断行为（含本文件要求的 cluster-free 测试路径）。
+func (s *Server) Wrap(h http.HandlerFunc) http.HandlerFunc { return s.wrap(h) }
 
 // recordAccess 把一条请求记录追加到访问日志环形缓冲（超出容量则丢弃最旧）。
 func (s *Server) recordAccess(method, path string, status int, d time.Duration, reqID string) {
