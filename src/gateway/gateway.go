@@ -97,6 +97,10 @@ type Server struct {
 	// 为空表示不限制。用于网关仅对内网/特定来源开放的场景。
 	ipAllowMu sync.Mutex
 	ipAllow   []*net.IPNet
+
+	// I58：已注册路由清单（在 Handler() 中填充），供 /debug/routes 暴露，便于确认路由面。
+	routeMu sync.Mutex
+	routes  []string
 }
 
 // tokenBucket 是单客户端的令牌桶：按时间补充令牌，桶满截断；取用时需至少 1 枚令牌。
@@ -396,39 +400,50 @@ func (s *Server) Init(nGroups int) {
 	}
 }
 
-// Handler 返回 HTTP 路由（Go 1.22 的 method+path 模式）。
+// Handler 返回 HTTP 路由（Go 1.22 的 method+path 模式）。register 同时登记路由到
+// mux 与 routes 清单（避免两者漂移），供 /debug/routes 暴露完整路由面。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /kv/{key}", s.wrap(s.handleGet))
-	mux.HandleFunc("PUT /kv/{key}", s.wrap(s.handlePut))
-	mux.HandleFunc("POST /kv/{key}/append", s.wrap(s.handleAppend))
-	mux.HandleFunc("GET /healthz", s.wrap(s.handleHealthz))
+	var routes []string
+	register := func(pattern string, h func(http.ResponseWriter, *http.Request)) {
+		mux.HandleFunc(pattern, s.wrap(h))
+		routes = append(routes, pattern)
+	}
+	register("GET /kv/{key}", s.handleGet)
+	register("PUT /kv/{key}", s.handlePut)
+	register("POST /kv/{key}/append", s.handleAppend)
+	register("GET /healthz", s.handleHealthz)
 	// 就绪探针（I18）：集群可正常服务读写时 200，否则 503，供 k8s readinessProbe 直用。
-	mux.HandleFunc("GET /readyz", s.wrap(s.handleReadyz))
+	register("GET /readyz", s.handleReadyz)
 	// 可观测性：把进程内 ShardKV 的 Metrics 注册表 JSON 序列化暴露出来。
 	// 指标由 cycle 11 的 metrics 包在热路径上以纯原子操作累计，零行为影响。
-	mux.HandleFunc("GET /metrics", s.wrap(s.handleMetrics))
+	register("GET /metrics", s.handleMetrics)
 	// 诊断：暴露每个 group/副本的「分片归属 + 待接收/待迁出」状态，便于定位
 	// 3-group 再平衡卡死等迁移问题（pendingIn/pendingOut 残留会冻结配置推进）。
-	mux.HandleFunc("GET /debug/shards", s.wrap(s.handleDebugShards))
+	register("GET /debug/shards", s.handleDebugShards)
 	// 集群健康总览（程序化消费）：每 group 是否有 leader、当前 config 号、拥有分片数、
 	// 待接收/待迁出/孤儿 incoming 分片，以及是否存在卡滞（StallSeconds>0 即冻结风险）。
-	mux.HandleFunc("GET /status", s.wrap(s.handleStatus))
+	register("GET /status", s.handleStatus)
 	// 迁移进度（人类可读，供 CLI `start.sh migrate` 直接展示）：每个 group leader 副本的
 	// 实时迁移状态 + 集群最新 config 号，一眼看清再平衡是否卡住。
-	mux.HandleFunc("GET /debug/migrate", s.wrap(s.handleDebugMigrate))
+	register("GET /debug/migrate", s.handleDebugMigrate)
 	// 配置历史（人类/程序可读）：展示 shardmaster 从初始到最新的每段配置，便于复盘
 	// rebalance 轨迹、确认分片在哪些 group 间迁移（排查 3-group 冻结时尤其有用）。
-	mux.HandleFunc("GET /debug/configs", s.wrap(s.handleDebugConfigs))
+	register("GET /debug/configs", s.handleDebugConfigs)
 	// 当前 group 成员与分片归属（I14）：每个 gid 的 server 列表及其拥有的分片编号。
-	mux.HandleFunc("GET /debug/groups", s.wrap(s.handleDebugGroups))
+	register("GET /debug/groups", s.handleDebugGroups)
 	// 进程内访问日志（I15）：最近 N 条 HTTP 请求的方法/路径/状态码/延迟，便于审计排障。
-	mux.HandleFunc("GET /debug/accesslog", s.wrap(s.handleDebugAccessLog))
+	register("GET /debug/accesslog", s.handleDebugAccessLog)
 	// 分级结构化日志（I47）：最近 N 条带级别（debug/info/warn/error）的日志，
 	// 可按 ?level= 过滤最低级别、?limit= 控制条数，统一排障入口。
-	mux.HandleFunc("GET /debug/log", s.wrap(s.handleDebugLog))
+	register("GET /debug/log", s.handleDebugLog)
 	// 当前生效配置（I52）：返回网关实际生效的配置快照（脱敏），便于确认配置加载结果。
-	mux.HandleFunc("GET /debug/config", s.wrap(s.handleDebugConfig))
+	register("GET /debug/config", s.handleDebugConfig)
+	// I58：已注册路由清单，便于确认网关路由面（含本端点自身）。
+	register("GET /debug/routes", s.handleDebugRoutes)
+	s.routeMu.Lock()
+	s.routes = routes
+	s.routeMu.Unlock()
 	// I16：以 http.TimeoutHandler 兜底单请求最大时长，避免后端 Raft 操作在迁移抖动
 	// 下长时间不返回时 HTTP 连接无限挂起。超时返回 503；内层 handler 仍在后台跑完
 	// （其写入被丢弃），不会破坏状态机，与 Clerk 有界重试互补。requestTimeout 默认 30s。
@@ -669,7 +684,19 @@ func (s *Server) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// SetHTTPServer 注册底层 *http.Server，使 Shutdown 能一并关闭监听（可选）。
+// handleDebugRoutes 返回网关已注册的路由清单（I58），便于确认路由面、核对是否缺漏
+// 或重复。数据来自 Handler() 填充的 s.routes（与 mux 实际注册一致，无漂移）。
+func (s *Server) handleDebugRoutes(w http.ResponseWriter, r *http.Request) {
+	s.routeMu.Lock()
+	routes := s.routes
+	s.routeMu.Unlock()
+	out := map[string]interface{}{"count": len(routes), "routes": routes}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(out); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
 func (s *Server) SetHTTPServer(srv *http.Server) {
 	s.mu.Lock()
 	s.srv = srv

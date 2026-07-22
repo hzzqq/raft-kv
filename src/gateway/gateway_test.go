@@ -1159,3 +1159,58 @@ func TestGatewayIPAllow(t *testing.T) {
 	}
 	resp2.Body.Close()
 }
+
+// TestGatewayDebugRoutes：验证 /debug/routes 路由清单端点（I58）。cluster-free 直接
+// 构造 Server 并调 Handler()（不启动集群），再 httptest 调 handleDebugRoutes，断言返回
+// 的 routes 包含全部已注册模式且含本端点自身。
+func TestGatewayDebugRoutes(t *testing.T) {
+	s := &Server{
+		sem:            make(chan struct{}, maxConcurrent),
+		accessCap:      256,
+		logCap:         256,
+		requestTimeout: 30 * time.Second,
+	}
+	s.Handler() // 填充 s.routes
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleDebugRoutes(w, r)
+	}))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/debug/routes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var out struct {
+		Count  int      `json:"count"`
+		Routes []string `json:"routes"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("body not valid JSON: %v (body=%s)", err, string(b))
+	}
+	if out.Count == 0 {
+		t.Fatalf("routes count = 0, want >0")
+	}
+	want := map[string]bool{
+		"GET /kv/{key}":     true,
+		"PUT /kv/{key}":     true,
+		"GET /debug/config": true,
+		"GET /debug/routes": true,
+	}
+	for pat := range want {
+		found := false
+		for _, r := range out.Routes {
+			if r == pat {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("route %q missing from /debug/routes (routes=%v)", pat, out.Routes)
+		}
+	}
+}
