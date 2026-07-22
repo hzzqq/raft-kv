@@ -14,6 +14,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -117,6 +118,12 @@ type Server struct {
 	cacheMax    int
 	cacheStore  map[string]*cacheEntry
 	cacheOrder  []string
+
+	// I69：ETag / 条件 GET。对 GET 200 响应计算 ETag（响应体 SHA256），回写 ETag 头；
+	// 客户端带 If-None-Match 且匹配时直接 304 不回源，省带宽。与响应缓存共用捕获路径。
+	etagOn    bool
+	etagMu    sync.Mutex
+	etagStore map[string]string
 
 	// I57：IP 白名单（CIDR 列表）。非空时仅允许列表内客户端 IP 访问，其余返回 403。
 	// 为空表示不限制。用于网关仅对内网/特定来源开放的场景。
@@ -477,19 +484,35 @@ type cacheEntry struct {
 	exp time.Time
 }
 
-// capturingRecorder 在 statusRecorder 之上额外缓冲响应体，供缓存落盘。
-// 嵌入 *statusRecorder，故 WriteHeader/Write 透传到原 ResponseWriter（客户端照常收到响应），
-// 同时把写出的字节累积到 buf。
+// capturingRecorder 缓冲响应（状态码 + 响应体），不在 handler 执行期间下发，
+// 以便落缓存或计算 ETag 后，再统一 WriteHeader（此时已含 ETag 等全部头）后写出 body。
+// 关键：Go net/http 在 handler 首次 Write/WriteHeader 时即冻结响应头，故 ETag 必须在
+// WriteHeader 之前设置，不能在 handler 内透传下发后再补。Header() 仍透传底层 w，
+// 使 handler 设置的 Content-Type 等正常生效。
 type capturingRecorder struct {
-	*statusRecorder
-	buf *bytes.Buffer
+	http.ResponseWriter
+	buf    *bytes.Buffer
+	status int
+	wrote  bool
 }
 
-// Write 透传到底层并缓冲一份，用于缓存。
-func (c *capturingRecorder) Write(b []byte) (int, error) {
-	c.buf.Write(b)
-	return c.statusRecorder.Write(b)
+// WriteHeader 仅记录状态码，不下发给底层（延迟到统一下发时）。
+func (c *capturingRecorder) WriteHeader(code int) {
+	if !c.wrote {
+		c.status = code
+		c.wrote = true
+	}
 }
+
+// Write 仅缓冲 body 字节，不下发给底层。
+func (c *capturingRecorder) Write(b []byte) (int, error) {
+	if !c.wrote {
+		c.status = http.StatusOK
+		c.wrote = true
+	}
+	return c.buf.Write(b)
+}
+
 
 // SetCache 开启响应缓存：ttl 为成功响应缓存时长，maxKeys 为最大缓存条目（FIFO 淘汰）。
 // 负缓存（5xx）时长固定为 min(ttl/10, 2s)，仅用于缓解后端抖动期的惊群。生产可用。
@@ -594,6 +617,35 @@ func (s *Server) replayCache(w http.ResponseWriter, cv *cacheVal, start time.Tim
 	Metrics.Counter("http_requests_total").Inc()
 	Metrics.Counter(fmt.Sprintf("http_responses_%d", cv.Status)).Inc()
 	Metrics.Histogram("http_request_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
+}
+
+// SetETag 开启 ETag / 条件 GET（生产可用）。对 GET 200 响应计算 ETag 并回写，
+// 客户端带 If-None-Match 命中时返回 304 不回源。
+func (s *Server) SetETag(on bool) {
+	s.etagOn = on
+	if on && s.etagStore == nil {
+		s.etagStore = make(map[string]string)
+	}
+}
+
+// computeETag 由响应体计算弱校验外的强 ETag（SHA256，包成双引号形式）。
+func computeETag(body []byte) string {
+	sum := sha256.Sum256(body)
+	return `"` + fmt.Sprintf("%x", sum) + `"`
+}
+
+// etagMatches 判断该请求维度的已存 ETag 是否与客户端携带值一致。
+func (s *Server) etagMatches(key, inm string) bool {
+	s.etagMu.Lock()
+	defer s.etagMu.Unlock()
+	return s.etagStore[key] == inm
+}
+
+// etagSet 记录该请求维度的 ETag。
+func (s *Server) etagSet(key, etag string) {
+	s.etagMu.Lock()
+	defer s.etagMu.Unlock()
+	s.etagStore[key] = etag
 }
 
 // SetTestDelay 仅供单测注入人为延迟，使 429 路径可被稳定复现。生产不可用。
@@ -805,6 +857,16 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 				return
 			}
 		}
+		// I69：条件 GET。客户端带 If-None-Match 且与该路径已记录 ETag 一致时直接 304，不回源。
+		if s.etagOn && r.Method == http.MethodGet {
+			if inm := r.Header.Get("If-None-Match"); inm != "" && s.etagMatches(s.cacheKey(r), inm) {
+				w.WriteHeader(http.StatusNotModified)
+				s.recordAccess(r.Method, r.URL.Path, http.StatusNotModified, time.Since(start), reqID)
+				Metrics.Counter("http_requests_total").Inc()
+				Metrics.Counter("http_responses_304").Inc()
+				return
+			}
+		}
 		record := func(status int, d time.Duration) {
 			s.recordAccess(r.Method, r.URL.Path, status, d, reqID)
 		}
@@ -837,20 +899,40 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		}
 		rec := &statusRecorder{ResponseWriter: w}
 		var st int
-		if s.cacheOn && r.Method == http.MethodGet {
-			// 缓存可命中路径：用 capturingRecorder 透传响应并缓冲，供落缓存。
-			crec := &capturingRecorder{statusRecorder: rec, buf: &bytes.Buffer{}}
+		if (s.cacheOn || s.etagOn) && r.Method == http.MethodGet {
+			// 缓存/ETag 路径：crec 仅缓冲响应（不下发），handler 跑完后再统一 WriteHeader 下发，
+			// 确保 ETag 等头在首次 Write/WriteHeader（冻结响应头）之前已设置好。
+			crec := &capturingRecorder{ResponseWriter: w, buf: &bytes.Buffer{}}
 			h(crec, r)
-			st = rec.status
+			st = crec.status
 			if st == 0 {
 				st = http.StatusOK
 			}
+			body := append([]byte(nil), crec.buf.Bytes()...)
 			ck := s.cacheKey(r)
-			if st == http.StatusOK {
-				s.cacheSet(ck, &cacheVal{Status: st, Header: w.Header().Clone(), Body: append([]byte(nil), crec.buf.Bytes()...)})
-			} else if st >= 500 {
-				s.cacheSetNeg(ck, &cacheVal{Status: st, Header: w.Header().Clone(), Body: append([]byte(nil), crec.buf.Bytes()...)})
+			// 若本次响应走 gzip，则缓存体也存压缩后的字节，使回放与 Content-Encoding 一致。
+			storeBody := body
+			if _, gz := w.(*gzipResponseWriter); gz {
+				var gb bytes.Buffer
+				gzw := gzip.NewWriter(&gb)
+				gzw.Write(body)
+				gzw.Close()
+				storeBody = gb.Bytes()
 			}
+			if s.cacheOn {
+				if st == http.StatusOK {
+					s.cacheSet(ck, &cacheVal{Status: st, Header: w.Header().Clone(), Body: storeBody})
+				} else if st >= 500 {
+					s.cacheSetNeg(ck, &cacheVal{Status: st, Header: w.Header().Clone(), Body: storeBody})
+				}
+			}
+			if s.etagOn && st == http.StatusOK {
+				etag := computeETag(body)
+				s.etagSet(ck, etag)
+				w.Header().Set("ETag", etag)
+			}
+			w.WriteHeader(st)
+			w.Write(body)
 		} else {
 			h(rec, r)
 			st = rec.status
