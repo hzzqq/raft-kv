@@ -129,6 +129,15 @@ CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh conf
   以「持租约 leader + 无迁移卡滞」为就绪判据，`/readyz` 据此返回 200/503。
 
 - **缓存击穿/穿透防护 + 命中率指标（#83-#87）**：kvcli 读穿缓存在 #73 基础上做深——① **单飞 singleflight**（`util.Group`，并发同 key 回源只打一次后端，防热点 key 同时失效把压力打爆）；② **回源成功才写缓存**，且 sf 关闭路径同样写缓存（修复一处分支遗漏：sf 关闭时 Get 不写缓存导致穿透）；③ **可观测性**：`CacheStats()` 暴露 `hits/misses/coalesced/negative` 原子计数器，`Bench` 额外报告窗口内缓存命中率，便于评估缓存收益；④ **负向空值** 计入 `negative`（KV 对未设置 key 返回 `OK`+空串而非 404，故穿透已借正缓存缓解，无需独立负缓存契约）。`client_cache_integration_test.go` 综合守护：100 并发同 key → 后端仅回源 1 次、命中=99、合并>0。
+- **并发原语集中化（#88/#90）**：新增 `util.Semaphore`（有界信号量，支持加权获取 `AcquireWeighted` + ctx 取消时回滚已取额度、防下溢）与 `util.ErrGroup`（并发任务组，首个错误即 `cancel` 全组、返回首个错误）。凡需「有界并发」或「一组 goroutine 任一失败即整体取消」的场景统一复用，禁止各调用点手写 `chan struct{}` 信号量或裸 `sync.WaitGroup`（易漏取消/回滚）。
+- **滑窗限流原语（#89）**：`util.SlidingWindowLimiter` 按 key 做滑动窗口限流（`Allow`/`AllowN`，窗口清扫、注入时钟便于测试），与 #49 网关每客户端令牌桶（固定窗口）互补——滑窗对突发更平滑。新增限流能力一律优先复用既有原语，勿重造。
+- **Prometheus 暴露规范补全（#91）**：`metrics` 注册支持 `WithHelp` 描述注册，`WritePrometheus` 在每序列前输出 `# HELP <sn> <desc>`（无描述则不输出，向后兼容）。新增指标优先带 HELP，确保 scrape 端可读懂语义。
+- **配置一致性校验（#92/#100）**：`shardmaster.ValidateConfig` 校验单配置内部一致性（未知 gid / 空地址 / 负编号 / 无 group）；`gateway.GatewayConfig.Validate` 校验网关配置（listen_addr 须合法 host:port 且端口 1..65535、超时/并发/体量须为正、限流不矛盾、CIDR 合法）。二者风格对齐——纯函数返回 `[]string` 问题列表，`Apply`/调用方在应用前做硬守卫，结构性错误以 error 级日志暴露（网关侧与既有软告警 warn 区分），不阻断启动以便回看。
+- **状态渲染纯函数化（#93/#94）**：`statusfmt.clusterHealthScore`（leader 占比/stall/积压加权 0–100）与 `shardBalance`（极差/总分片占比 0–100）均为纯函数、cluster-free 可测，便于 rebalance 阈值 / 告警依据，禁止再在 HTTP handler 内联算分。
+- **迁移计划只读化（#97）**：`shardkv.PlanRebalance(current, gids)` 纯函数计算迁移步骤（From/To），不改动状态、可 dry-run 预览，与 `shardmaster.rebalance`（就地变更 Config）互补——运维提交配置前应先 PlanRebalance 评估迁移代价，避免盲目 rebalance 引发大搬动。
+- **一次性开关（#98）**：`util.OnceFlag`（CAS 翻转，`Trigger` 返回是否本次触发、`Done` 可观测）用于 shutdown / migration 等「只做一次」护栏，替代裸 `atomic.Bool`/`sync.Once`（后者无法观测「已触发」且 `Once.Do` 不暴露触发者）。
+- **指标命名空间（#99）**：`metrics.Registry.Subsystem(name)` 返回以 `name_` 为前缀的子表（与父共享存储+锁、可嵌套），注册指标名自动加前缀、导出/快照按前缀过滤——按组件（raft/shardkv/gateway）分组命名空间，单一注册表便于一次性 scrape 且避免同名冲突；子表 `Reset` 仅清自身前缀。
+- **demo 启动诊断（#96）**：`demo` 跑集群前打印 `CollectStartupReport`/`FormatStartupReport`（go/os/arch/cpu/gomax/cwd + 本地自检：临时目录可写、NShards>0），`RAFT_KV_DEMO_QUIET` 可静默；诊断函数 cluster-free，不触碰 raft/kv。
 
 ## 5. 快速排障 SOP
 
