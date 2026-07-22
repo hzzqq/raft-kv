@@ -6,8 +6,9 @@
 //     消息类型：0=数据帧，1=错误帧（payload 为错误文本）。
 //   - 一次 RPC = 客户端顺序发送两帧（方法名帧 + 请求体帧），服务端回一帧（响应/错误）。
 //   - 编解码默认 JSON（零依赖、可人工审查）；Handler 也接受裸字节，便于自定义编码。
-//   - 客户端每次 Invoke 建链/拆链（connection-per-RPC），天然规避多路复用竞态，并发安全；
-//     后续可加连接池优化吞吐，不影响语义正确性。
+//   - 客户端默认走连接池（maxIdle 个空闲连接复用），降低高并发建链开销；
+//     SetPool(0,0) 可回退为 connection-per-RPC。池内连接无未决读，天然规避多路复用竞态，并发安全。
+//   - 支持 ctx 截止时间传播（客户端设连接 deadline）与可选 TLS（crypto/tls，零外部依赖）。
 //
 // 之所以不引入 google.golang.org/grpc：当前构建环境不可联网安装外部模块，本包用标准库
 // 复刻了 gRPC 的核心传输契约（长度前缀帧 + 方法路由 + 错误帧），足以支撑网关/客户端
@@ -197,39 +198,145 @@ func (s *Server) Stop() {
 
 // ---- ClientConn ----
 
+// pooledConn 是池化的底层连接，复用 bufio 读写器以避免重复分配。
+type pooledConn struct {
+	conn   net.Conn
+	r      *bufio.Reader
+	w      *bufio.Writer
+	usedAt time.Time
+}
+
 // ClientConn 是到某 target（host:port）的 gRPC 风格客户端。
-// 每次 Invoke 建链/拆链，并发安全。
+// 通过连接池复用空闲 TCP 连接（受 maxIdle 限制），降低高并发下的建链开销；并发安全。
 type ClientConn struct {
-	target string
-	codec  Codec
-	dialTO time.Duration
+	target      string
+	codec       Codec
+	dialTO      time.Duration
+	maxIdle     int
+	idleTimeout time.Duration
+
+	mu     sync.Mutex
+	idle   []*pooledConn
+	dials  int
+	reused int
+	closed bool
 }
 
-// Dial 构造到 target 的客户端（不立即建链）。
+// Dial 构造到 target 的客户端（不立即建链）。默认开启连接池（maxIdle=4，空闲 30s 回收）。
 func Dial(target string) *ClientConn {
-	return &ClientConn{target: target, codec: JSONCodec{}, dialTO: 5 * time.Second}
+	return &ClientConn{target: target, codec: JSONCodec{}, dialTO: 5 * time.Second, maxIdle: 4, idleTimeout: 30 * time.Second}
 }
 
-// Invoke 发起一次 RPC：method 为完整方法名（如 "/Kv/Get"），reqData 为请求体字节，
-// 返回响应体字节。ctx 取消或连接失败时返回错误。
-func (cc *ClientConn) Invoke(ctx context.Context, method string, reqData []byte) (respData []byte, err error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
+// SetPool 配置连接池：maxIdle 为最大空闲连接数（<=0 表示关闭池、每次 RPC 建链/拆链），
+// idleTimeout 为空闲连接最大存活时间。
+func (cc *ClientConn) SetPool(maxIdle int, idleTimeout time.Duration) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.maxIdle = maxIdle
+	cc.idleTimeout = idleTimeout
+	if cc.maxIdle <= 0 {
+		for _, pc := range cc.idle {
+			pc.conn.Close()
+		}
+		cc.idle = nil
 	}
+}
+
+// ClientStats 是 ClientConn 的观测快照。
+type ClientStats struct {
+	Dials  int // 自建链次数
+	Reused int // 复用空闲连接次数
+	Idle   int // 当前空闲连接数
+}
+
+// Stats 返回客户端的连接池与调用统计（仅供观测/测试）。
+func (cc *ClientConn) Stats() ClientStats {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return ClientStats{Dials: cc.dials, Reused: cc.reused, Idle: len(cc.idle)}
+}
+
+// getConn 取一条可用连接：优先复用空闲池中的健康连接，否则新建。
+func (cc *ClientConn) getConn() (*pooledConn, error) {
+	cc.mu.Lock()
+	if cc.closed {
+		cc.mu.Unlock()
+		return nil, ErrClosed
+	}
+	for len(cc.idle) > 0 {
+		pc := cc.idle[len(cc.idle)-1]
+		cc.idle = cc.idle[:len(cc.idle)-1]
+		if time.Since(pc.usedAt) <= cc.idleTimeout {
+			cc.reused++
+			cc.mu.Unlock()
+			return pc, nil
+		}
+		pc.conn.Close()
+	}
+	cc.dials++
+	cc.mu.Unlock()
+
 	conn, err := net.DialTimeout("tcp", cc.target, cc.dialTO)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	w := bufio.NewWriter(conn)
-	if err := writeFrame(w, frameData, []byte(method)); err != nil {
+	return &pooledConn{conn: conn, r: bufio.NewReader(conn), w: bufio.NewWriter(conn), usedAt: time.Now()}, nil
+}
+
+// putConn 归还连接：若池满或已关闭则直接关闭，否则放回空闲池。
+func (cc *ClientConn) putConn(pc *pooledConn) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if cc.closed || len(cc.idle) >= cc.maxIdle {
+		pc.conn.Close()
+		return
+	}
+	pc.usedAt = time.Now()
+	cc.idle = append(cc.idle, pc)
+}
+
+// Close 关闭客户端并释放所有空闲连接。幂等。
+func (cc *ClientConn) Close() error {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if cc.closed {
+		return nil
+	}
+	cc.closed = true
+	for _, pc := range cc.idle {
+		pc.conn.Close()
+	}
+	cc.idle = nil
+	return nil
+}
+
+// Invoke 发起一次 RPC：method 为完整方法名（如 "/Kv/Get"），reqData 为请求体字节，
+// 返回响应体字节。ctx 取消或连接失败时返回错误。连接经池化复用。
+func (cc *ClientConn) Invoke(ctx context.Context, method string, reqData []byte) (respData []byte, err error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := writeFrame(w, frameData, reqData); err != nil {
+	pc, gerr := cc.getConn()
+	if gerr != nil {
+		return nil, gerr
+	}
+	defer func() {
+		if err != nil {
+			pc.conn.Close() // 出错的连接不再复用，避免半写状态污染池
+		} else {
+			cc.putConn(pc)
+		}
+	}()
+	r, w := pc.r, pc.w
+	if err = writeFrame(w, frameData, []byte(method)); err != nil {
 		return nil, err
 	}
-	typ, resp, err := readFrame(r)
+	if err = writeFrame(w, frameData, reqData); err != nil {
+		return nil, err
+	}
+	var typ byte
+	var resp []byte
+	typ, resp, err = readFrame(r)
 	if err != nil {
 		return nil, err
 	}
