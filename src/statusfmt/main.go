@@ -119,3 +119,40 @@ func clusterHealthScore(st clusterStatus) (score float64, summary string) {
 		leaderRatio*100, avgStall, backlog)
 	return score, summary
 }
+
+// shardBalance 量化分片在各 group 间的均衡度，返回 0-100 分（100=完全均衡）。
+// 用「最大拥有量与最小拥有量之差」相对总分片的占比衡量失衡，便于单测
+// 与 rebalance 前后对比（失衡下降即改善）。纯函数，无副作用。
+func shardBalance(st clusterStatus) (score float64, detail string) {
+	if len(st.Groups) == 0 {
+		return 0, "no groups"
+	}
+	var counts []int
+	total := 0
+	for _, g := range st.Groups {
+		counts = append(counts, g.OwnedCount)
+		total += g.OwnedCount
+	}
+	if total == 0 {
+		return 100, "no shards assigned"
+	}
+	min, max := counts[0], counts[0]
+	for _, c := range counts {
+		if c < min {
+			min = c
+		}
+		if c > max {
+			max = c
+		}
+	}
+	dev := max - min
+	score = 100 - float64(dev)*100.0/float64(total)
+	if score < 0 {
+		score = 0
+	}
+	if score > 100 {
+		score = 100
+	}
+	detail = fmt.Sprintf("min=%d max=%d total=%d", min, max, total)
+	return score, detail
+}
