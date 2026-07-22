@@ -431,8 +431,14 @@ func (g *gzipResponseWriter) Write(p []byte) (int, error) { return g.gz.Write(p)
 func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 
 // NewServer 用给定集群构造网关（不立即加入 group，需先 Init）。
+// c 为 nil 时构造一个不依赖内存集群的实例（仅用于暴露 gRPC 等独立服务）。
 func NewServer(c *cluster.Cluster) *Server {
-	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20, compress: true, secHeaders: true, startedAt: time.Now(), version: "dev", breakerCooldown: 10 * time.Second, breakerThreshold: 5}
+	s := &Server{sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20, compress: true, secHeaders: true, startedAt: time.Now(), version: "dev", breakerCooldown: 10 * time.Second, breakerThreshold: 5}
+	if c != nil {
+		s.c = c
+		s.clerk = c.Clerk()
+	}
+	return s
 }
 
 // logLevel 是结构化日志级别，数值越大越严重。
