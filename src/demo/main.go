@@ -2,14 +2,16 @@
 //
 // 在进程内启动一个多 replica group 的 ShardKV 集群（基于可复用的 cluster 包），
 // 分两段演示：
-//   1) 进程内 KV 路径：直接用 Clerk 做 Put/Get/Append + 跨 group 分片迁移；
-//   2) 全栈 HTTP 路径：以本进程集群的 Clerk 起一个真正的 HTTP 网关，客户端经
-//      HTTP 做 Put/Get/Append，并拉取 /metrics —— 验证 cluster→HTTP→client 全栈。
+//  1. 进程内 KV 路径：直接用 Clerk 做 Put/Get/Append + 跨 group 分片迁移；
+//  2. 全栈 HTTP 路径：以本进程集群的 Clerk 起一个真正的 HTTP 网关，客户端经
+//     HTTP 做 Put/Get/Append，并拉取 /metrics —— 验证 cluster→HTTP→client 全栈。
+//
 // 适合作为"开箱即跑"的示例。注意：本演示依赖内存 labrpc 网络（与测试同一套），
 // 因此集群是进程内的；生产部署需替换为真实网络传输层（gRPC / TCP）。
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -91,6 +93,10 @@ func RunDemo() string {
 	afterMove := ck.Get("hello")
 
 	// ---- 2) 全栈 HTTP 路径 ----
+	// 整体超时兜底：集群/网关异常时不让 demo 永久挂起（防御性）。
+	demoCtx, demoCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer demoCancel()
+
 	srv := &http.Server{Handler: demoGatewayHandler(ck)}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -98,29 +104,38 @@ func RunDemo() string {
 	}
 	go srv.Serve(ln)
 	base := "http://" + ln.Addr().String()
-	defer srv.Close()
+	defer func() { _ = srv.Shutdown(context.Background()) }() // 优雅关闭，等待在途请求完成
 
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 	waitHealth(base, httpClient)
 
-	putReq, _ := http.NewRequest(http.MethodPut, base+"/kv/dkey", strings.NewReader("dval"))
+	get := func(path string) (*http.Response, error) {
+		req, e := http.NewRequestWithContext(demoCtx, http.MethodGet, base+path, nil)
+		if e != nil {
+			return nil, e
+		}
+		return httpClient.Do(req)
+	}
+
+	putReq, _ := http.NewRequestWithContext(demoCtx, http.MethodPut, base+"/kv/dkey", strings.NewReader("dval"))
 	putResp, _ := httpClient.Do(putReq)
 	putOK := putResp != nil && putResp.StatusCode == http.StatusOK
 	if putResp != nil {
 		putResp.Body.Close()
 	}
-	getResp, _ := httpClient.Get(base + "/kv/dkey")
+	getResp, _ := get(base + "/kv/dkey")
 	dval := ""
 	if getResp != nil {
 		b, _ := io.ReadAll(getResp.Body)
 		dval = string(b)
 		getResp.Body.Close()
 	}
-	appResp, _ := httpClient.Post(base+"/kv/dkey/append", "text/plain", strings.NewReader("-http"))
+	appReq, _ := http.NewRequestWithContext(demoCtx, http.MethodPost, base+"/kv/dkey/append", strings.NewReader("-http"))
+	appResp, _ := httpClient.Do(appReq)
 	if appResp != nil {
 		appResp.Body.Close()
 	}
-	getResp2, _ := httpClient.Get(base + "/kv/dkey")
+	getResp2, _ := get(base + "/kv/dkey")
 	dval2 := ""
 	if getResp2 != nil {
 		b, _ := io.ReadAll(getResp2.Body)
@@ -128,7 +143,7 @@ func RunDemo() string {
 		getResp2.Body.Close()
 	}
 	metricsBody := ""
-	mResp, _ := httpClient.Get(base + "/metrics")
+	mResp, _ := get(base + "/metrics")
 	if mResp != nil {
 		b, _ := io.ReadAll(mResp.Body)
 		metricsBody = string(b)
