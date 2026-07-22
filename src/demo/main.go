@@ -26,6 +26,7 @@ import (
 	"raftkv/src/metrics"
 	"raftkv/src/shardkv"
 	"raftkv/src/shardmaster"
+	"raftkv/src/util"
 )
 
 func key2shard(key string) int {
@@ -161,16 +162,22 @@ func RunDemo() string {
 	)
 }
 
-// waitHealth 轮询 /healthz 直到返回 200（最多 ~2s），避免 Serve 尚未开始接受连接。
+// waitHealth 轮询 /healthz 直到返回 200（整体上限 ~4s），避免 Serve 尚未开始接受连接。
+// 采用指数退避（util.Backoff），网关/集群暂时不可达时不会以恒定高频空打，也不会无限阻塞。
 func waitHealth(base string, client *http.Client) {
-	for i := 0; i < 40; i++ {
+	deadline := time.Now().Add(4 * time.Second)
+	for attempt := 1; ; attempt++ {
 		if r, err := client.Get(base + "/healthz"); err == nil {
+			code := r.StatusCode
 			r.Body.Close()
-			if r.StatusCode == http.StatusOK {
+			if code == http.StatusOK {
 				return
 			}
 		}
-		time.Sleep(50 * time.Millisecond)
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(util.Backoff(50*time.Millisecond, 500*time.Millisecond, attempt, 0.2))
 	}
 }
 
