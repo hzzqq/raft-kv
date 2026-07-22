@@ -33,6 +33,12 @@ func (c *Counter) Inc() int64 { return atomic.AddInt64(&c.v, 1) }
 // Add 增加 n（可为负），返回新值。
 func (c *Counter) Add(n int64) int64 { return atomic.AddInt64(&c.v, n) }
 
+// Sub 减少 n（等价 Add(-n)），返回新值。便于「当前活跃数 = 增 + 减」类 delta 计数。
+func (c *Counter) Sub(n int64) int64 { return atomic.AddInt64(&c.v, -n) }
+
+// Dec 自减 1，返回新值。
+func (c *Counter) Dec() int64 { return atomic.AddInt64(&c.v, -1) }
+
 // Value 返回当前值。
 func (c *Counter) Value() int64 { return atomic.LoadInt64(&c.v) }
 
