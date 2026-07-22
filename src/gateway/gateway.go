@@ -470,6 +470,15 @@ func (s *Server) setRateLimitHeaders(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(resetUnix, 10))
 }
 
+// setTraceHeaders 把本次请求的唯一 ID 回写为 X-Request-Id 响应头，便于客户端/网关两侧
+// 按同一 ID 关联日志与链路（reqID 已在 wrap 中生成或透传自入向头）。对所有正常响应一致
+// 生效，是排障与分布式追踪的基线能力（新需求 I91）。
+func (s *Server) setTraceHeaders(w http.ResponseWriter, reqID string) {
+	if reqID != "" {
+		w.Header().Set("X-Request-ID", reqID)
+	}
+}
+
 // accessEntry 是 /debug/accesslog 中单条请求记录。
 type accessEntry struct {
 	TS        time.Time `json:"ts"`
@@ -908,6 +917,8 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		// I85：下发 X-RateLimit-* 头，便于客户端感知限额与重置时刻（限流开启时）。
 		// 早于后续缓存/ETag/回源，对所有正常响应一致生效。
 		s.setRateLimitHeaders(w, r)
+		// I91：回写请求追踪 ID，便于两侧关联链路。
+		s.setTraceHeaders(w, reqID)
 		// I68：GET 命中响应缓存则直接回放，跳过并发信号量与回源（限流/安全语义已于上方校验）。
 		if s.cacheOn && r.Method == http.MethodGet {
 			if cv := s.cacheGet(s.cacheKey(r)); cv != nil {

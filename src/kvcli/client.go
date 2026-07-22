@@ -206,6 +206,12 @@ func NewClient(base string) *Client {
 	}
 }
 
+// Close 释放客户端占用的空闲 TCP 连接，便于调用方在退出/热重载时主动回收资源，
+// 避免连接池长期空占。已在进行中的在途请求不受影响（标准库语义）。
+func (c *Client) Close() {
+	c.http.CloseIdleConnections()
+}
+
 // EnableCache 开启读穿缓存：ttl 为条目有效期，max 为容量上限（超出按近似 FIFO
 // 淘汰最旧条目）。关闭态（默认）下 Get 始终回源，零缓存行为影响——对现有无缓存
 // 调用方完全透明。

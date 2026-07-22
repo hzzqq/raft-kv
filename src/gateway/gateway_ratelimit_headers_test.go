@@ -76,3 +76,18 @@ func TestGatewayShutdownClosesGRPC(t *testing.T) {
 		t.Fatalf("gRPC listener should be closed by Shutdown")
 	}
 }
+
+// TestGatewayTraceHeaders 验证回写 X-Request-Id 响应头（空 ID 不下发）。
+func TestGatewayTraceHeaders(t *testing.T) {
+	s := &Server{}
+	rec := httptest.NewRecorder()
+	s.setTraceHeaders(rec, "abc-123")
+	if rec.Header().Get("X-Request-ID") != "abc-123" {
+		t.Fatalf("X-Request-ID missing, got %q", rec.Header().Get("X-Request-ID"))
+	}
+	rec2 := httptest.NewRecorder()
+	s.setTraceHeaders(rec2, "")
+	if rec2.Header().Get("X-Request-ID") != "" {
+		t.Fatalf("empty reqID should not set X-Request-ID")
+	}
+}

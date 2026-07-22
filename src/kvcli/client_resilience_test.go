@@ -176,3 +176,19 @@ func TestClientMetrics(t *testing.T) {
 		t.Fatalf("expected positive avg latency")
 	}
 }
+
+// TestClientClose 验证 Close 回收空闲连接后仍能新建连接继续工作。
+func TestClientClose(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL)
+	if v, err := c.Get("k"); err != nil || v != "ok" {
+		t.Fatalf("before close: got %q err %v", v, err)
+	}
+	c.Close()
+	if v, err := c.Get("k"); err != nil || v != "ok" {
+		t.Fatalf("after close should still work: got %q err %v", v, err)
+	}
+}
