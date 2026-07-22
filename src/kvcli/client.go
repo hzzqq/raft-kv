@@ -47,6 +47,17 @@ type Client struct {
 
 	// 请求级超时（纳秒，原子存储）：当传入 ctx 无 deadline 时，回源请求附加此超时；0=不附加。
 	reqTimeoutNs int64
+
+	// gzip：开启后回源请求带 Accept-Encoding: gzip 并自动解压响应（省带宽）。
+	gzip bool
+
+	// 客户端熔断：开启后下游连续失败达阈值则快速失败，保护下游（复用 util.CircuitBreaker）。
+	breaker *util.CircuitBreaker
+
+	// 客户端级可观测指标（原子计数）。
+	mReq   int64
+	mErr   int64
+	mLatNs int64
 }
 
 // cacheEntry 是单条缓存值及其绝对过期时刻。
@@ -322,35 +333,66 @@ func (c *Client) GetCtx(ctx context.Context, key string) (string, error) {
 	return c.getCtx(ctx, key)
 }
 
-// fetchGet 是 Get 的纯回源逻辑（含重试），不含缓存/单飞。返回后端原始响应体字符串。
+// fetchGet 是 Get 的纯回源逻辑（含重试、熔断守卫、gzip 解压、指标），不含缓存/单飞。
 func (c *Client) fetchGet(ctx context.Context, key string) (string, error) {
+	if c.breakerOpen() {
+		return "", fmt.Errorf("kvcli: circuit breaker open, fast-fail")
+	}
+	start := time.Now()
 	var lastErr error
 	reqCtx, cancel := c.ctxForRequest(ctx)
 	defer cancel()
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
-		if attempt > 0 {
-			time.Sleep(c.backoffFor(attempt))
-		}
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.base+"/kv/"+url.PathEscape(key), nil)
 		if err != nil {
-			return "", err
+			lastErr = err
+			break
+		}
+		if c.gzip {
+			req.Header.Set("Accept-Encoding", "gzip")
 		}
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err // 网络错误：瞬态，可重试
+			if attempt < c.maxRetries {
+				time.Sleep(c.backoffFor(attempt + 1))
+			}
 			continue
 		}
 		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("retryable status %d for GET /kv/%s", resp.StatusCode, key)
+			if attempt < c.maxRetries {
+				if d, ok := retryAfterSeconds(resp); ok {
+					time.Sleep(d)
+				} else {
+					time.Sleep(c.backoffFor(attempt + 1))
+				}
+			}
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			return "", respErr("GET", key, resp)
+			err = respErr("GET", key, resp)
+			resp.Body.Close()
+			c.recordCall(start, err)
+			c.breakerRecord(err)
+			return "", err
 		}
-		b, _ := io.ReadAll(resp.Body)
+		b, err := readRespBody(resp)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			if attempt < c.maxRetries {
+				time.Sleep(c.backoffFor(attempt + 1))
+			}
+			continue
+		}
+		c.recordCall(start, nil)
+		c.breakerRecord(nil)
 		return string(b), nil
 	}
+	c.recordCall(start, lastErr)
+	c.breakerRecord(lastErr)
 	return "", lastErr
 }
 
@@ -529,33 +571,54 @@ func (c *Client) Put(key, value string) error {
 }
 
 func (c *Client) putCtx(ctx context.Context, key, value string) error {
+	if c.breakerOpen() {
+		return fmt.Errorf("kvcli: circuit breaker open, fast-fail")
+	}
+	start := time.Now()
 	var lastErr error
 	reqCtx, cancel := c.ctxForRequest(ctx)
 	defer cancel()
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
-		if attempt > 0 {
-			time.Sleep(c.backoffFor(attempt))
-		}
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, c.base+"/kv/"+url.PathEscape(key), strings.NewReader(value))
 		if err != nil {
-			return err
+			lastErr = err
+			break
 		}
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
+			if attempt < c.maxRetries {
+				time.Sleep(c.backoffFor(attempt + 1))
+			}
 			continue
 		}
 		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("retryable status %d for PUT /kv/%s", resp.StatusCode, key)
+			if attempt < c.maxRetries {
+				if d, ok := retryAfterSeconds(resp); ok {
+					time.Sleep(d)
+				} else {
+					time.Sleep(c.backoffFor(attempt + 1))
+				}
+			}
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			return respErr("PUT", key, resp)
+			err = respErr("PUT", key, resp)
+			resp.Body.Close()
+			c.recordCall(start, err)
+			c.breakerRecord(err)
+			return err
 		}
+		resp.Body.Close()
 		c.invalidateCache(key)
+		c.recordCall(start, nil)
+		c.breakerRecord(nil)
 		return nil
 	}
+	c.recordCall(start, lastErr)
+	c.breakerRecord(lastErr)
 	return lastErr
 }
 
@@ -565,32 +628,53 @@ func (c *Client) Append(key, value string) error {
 }
 
 func (c *Client) appendCtx(ctx context.Context, key, value string) error {
+	if c.breakerOpen() {
+		return fmt.Errorf("kvcli: circuit breaker open, fast-fail")
+	}
+	start := time.Now()
 	var lastErr error
 	reqCtx, cancel := c.ctxForRequest(ctx)
 	defer cancel()
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
-		if attempt > 0 {
-			time.Sleep(c.backoffFor(attempt))
-		}
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.base+"/kv/"+url.PathEscape(key)+"/append", strings.NewReader(value))
 		if err != nil {
-			return err
+			lastErr = err
+			break
 		}
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
+			if attempt < c.maxRetries {
+				time.Sleep(c.backoffFor(attempt + 1))
+			}
 			continue
 		}
 		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("retryable status %d for POST /kv/%s/append", resp.StatusCode, key)
+			if attempt < c.maxRetries {
+				if d, ok := retryAfterSeconds(resp); ok {
+					time.Sleep(d)
+				} else {
+					time.Sleep(c.backoffFor(attempt + 1))
+				}
+			}
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			return respErr("POST", key, resp)
+			err = respErr("POST", key, resp)
+			resp.Body.Close()
+			c.recordCall(start, err)
+			c.breakerRecord(err)
+			return err
 		}
+		resp.Body.Close()
 		c.invalidateCache(key)
+		c.recordCall(start, nil)
+		c.breakerRecord(nil)
 		return nil
 	}
+	c.recordCall(start, lastErr)
+	c.breakerRecord(lastErr)
 	return lastErr
 }
