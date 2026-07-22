@@ -59,6 +59,8 @@ type Histogram struct {
 	samples []float64
 	count   int64
 	sum     float64
+	min     float64
+	max     float64
 }
 
 const defaultHistCap = 4096
@@ -69,7 +71,7 @@ func NewHistogram(capacity ...int) *Histogram {
 	if len(capacity) > 0 && capacity[0] > 0 {
 		cap = capacity[0]
 	}
-	return &Histogram{cap: cap, samples: make([]float64, 0, cap)}
+	return &Histogram{cap: cap, samples: make([]float64, 0, cap), min: math.Inf(1), max: math.Inf(-1)}
 }
 
 // Record 记录一个样本。
@@ -78,6 +80,12 @@ func (h *Histogram) Record(v float64) {
 	defer h.mu.Unlock()
 	h.count++
 	h.sum += v
+	if v < h.min {
+		h.min = v
+	}
+	if v > h.max {
+		h.max = v
+	}
 	if len(h.samples) < h.cap {
 		h.samples = append(h.samples, v)
 		return
@@ -92,6 +100,8 @@ type HistSnapshot struct {
 	Count int64   `json:"count"`
 	Sum   float64 `json:"sum"`
 	Mean  float64 `json:"mean"`
+	Min   float64 `json:"min"`
+	Max   float64 `json:"max"`
 	P50   float64 `json:"p50"`
 	P95   float64 `json:"p95"`
 	P99   float64 `json:"p99"`
@@ -112,10 +122,29 @@ func (h *Histogram) Snapshot() HistSnapshot {
 		Count: h.count,
 		Sum:   h.sum,
 		Mean:  mean,
+		Min:   h.min,
+		Max:   h.max,
 		P50:   percentile(sorted, 0.50),
 		P95:   percentile(sorted, 0.95),
 		P99:   percentile(sorted, 0.99),
 	}
+}
+
+// Timer 是绑定到某直方图的一次计时器。调用方在待测区间起止分别调用 Histogram.Timer()
+// 与 Timer.Stop()，经过的毫秒耗时即被 Record 进直方图——比手动 Record 更不易漏写。
+type Timer struct {
+	h     *Histogram
+	start time.Time
+}
+
+// Timer 返回一个已起算的计时器，绑定到当前直方图。
+func (h *Histogram) Timer() *Timer {
+	return &Timer{h: h, start: time.Now()}
+}
+
+// Stop 停止计时并把耗时（毫秒）记录进直方图。
+func (t *Timer) Stop() {
+	t.h.Record(float64(time.Since(t.start).Microseconds()) / 1000.0)
 }
 
 func percentile(s []float64, q float64) float64 {

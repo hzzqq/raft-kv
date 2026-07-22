@@ -164,3 +164,36 @@ func TestWritePrometheus(t *testing.T) {
 		t.Fatalf("missing _p99 gauge TYPE:\n%s", out)
 	}
 }
+
+func TestHistogramMinMax(t *testing.T) {
+	h := NewHistogram(100)
+	for i := 1; i <= 10; i++ {
+		h.Record(float64(i))
+	}
+	s := h.Snapshot()
+	if s.Min != 1 {
+		t.Fatalf("min want 1 got %v", s.Min)
+	}
+	if s.Max != 10 {
+		t.Fatalf("max want 10 got %v", s.Max)
+	}
+	// 空直方图 min/max 应为 0（而非 ±Inf），避免 JSON 出现非有限数被 Prometheus 拒绝。
+	empty := NewHistogram(10).Snapshot()
+	if empty.Min != 0 || empty.Max != 0 {
+		t.Fatalf("empty hist min/max want 0 got %v/%v", empty.Min, empty.Max)
+	}
+}
+
+func TestTimer(t *testing.T) {
+	h := NewHistogram(10)
+	tr := h.Timer()
+	time.Sleep(5 * time.Millisecond)
+	tr.Stop()
+	s := h.Snapshot()
+	if s.Count != 1 {
+		t.Fatalf("timer count want 1 got %d", s.Count)
+	}
+	if s.Min < 5.0 || s.Max < 5.0 {
+		t.Fatalf("timer recorded too-small latency: min=%v max=%v", s.Min, s.Max)
+	}
+}
