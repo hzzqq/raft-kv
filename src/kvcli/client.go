@@ -21,6 +21,20 @@ import (
 type Client struct {
 	base string
 	http *http.Client
+
+	// cache 是可选读穿缓存：启用后 Get 命中且未过期直接返回，跳过回源；
+	// Put/Append 成功会使对应 key 失效。默认 nil = 关闭（零行为影响）。
+	cacheMu  sync.Mutex
+	cache    map[string]cacheEntry
+	cacheTTL time.Duration
+	cacheMax int
+	cacheLen int
+}
+
+// cacheEntry 是单条缓存值及其绝对过期时刻。
+type cacheEntry struct {
+	val string
+	exp time.Time
 }
 
 // BenchResult 汇总一次压测的结果。
@@ -146,6 +160,59 @@ func NewClient(base string) *Client {
 	}
 }
 
+// EnableCache 开启读穿缓存：ttl 为条目有效期，max 为容量上限（超出按近似 FIFO
+// 淘汰最旧条目）。关闭态（默认）下 Get 始终回源，零缓存行为影响——对现有无缓存
+// 调用方完全透明。
+func (c *Client) EnableCache(ttl time.Duration, max int) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	if c.cache == nil {
+		c.cache = make(map[string]cacheEntry, max)
+	}
+	c.cacheTTL = ttl
+	c.cacheMax = max
+}
+
+// storeCache 写入缓存；超出容量时淘汰过期最久（近似 FIFO）的条目。调用方须持 cacheMu。
+func (c *Client) storeCache(key, val string) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	if c.cache == nil {
+		return
+	}
+	if c.cacheMax > 0 && c.cacheLen >= c.cacheMax && len(c.cache) >= c.cacheMax {
+		var oldestKey string
+		var oldest time.Time
+		first := true
+		for k, e := range c.cache {
+			if first || e.exp.Before(oldest) {
+				oldest = e.exp
+				oldestKey = k
+				first = false
+			}
+		}
+		if oldestKey != "" {
+			delete(c.cache, oldestKey)
+			c.cacheLen--
+		}
+	}
+	c.cache[key] = cacheEntry{val: val, exp: time.Now().Add(c.cacheTTL)}
+	c.cacheLen++
+}
+
+// invalidateCache 使某 key 的缓存失效（Put/Append 成功后调用）。调用方须持 cacheMu。
+func (c *Client) invalidateCache(key string) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	if c.cache == nil {
+		return
+	}
+	if _, ok := c.cache[key]; ok {
+		delete(c.cache, key)
+		c.cacheLen--
+	}
+}
+
 // maxErrBody 是错误响应体在错误信息中保留的最大字节数，避免把巨大响应体塞进 error。
 const maxErrBody = 256
 
@@ -167,6 +234,15 @@ func (c *Client) Get(key string) (string, error) {
 }
 
 func (c *Client) getCtx(ctx context.Context, key string) (string, error) {
+	// 读穿缓存：命中且未过期直接返回，跳过回源（零额外网络开销）。
+	if c.cache != nil {
+		c.cacheMu.Lock()
+		if e, ok := c.cache[key]; ok && time.Now().Before(e.exp) {
+			c.cacheMu.Unlock()
+			return e.val, nil
+		}
+		c.cacheMu.Unlock()
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/kv/"+url.PathEscape(key), nil)
 	if err != nil {
 		return "", err
@@ -180,6 +256,9 @@ func (c *Client) getCtx(ctx context.Context, key string) (string, error) {
 		return "", respErr("GET", key, resp)
 	}
 	b, _ := io.ReadAll(resp.Body)
+	if c.cache != nil {
+		c.storeCache(key, string(b))
+	}
 	return string(b), nil
 }
 
@@ -201,6 +280,7 @@ func (c *Client) putCtx(ctx context.Context, key, value string) error {
 	if resp.StatusCode != http.StatusOK {
 		return respErr("PUT", key, resp)
 	}
+	c.invalidateCache(key)
 	return nil
 }
 
@@ -222,5 +302,6 @@ func (c *Client) appendCtx(ctx context.Context, key, value string) error {
 	if resp.StatusCode != http.StatusOK {
 		return respErr("POST", key, resp)
 	}
+	c.invalidateCache(key)
 	return nil
 }
