@@ -2,7 +2,7 @@
 GO ?= go
 export PATH := $(PATH):/c/Users/Administrator/.workbuddy/binaries/go/go/bin
 
-.PHONY: build vet test test-race clean lint cover test-cover build-binaries demo serve serve-bg stop cli
+.PHONY: build vet test test-shardkv test-all test-race fmt bench clean lint cover test-cover build-binaries demo serve serve-bg stop cli
 
 build:
 	$(GO) build ./...
@@ -10,8 +10,18 @@ build:
 vet:
 	$(GO) vet ./...
 
+# 仅跑 ShardKV 重点包（轻量，向后兼容旧习惯 / CI）。
 test:
 	$(GO) test ./src/shardkv/... -count=1 -timeout 300s
+
+# 同 test，语义别名（显式表达"只 shardkv"）。
+test-shardkv:
+	$(GO) test ./src/shardkv/... -count=1 -timeout 300s
+
+# 全量：覆盖所有包（含本轮新增的 gateway/metrics/kvcli/statusfmt/demo 的 cluster-free 测试）。
+# shardkv 的 churn 用例较重，已给足 timeout；CI 环境另有 race job。
+test-all:
+	$(GO) test ./... -count=1 -timeout 600s
 
 # 注意：本机 Windows 环境无 gcc，无法编译 race 检测器；此目标在支持 -race 的
 # 环境（Linux / macOS / 装了 gcc 的 Windows）下才有意义。
@@ -65,3 +75,13 @@ cover:
 
 # 与 cover 同义，方便记忆。
 test-cover: cover
+
+# 格式检查：列出 ./src 下未通过 gofmt 的文件。默认不自动 -w，避免波及上游 6.824
+# 起始代码；如需就地重写本轮回改动文件，可手动：gofmt -w ./src/<pkg>。
+fmt:
+	gofmt -l ./src
+
+# 基准：跑 raft 提交路径基准（BenchmarkRaftAgree 等）各一次，量化提交吞吐。
+# 需要连后端压测时也可用：make cli args="bench mixed 2000 8"（连已启动网关）。
+bench:
+	$(GO) test -run='^$$' -bench=. -benchtime=1x ./src/raft
