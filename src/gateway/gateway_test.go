@@ -1113,3 +1113,49 @@ func TestGatewaySecurityHeaders(t *testing.T) {
 		}
 	}
 }
+
+// TestGatewayIPAllow：验证 IP 白名单（I57）。cluster-free 套 wrap + no-op handler。
+// 白名单设为 10.0.0.0/8（不含 httptest 的 127.0.0.1 来源）-> 403；改为 127.0.0.0/8 -> 200。
+func TestGatewayIPAllow(t *testing.T) {
+	inner := func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }
+
+	// 拒绝：来源 127.0.0.1 不在 10.0.0.0/8
+	s := &Server{
+		sem:            make(chan struct{}, maxConcurrent),
+		accessCap:      256,
+		logCap:         256,
+		requestTimeout: 30 * time.Second,
+	}
+	s.SetIPAllow([]string{"10.0.0.0/8"})
+	h := s.wrap(inner)
+	ts := httptest.NewServer(http.HandlerFunc(h))
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("denied status = %d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 放行：来源 127.0.0.1 在 127.0.0.0/8
+	s2 := &Server{
+		sem:            make(chan struct{}, maxConcurrent),
+		accessCap:      256,
+		logCap:         256,
+		requestTimeout: 30 * time.Second,
+	}
+	s2.SetIPAllow([]string{"127.0.0.0/8"})
+	h2 := s2.wrap(inner)
+	ts2 := httptest.NewServer(http.HandlerFunc(h2))
+	defer ts2.Close()
+	resp2, err := http.Get(ts2.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("allowed status = %d, want 200", resp2.StatusCode)
+	}
+	resp2.Body.Close()
+}

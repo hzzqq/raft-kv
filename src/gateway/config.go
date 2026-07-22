@@ -23,6 +23,7 @@ type GatewayConfig struct {
 	MaxBodySize     int      `yaml:"max_body_size"`
 	Compress        bool     `yaml:"compress"`
 	SecurityHeaders bool     `yaml:"security_headers"`
+	AllowCIDRs      []string `yaml:"allow_cidrs"`
 }
 
 // DefaultGatewayConfig 返回代码内默认值。
@@ -37,6 +38,7 @@ func DefaultGatewayConfig() GatewayConfig {
 		MaxBodySize:     1 << 20,
 		Compress:        true,
 		SecurityHeaders: true,
+		AllowCIDRs:      nil,
 	}
 }
 
@@ -86,6 +88,8 @@ func ParseGatewayConfig(data []byte) (GatewayConfig, error) {
 			cfg.Compress = (val == "true" || val == "1" || val == "yes")
 		case "security_headers":
 			cfg.SecurityHeaders = (val == "true" || val == "1" || val == "yes")
+		case "allow_cidrs":
+			cfg.AllowCIDRs = parseList(val)
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -145,6 +149,9 @@ func (c GatewayConfig) Apply(s *Server) {
 		s.SetClientRateLimit(c.ClientRate, c.ClientBurst)
 	}
 	s.SetCORS(c.CORSOrigins)
+	if len(c.AllowCIDRs) > 0 {
+		s.SetIPAllow(c.AllowCIDRs)
+	}
 	s.curCfg = c
 }
 

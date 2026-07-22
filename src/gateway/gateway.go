@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -91,6 +92,11 @@ type Server struct {
 	// I56：安全响应头开关。开启时 wrap 注入 X-Content-Type-Options / X-Frame-Options /
 	// Referrer-Policy 等基线安全头，缓解 MIME 嗅探 / 点击劫持 / 引用泄露。默认开启。
 	secHeaders bool
+
+	// I57：IP 白名单（CIDR 列表）。非空时仅允许列表内客户端 IP 访问，其余返回 403。
+	// 为空表示不限制。用于网关仅对内网/特定来源开放的场景。
+	ipAllowMu sync.Mutex
+	ipAllow   []*net.IPNet
 }
 
 // tokenBucket 是单客户端的令牌桶：按时间补充令牌，桶满截断；取用时需至少 1 枚令牌。
@@ -129,6 +135,55 @@ func (s *Server) SetCompress(on bool) { s.compress = on }
 
 // SetSecurityHeaders 配置是否注入基线安全响应头（生产可用）。默认开启。
 func (s *Server) SetSecurityHeaders(on bool) { s.secHeaders = on }
+
+// SetIPAllow 配置 IP 白名单（CIDR 字符串列表）。解析失败的条目被跳过并记录警告；
+// 空列表表示关闭白名单（允许所有来源）。并发安全。
+func (s *Server) SetIPAllow(cidrs []string) {
+	var nets []*net.IPNet
+	for _, c := range cidrs {
+		_, ipnet, err := net.ParseCIDR(c)
+		if err != nil {
+			s.logf(levelWarn, "invalid allow_cidr, skipped", map[string]string{"cidr": c})
+			continue
+		}
+		nets = append(nets, ipnet)
+	}
+	s.ipAllowMu.Lock()
+	s.ipAllow = nets
+	s.ipAllowMu.Unlock()
+}
+
+// clientAllowed 判断请求来源 IP 是否在白名单内。白名单为空时恒返回 true（不限制）。
+// 来源 IP 优先取 X-Forwarded-For 首段（经反代时），否则取 RemoteAddr 的 IP 部分。
+func (s *Server) clientAllowed(r *http.Request) bool {
+	s.ipAllowMu.Lock()
+	nets := s.ipAllow
+	s.ipAllowMu.Unlock()
+	if len(nets) == 0 {
+		return true
+	}
+	ipStr := r.RemoteAddr
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		if idx := strings.IndexAny(fwd, ", "); idx >= 0 {
+			ipStr = fwd[:idx]
+		} else {
+			ipStr = fwd
+		}
+	}
+	ip := net.ParseIP(ipStr)
+	if idx := strings.LastIndex(ipStr, ":"); idx >= 0 {
+		ip = net.ParseIP(ipStr[:idx])
+	}
+	if ip == nil {
+		return false
+	}
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
 
 // SetClientRateLimit 配置每客户端令牌桶限流（生产可用）：rps 为每客户端每秒补充
 // 令牌数，burst 为桶容量（允许的最大突发请求数）。rps<=0 表示关闭限流。
@@ -399,6 +454,14 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("Referrer-Policy", "no-referrer")
 		}
+		// I57：IP 白名单。白名单非空且来源 IP 不在列表内 -> 403 拒绝（在并发/限流之前）。
+		if !s.clientAllowed(r) {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, `{"error":"source IP not allowed","code":403}`)
+			s.logf(levelWarn, "ip not allowed", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
+			return
+		}
 		// I54：请求体大小上限。已知 Content-Length 超阈值直接 413 拒绝；并对 body 套
 		// MaxBytesReader 兜底（覆盖 chunked / 流式超发），避免超大 body 打爆内存或后端。
 		if s.maxBodySize > 0 {
@@ -580,6 +643,7 @@ type ConfigSnapshot struct {
 	MaxBodySize     int64    `json:"max_body_size"`
 	Compress        bool     `json:"compress"`
 	SecurityHeaders bool     `json:"security_headers"`
+	AllowCIDRs      []string `json:"allow_cidrs"`
 }
 
 // handleDebugConfig 返回网关当前生效配置快照（I52），便于排障确认配置加载结果。
@@ -596,6 +660,7 @@ func (s *Server) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
 		MaxBodySize:     int64(c.MaxBodySize),
 		Compress:        c.Compress,
 		SecurityHeaders: c.SecurityHeaders,
+		AllowCIDRs:      c.AllowCIDRs,
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
