@@ -128,6 +128,8 @@ CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh conf
   无法提交，若仅按角色判就绪会误报「可服务」。故 `ShardDebug` 新增 `Lease` 字段，`clusterHealthy()`
   以「持租约 leader + 无迁移卡滞」为就绪判据，`/readyz` 据此返回 200/503。
 
+- **缓存击穿/穿透防护 + 命中率指标（#83-#87）**：kvcli 读穿缓存在 #73 基础上做深——① **单飞 singleflight**（`util.Group`，并发同 key 回源只打一次后端，防热点 key 同时失效把压力打爆）；② **回源成功才写缓存**，且 sf 关闭路径同样写缓存（修复一处分支遗漏：sf 关闭时 Get 不写缓存导致穿透）；③ **可观测性**：`CacheStats()` 暴露 `hits/misses/coalesced/negative` 原子计数器，`Bench` 额外报告窗口内缓存命中率，便于评估缓存收益；④ **负向空值** 计入 `negative`（KV 对未设置 key 返回 `OK`+空串而非 404，故穿透已借正缓存缓解，无需独立负缓存契约）。`client_cache_integration_test.go` 综合守护：100 并发同 key → 后端仅回源 1 次、命中=99、合并>0。
+
 ## 5. 快速排障 SOP
 
 1. 复现挂死时先 `curl /status` 看 `healthy` 与哪个 group 异常。
