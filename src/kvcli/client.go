@@ -44,6 +44,9 @@ type Client struct {
 	missC      int64
 	coalescedC int64
 	negC       int64
+
+	// 请求级超时（纳秒，原子存储）：当传入 ctx 无 deadline 时，回源请求附加此超时；0=不附加。
+	reqTimeoutNs int64
 }
 
 // cacheEntry 是单条缓存值及其绝对过期时刻。
@@ -248,6 +251,25 @@ func (c *Client) invalidateCache(key string) {
 // SetRetry 配置客户端级重试：对网络错误与 503/504（瞬态）最多重试 max 次，
 // 指数退避（base 起，上限 2s）。max<=0 表示不重试（默认，保持历史行为）。
 // Put/Append 经网关 Clerk 幂等去重，重试安全；Get 天然幂等，可安全重试。
+// SetRequestTimeout 设置请求级超时：当传入的 ctx 没有 deadline 时，回源请求会附加该超时。
+// 设为 0 则不附加（完全依赖传入 ctx）。可在并发使用前调用，内部以原子存储保证并发安全。
+func (c *Client) SetRequestTimeout(d time.Duration) {
+	atomic.StoreInt64(&c.reqTimeoutNs, int64(d))
+}
+
+// ctxForRequest 在 ctx 无 deadline 时包裹请求级超时，返回新 ctx 与 cancel（调用方须 defer cancel）。
+// 已有 deadline 则不复盖（避免调用方超时失效），保证回源不会因包装而突破调用方约束。
+func (c *Client) ctxForRequest(ctx context.Context) (context.Context, context.CancelFunc) {
+	ns := atomic.LoadInt64(&c.reqTimeoutNs)
+	if ns <= 0 {
+		return ctx, func() {}
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, time.Duration(ns))
+}
+
 func (c *Client) SetRetry(max int, base time.Duration) {
 	c.maxRetries = max
 	if base <= 0 {
@@ -294,14 +316,22 @@ func (c *Client) Get(key string) (string, error) {
 	return c.getCtx(context.Background(), key)
 }
 
+// GetCtx 带 ctx 读取 key（见 Get）。调用方可用 ctx 控制超时/取消；传入的 ctx 若已带 deadline，
+// 不会被请求级超时（SetRequestTimeout）覆盖，保证调用方约束优先。
+func (c *Client) GetCtx(ctx context.Context, key string) (string, error) {
+	return c.getCtx(ctx, key)
+}
+
 // fetchGet 是 Get 的纯回源逻辑（含重试），不含缓存/单飞。返回后端原始响应体字符串。
 func (c *Client) fetchGet(ctx context.Context, key string) (string, error) {
 	var lastErr error
+	reqCtx, cancel := c.ctxForRequest(ctx)
+	defer cancel()
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if attempt > 0 {
 			time.Sleep(c.backoffFor(attempt))
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/kv/"+url.PathEscape(key), nil)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.base+"/kv/"+url.PathEscape(key), nil)
 		if err != nil {
 			return "", err
 		}
@@ -483,11 +513,13 @@ func (c *Client) Put(key, value string) error {
 
 func (c *Client) putCtx(ctx context.Context, key, value string) error {
 	var lastErr error
+	reqCtx, cancel := c.ctxForRequest(ctx)
+	defer cancel()
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if attempt > 0 {
 			time.Sleep(c.backoffFor(attempt))
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.base+"/kv/"+url.PathEscape(key), strings.NewReader(value))
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, c.base+"/kv/"+url.PathEscape(key), strings.NewReader(value))
 		if err != nil {
 			return err
 		}
@@ -517,11 +549,13 @@ func (c *Client) Append(key, value string) error {
 
 func (c *Client) appendCtx(ctx context.Context, key, value string) error {
 	var lastErr error
+	reqCtx, cancel := c.ctxForRequest(ctx)
+	defer cancel()
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if attempt > 0 {
 			time.Sleep(c.backoffFor(attempt))
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/kv/"+url.PathEscape(key)+"/append", strings.NewReader(value))
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.base+"/kv/"+url.PathEscape(key)+"/append", strings.NewReader(value))
 		if err != nil {
 			return err
 		}
