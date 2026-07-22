@@ -6,7 +6,10 @@
 //   - 避免各调用点重复手写易错的逐字段比较。
 package shardmaster
 
-import "sort"
+import (
+	"fmt"
+	"sort"
+)
 
 // slicesEqualSet 判断两个字符串切片作为集合是否相等（忽略顺序、允许重复计数一致）。
 // 用于比较 Config.Groups 中 gid 对应的 server 列表（顺序在不同 copy 路径下可能不一致）。
@@ -86,4 +89,43 @@ func OwnedShards(c *Config, gid int) []int {
 		}
 	}
 	return out
+}
+
+// ValidateConfig 校验单份配置的内部一致性，返回所有违规描述（空切片=合法）。
+// 用于 Apply 前预检 / Query 结果自检，把"分片指向不存在的 group"这类
+// 静默配置错误提前暴露为可读错误，而非带病上线后数据错乱。
+func ValidateConfig(c *Config) []string {
+	if c == nil {
+		return []string{"config is nil"}
+	}
+	var problems []string
+	if c.Num < 0 {
+		problems = append(problems, fmt.Sprintf("negative config number %d", c.Num))
+	}
+	// 已编号（>0）的配置必须有 group，否则分片无主。
+	if c.Num > 0 && len(c.Groups) == 0 {
+		problems = append(problems, fmt.Sprintf("config numbered %d has no groups", c.Num))
+	}
+	for gid, servers := range c.Groups {
+		if len(servers) == 0 {
+			problems = append(problems, fmt.Sprintf("gid %d has no servers", gid))
+			continue
+		}
+		for _, addr := range servers {
+			if addr == "" {
+				problems = append(problems, fmt.Sprintf("gid %d has empty server address", gid))
+			}
+		}
+	}
+	// 每个分片必须指向一个存在的 group（除非尚未分配、gid==0 且整体处于初始态）。
+	for i := 0; i < NShards; i++ {
+		gid := c.Shards[i]
+		if gid == 0 {
+			continue // 初始未分配：允许
+		}
+		if _, ok := c.Groups[gid]; !ok {
+			problems = append(problems, fmt.Sprintf("shard %d assigned to unknown gid %d", i, gid))
+		}
+	}
+	return problems
 }
