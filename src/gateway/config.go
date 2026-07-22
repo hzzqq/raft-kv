@@ -132,20 +132,39 @@ func LoadGatewayConfig(path string) (GatewayConfig, error) {
 }
 
 // Apply 把配置应用到 Server（仅在显式非零时覆盖，避免把默认值反向清零）。
-// 在 NewServer 之后、Handler() 之前调用。
+// 在 NewServer 之后、Handler() 之前调用。越界/可疑值会记 warn 日志（经 s.logf），
+// 便于在 /debug/log 中回看配置加载时的问题，但不阻断启动。
 func (c GatewayConfig) Apply(s *Server) {
 	if c.RequestTimeout > 0 {
+		if c.RequestTimeout > 600 {
+			s.logf(levelWarn, "config: request_timeout_sec unusually large", map[string]string{"value": strconv.Itoa(c.RequestTimeout)})
+		}
 		s.SetRequestTimeout(time.Duration(c.RequestTimeout) * time.Second)
+	} else if c.RequestTimeout < 0 {
+		s.logf(levelWarn, "config: negative request_timeout_sec ignored", map[string]string{"value": strconv.Itoa(c.RequestTimeout)})
 	}
 	if c.MaxConcurrent > 0 {
+		if c.MaxConcurrent < 4 {
+			s.logf(levelWarn, "config: max_concurrent very low (frequent 429 risk)", map[string]string{"value": strconv.Itoa(c.MaxConcurrent)})
+		}
 		s.sem = make(chan struct{}, c.MaxConcurrent)
+	} else if c.MaxConcurrent < 0 {
+		s.logf(levelWarn, "config: negative max_concurrent ignored", map[string]string{"value": strconv.Itoa(c.MaxConcurrent)})
 	}
 	if c.MaxBodySize > 0 {
+		if c.MaxBodySize < 1024 {
+			s.logf(levelWarn, "config: max_body_size very small", map[string]string{"value": strconv.Itoa(c.MaxBodySize)})
+		} else if c.MaxBodySize > 100*1024*1024 {
+			s.logf(levelWarn, "config: max_body_size very large", map[string]string{"value": strconv.Itoa(c.MaxBodySize)})
+		}
 		s.maxBodySize = int64(c.MaxBodySize)
 	}
 	s.compress = c.Compress
 	s.secHeaders = c.SecurityHeaders
 	if c.ClientBurst > 0 {
+		if c.ClientRate <= 0 {
+			s.logf(levelWarn, "config: client_rate <=0 with client_burst set (rate limiting ineffective)", map[string]string{"client_burst": strconv.Itoa(c.ClientBurst)})
+		}
 		s.SetClientRateLimit(c.ClientRate, c.ClientBurst)
 	}
 	s.SetCORS(c.CORSOrigins)

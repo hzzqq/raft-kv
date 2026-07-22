@@ -1257,3 +1257,48 @@ func TestGatewayDebugVersion(t *testing.T) {
 		t.Fatalf("uptime_sec = %v, want ~100", out.UptimeSec)
 	}
 }
+
+// TestGatewayConfigValidate：验证配置校验告警（I60）。cluster-free 构造 Server，
+// 用一个越界配置 Apply，断言 /debug/log?level=warn 中出现对应 warn（max_concurrent 过低、
+// client_rate<=0 与 client_burst 共存、max_body_size 过小、allow_cidr 解析失败）。
+func TestGatewayConfigValidate(t *testing.T) {
+	s := &Server{
+		sem:            make(chan struct{}, maxConcurrent),
+		accessCap:      256,
+		logCap:         256,
+		requestTimeout: 30 * time.Second,
+		clientLimiters: make(map[string]*tokenBucket),
+	}
+	cfg := GatewayConfig{
+		ListenAddr:     ":9090",
+		RequestTimeout: 30,
+		MaxConcurrent:  1, // 过低 -> warn
+		ClientRate:     0,
+		ClientBurst:    10,                     // 与 client_rate 0 共存 -> warn
+		MaxBodySize:    10,                     // 过小 -> warn
+		AllowCIDRs:     []string{"not-a-cidr"}, // 解析失败 -> warn
+	}
+	cfg.Apply(s)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleDebugLog(w, r)
+	}))
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/debug/log?level=warn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	body := string(b)
+	for _, want := range []string{
+		"max_concurrent very low",
+		"client_rate",
+		"max_body_size very small",
+		"invalid allow_cidr",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected warn log containing %q; body=%s", want, body)
+		}
+	}
+}
