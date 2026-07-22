@@ -411,6 +411,53 @@ func (c *Client) MGetCtx(ctx context.Context, keys []string) MGetResult {
 	return res
 }
 
+// MSetResult 批量写入结果：按 key 归集成功/失败，互不阻断。
+type MSetResult struct {
+	Results map[string]error // 每个 key 的写入结果：nil=成功
+	Errors  map[string]error // 仅失败项，便于调用方快速遍历处理
+	Failed  int              // 失败总数
+	Total   int              // 总 key 数
+}
+
+// MSet 并发批量写入多个 key-value（见 MSetCtx）。
+func (c *Client) MSet(pairs map[string]string) MSetResult {
+	return c.MSetCtx(context.Background(), pairs)
+}
+
+// MSetCtx 并发批量写入，复用单 key 的回源/重试/缓存失效全链路。
+// 每个 (key,value) 独立成功/失败，互不阻断：成功的在 Results 记为 nil，
+// 失败的进入 Results 与 Errors。写成功后 putCtx 已顺带失效本地缓存，保证写后读一致。
+// 空输入安全返回空结果。并发由 goroutine+WaitGroup 驱动（key 数通常有限；
+// 超大批量由调用方自行分批）。
+func (c *Client) MSetCtx(ctx context.Context, pairs map[string]string) MSetResult {
+	res := MSetResult{
+		Results: make(map[string]error, len(pairs)),
+		Errors:  make(map[string]error, 0),
+		Total:   len(pairs),
+	}
+	if len(pairs) == 0 {
+		return res
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for k, v := range pairs {
+		wg.Add(1)
+		go func(k, v string) {
+			defer wg.Done()
+			err := c.putCtx(ctx, k, v)
+			mu.Lock()
+			res.Results[k] = err
+			if err != nil {
+				res.Errors[k] = err
+			}
+			mu.Unlock()
+		}(k, v)
+	}
+	wg.Wait()
+	res.Failed = len(res.Errors)
+	return res
+}
+
 // CacheStats 汇总客户端缓存层的可观测指标（并发原子计数快照）。
 type CacheStats struct {
 	Hits      int64 // 缓存命中（含负向空值命中）
