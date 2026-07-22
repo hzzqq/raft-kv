@@ -21,6 +21,7 @@ type GatewayConfig struct {
 	ClientBurst    int      `yaml:"client_burst"`
 	CORSOrigins    []string `yaml:"cors_origins"`
 	MaxBodySize    int      `yaml:"max_body_size"`
+	Compress       bool     `yaml:"compress"`
 }
 
 // DefaultGatewayConfig 返回代码内默认值。
@@ -33,6 +34,7 @@ func DefaultGatewayConfig() GatewayConfig {
 		ClientBurst:    40,
 		CORSOrigins:    nil,
 		MaxBodySize:    1 << 20,
+		Compress:       true,
 	}
 }
 
@@ -78,6 +80,8 @@ func ParseGatewayConfig(data []byte) (GatewayConfig, error) {
 			if n, err := strconv.Atoi(val); err == nil {
 				cfg.MaxBodySize = n
 			}
+		case "compress":
+			cfg.Compress = (val == "true" || val == "1" || val == "yes")
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -131,6 +135,7 @@ func (c GatewayConfig) Apply(s *Server) {
 	if c.MaxBodySize > 0 {
 		s.maxBodySize = int64(c.MaxBodySize)
 	}
+	s.compress = c.Compress
 	if c.ClientBurst > 0 {
 		s.SetClientRateLimit(c.ClientRate, c.ClientBurst)
 	}

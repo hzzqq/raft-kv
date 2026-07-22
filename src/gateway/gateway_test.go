@@ -2,6 +2,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -1029,5 +1030,59 @@ func TestGatewayMaxBodySize(t *testing.T) {
 	resp2.Body.Close()
 	if string(b) != "ok" {
 		t.Fatalf("small body inner handler output = %q, want ok", string(b))
+	}
+}
+
+// TestGatewayCompress：验证响应 gzip 压缩（I55）。cluster-free 直接构造 Server，
+// 套 wrap + no-op handler。带 Accept-Encoding: gzip 时响应须有 Content-Encoding: gzip
+// 且 body 可解压回原文；不带则原样返回。
+func TestGatewayCompress(t *testing.T) {
+	s := &Server{
+		sem:            make(chan struct{}, maxConcurrent),
+		accessCap:      256,
+		logCap:         256,
+		requestTimeout: 30 * time.Second,
+		compress:       true,
+	}
+	inner := func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, strings.Repeat("payload-", 200)) }
+	h := s.wrap(inner)
+	ts := httptest.NewServer(http.HandlerFunc(h))
+	defer ts.Close()
+
+	// 带 gzip
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/x", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", resp.Header.Get("Content-Encoding"))
+	}
+	if resp.Header.Get("Vary") == "" {
+		t.Fatalf("Vary header missing (cache-correctness regression)")
+	}
+	gr, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(gr)
+	resp.Body.Close()
+	if string(out) != strings.Repeat("payload-", 200) {
+		t.Fatalf("decompressed body mismatch (len=%d)", len(out))
+	}
+
+	// 不带 gzip -> 原样
+	resp2, err := http.Get(ts.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp2.Header.Get("Content-Encoding") == "gzip" {
+		t.Fatalf("unexpected gzip when client did not ask")
+	}
+	b2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if string(b2) != strings.Repeat("payload-", 200) {
+		t.Fatalf("uncompressed body mismatch (len=%d)", len(b2))
 	}
 }

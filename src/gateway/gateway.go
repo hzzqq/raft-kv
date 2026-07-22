@@ -10,6 +10,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -82,6 +83,10 @@ type Server struct {
 	// 已知 Content-Length 直接 413 拒绝，并对 body 套 MaxBytesReader 兜底（含 chunked）。
 	// 默认 1MB（与历史 handler 内 1<<20 限额一致），可由配置 max_body_size 覆盖。
 	maxBodySize int64
+
+	// I55：响应 gzip 压缩开关。开启且客户端 Accept-Encoding 含 gzip 时，对响应体压缩
+	// （省带宽）；同时写 Vary: Accept-Encoding 避免共享缓存按错误编码缓存。默认开启。
+	compress bool
 }
 
 // tokenBucket 是单客户端的令牌桶：按时间补充令牌，桶满截断；取用时需至少 1 枚令牌。
@@ -113,6 +118,10 @@ func (s *Server) SetRequestTimeout(d time.Duration) { s.requestTimeout = d }
 // SetMaxBodySize 配置单请求最大请求体字节数（生产可用）。<=0 表示不限制。
 // 经 wrap 的 413 拒绝 + MaxBytesReader 兜底生效。
 func (s *Server) SetMaxBodySize(n int64) { s.maxBodySize = n }
+
+// SetCompress 配置是否对响应启用 gzip 压缩（生产可用）。仅当客户端 Accept-Encoding
+// 含 gzip 时压缩，并自动加 Vary: Accept-Encoding。
+func (s *Server) SetCompress(on bool) { s.compress = on }
 
 // SetClientRateLimit 配置每客户端令牌桶限流（生产可用）：rps 为每客户端每秒补充
 // 令牌数，burst 为桶容量（允许的最大突发请求数）。rps<=0 表示关闭限流。
@@ -240,12 +249,21 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	return r.ResponseWriter.Write(b)
 }
 
+// gzipResponseWriter 把 *gzip.Writer 适配成 http.ResponseWriter：Header/WriteHeader
+// 透传底层 ResponseWriter，Write 转发到 gzip 压缩流。仅用于 wrap 的 gzip 分支。
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	gz *gzip.Writer
+}
+
+func (g *gzipResponseWriter) Write(p []byte) (int, error) { return g.gz.Write(p) }
+
 // SetTestDelay 仅供单测注入人为延迟，使 429 路径可被稳定复现。生产不可用。
 func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 
 // NewServer 用给定集群构造网关（不立即加入 group，需先 Init）。
 func NewServer(c *cluster.Cluster) *Server {
-	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20}
+	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20, compress: true}
 }
 
 // logLevel 是结构化日志级别，数值越大越严重。
@@ -407,6 +425,16 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		if s.testDelay > 0 {
 			time.Sleep(s.testDelay)
 		}
+		// I55：响应 gzip 压缩。仅当开启且客户端 Accept-Encoding 含 gzip 时压缩，
+		// 并写 Vary: Accept-Encoding 避免共享缓存错乱。错误响应走的早期 return 已先
+		// 于此处返回，不会被压缩。
+		if s.compress && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Add("Vary", "Accept-Encoding")
+			gz := gzip.NewWriter(w)
+			defer gz.Close()
+			w = &gzipResponseWriter{ResponseWriter: w, gz: gz}
+		}
 		rec := &statusRecorder{ResponseWriter: w}
 		h(rec, r)
 		st := rec.status
@@ -536,6 +564,7 @@ type ConfigSnapshot struct {
 	ClientBurst    int      `json:"client_burst"`
 	CORSOrigins    []string `json:"cors_origins"`
 	MaxBodySize    int64    `json:"max_body_size"`
+	Compress       bool     `json:"compress"`
 }
 
 // handleDebugConfig 返回网关当前生效配置快照（I52），便于排障确认配置加载结果。
@@ -550,6 +579,7 @@ func (s *Server) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
 		ClientBurst:    c.ClientBurst,
 		CORSOrigins:    c.CORSOrigins,
 		MaxBodySize:    int64(c.MaxBodySize),
+		Compress:       c.Compress,
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
