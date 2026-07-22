@@ -1214,3 +1214,46 @@ func TestGatewayDebugRoutes(t *testing.T) {
 		}
 	}
 }
+
+// TestGatewayDebugVersion：验证版本与 uptime 端点（I59）。cluster-free 直接构造 Server，
+// 设 startedAt 过去 100s、version 后，经 Handler() 调 /debug/version，断言 uptime≈100 且
+// version 透传、含 go_version。
+func TestGatewayDebugVersion(t *testing.T) {
+	s := &Server{
+		sem:            make(chan struct{}, maxConcurrent),
+		accessCap:      256,
+		logCap:         256,
+		requestTimeout: 30 * time.Second,
+		startedAt:      time.Now().Add(-100 * time.Second),
+		version:        "test-1.2.3",
+	}
+	mux := s.Handler()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/debug/version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var out struct {
+		Version   string  `json:"version"`
+		GoVersion string  `json:"go_version"`
+		UptimeSec float64 `json:"uptime_sec"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Version != "test-1.2.3" {
+		t.Fatalf("version = %q, want test-1.2.3", out.Version)
+	}
+	if out.GoVersion == "" {
+		t.Fatalf("go_version empty")
+	}
+	if out.UptimeSec < 99 || out.UptimeSec > 101 {
+		t.Fatalf("uptime_sec = %v, want ~100", out.UptimeSec)
+	}
+}

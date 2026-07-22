@@ -19,6 +19,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,6 +102,10 @@ type Server struct {
 	// I58：已注册路由清单（在 Handler() 中填充），供 /debug/routes 暴露，便于确认路由面。
 	routeMu sync.Mutex
 	routes  []string
+
+	// I59：启动时间与版本号，供 /debug/version 暴露，便于运行时透明与 uptime 监控。
+	startedAt time.Time
+	version   string
 }
 
 // tokenBucket 是单客户端的令牌桶：按时间补充令牌，桶满截断；取用时需至少 1 枚令牌。
@@ -139,6 +144,9 @@ func (s *Server) SetCompress(on bool) { s.compress = on }
 
 // SetSecurityHeaders 配置是否注入基线安全响应头（生产可用）。默认开启。
 func (s *Server) SetSecurityHeaders(on bool) { s.secHeaders = on }
+
+// SetVersion 配置网关版本号（生产可用），供 /debug/version 暴露。
+func (s *Server) SetVersion(v string) { s.version = v }
 
 // SetIPAllow 配置 IP 白名单（CIDR 字符串列表）。解析失败的条目被跳过并记录警告；
 // 空列表表示关闭白名单（允许所有来源）。并发安全。
@@ -329,7 +337,7 @@ func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 
 // NewServer 用给定集群构造网关（不立即加入 group，需先 Init）。
 func NewServer(c *cluster.Cluster) *Server {
-	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20, compress: true, secHeaders: true}
+	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20, compress: true, secHeaders: true, startedAt: time.Now(), version: "dev"}
 }
 
 // logLevel 是结构化日志级别，数值越大越严重。
@@ -441,6 +449,8 @@ func (s *Server) Handler() http.Handler {
 	register("GET /debug/config", s.handleDebugConfig)
 	// I58：已注册路由清单，便于确认网关路由面（含本端点自身）。
 	register("GET /debug/routes", s.handleDebugRoutes)
+	// I59：版本与 uptime，便于运行时透明与监控（不含任何敏感配置）。
+	register("GET /debug/version", s.handleDebugVersion)
 	s.routeMu.Lock()
 	s.routes = routes
 	s.routeMu.Unlock()
@@ -680,6 +690,23 @@ func (s *Server) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(snap); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// handleDebugVersion 返回网关版本与 uptime（I59），便于运行时透明与监控。
+// 不含任何敏感配置字段。
+func (s *Server) handleDebugVersion(w http.ResponseWriter, r *http.Request) {
+	uptime := time.Since(s.startedAt).Seconds()
+	out := map[string]interface{}{
+		"version":    s.version,
+		"go_version": runtime.Version(),
+		"started_at": s.startedAt.UTC().Format(time.RFC3339),
+		"uptime_sec": uptime,
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(out); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
