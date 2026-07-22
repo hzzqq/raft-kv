@@ -488,6 +488,23 @@ func (c *Client) MSetCtx(ctx context.Context, pairs map[string]string) MSetResul
 	return res
 }
 
+// WarmUp 并发预热指定 keys 到本地缓存（复用 MGet 回源链路，成功后写入缓存）。
+// 适合启动期/定时批量填充热点 key，降低首次访问延迟。部分失败不阻断、返回聚合错误。
+// 需先启用缓存（EnableCache），否则返回错误（无缓存则预热无意义）。
+func (c *Client) WarmUp(keys []string) error {
+	c.cacheMu.Lock()
+	enabled := c.cache != nil
+	c.cacheMu.Unlock()
+	if !enabled {
+		return fmt.Errorf("WarmUp 需要启用缓存：先调用 EnableCache")
+	}
+	res := c.MGet(keys)
+	if len(res.Errors) > 0 {
+		return fmt.Errorf("warmup 失败 %d/%d 个 key", len(res.Errors), len(keys))
+	}
+	return nil
+}
+
 // CacheStats 汇总客户端缓存层的可观测指标（并发原子计数快照）。
 type CacheStats struct {
 	Hits      int64 // 缓存命中（含负向空值命中）
