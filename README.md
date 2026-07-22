@@ -240,6 +240,22 @@ export GO111MODULE=on
 
 全部变更已本地提交；R3 #54–#62 已按授权 `git push origin master`（仅 fast-forward），#63–#67 待批量 push。
 
+### R3 自主迭代交付（#68–#82，客户端/工具/可观测性增强）
+
+R3 续批（内部迭代 n=#68–#82）。延续「网关/客户端/工具测试一律 cluster-free，绕开沙箱 raft 选举偶发挂死」的纪律，全部本地提交 + 白盒测试验证：
+
+- **工程化/文档（#68）**：README 同步 R3 #54–#67 交付小结；runbook §4 新增「RPC 分发器必须覆盖全部 Raft 内部 RPC」正确性决策（源自 #71 修复的真实回归）。
+- **白盒测试与隐性回归修复（#69–#72）**：raft `Persister` 读写往返/拷贝隔离、shardmaster `rebalance`/`validate` 纯函数（无主/空组/不匀摊）、`statusfmt` 渲染、demo `key2shard`、kvcli 错误体透传/超时等白盒测试；并修复 #47 遗留的集群测试分发器未登记 `RequestPreVote`/`TimeoutNow` 真实回归（#71，使 ShardMaster/ShardKV 集群测试恢复可运行）。
+- **kvcli 客户端（#73/#74）**：读穿缓存（`EnableCache`：TTL + 容量上限 + Put/Append 写失效，降低回源）；客户端级重试（对网络错误 / 503 / 504 指数退避，Put/Append 因网关 Clerk 幂等去重安全可重试）。
+- **metrics（#75）**：直方图新增 `Min`/`Max` 字段（Snapshot 暴露，避免 JSON 出现非有限数被 Prometheus 拒绝），新增 `Timer` 便捷类型（`Record` 一段耗时，比手写 `Record` 更不易漏）。
+- **shardmaster（#76）**：纯函数配置比较辅助 `ConfigsEqual` / `IsNewer` / `NextConfigNum` / `OwnedShards`，统一「配置演进判断」语义，便于测试断言与诊断端点复用。
+- **kvraft（#77）**：幂等去重白盒测试（直接喂 `applyCh`，验证同 `clientId+seq` 重复命令复用 `LastResult`、新 seq 才重执行），守护线性一致性的关键保证。
+- **util 工具包（#78/#81）**：新增 `util.Backoff`（指数退避 + 抖动 + 上限，供 kvcli/demo 重试复用）、`util.LRU`（有界最近最少使用缓存，容量超限淘汰最久未用）。
+- **demo（#79）**：`waitHealth` 改为指数退避重试（复用 `util.Backoff`），网关/集群暂不可达时不会空打也不会永久阻塞。
+- **gateway（#80）**：per-route 请求指标埋点（请求总数 / 延迟直方图 / 按状态码分桶计数），经 `/metrics` 与 KV 层 `shardkv.Metrics` 合并暴露，统一采集网关 HTTP 面与 KV 层健康度。
+
+R3 #54–#82 全部本地提交；#54–#72 已按授权 fast-forward 推送，本批 #73–#82 在批次收尾时 fast-forward 推送（仅 fast-forward、绝不 `--force`、绝不 `rm -rf`）。
+
 ## 说明
 - 这是面向学习的实验性实现，重点在正确性与可读性，非生产级部署。
 - 持久化、RPC、网络均使用 MIT 6.824 提供的实验脚手架（`persister.go` / `labrpc.go`）。

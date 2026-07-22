@@ -99,6 +99,12 @@ CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh conf
   测试桩（`src/shardkv/shardkv_test.go`，其 ShardMaster 分发器**与** kv 分发器都要加）。#47 只修了
   ①、漏了 ②③④，导致 ShardMaster/ShardKV 集群测试长期 panic（被沙箱选举 flake 掩盖）；#71 已补全
   ②③④ 并验证 `TestShardMasterValidation`/`TestSKVBasic` 跑通。后续任何新增 raft 内部 RPC 都须同步这四处。
+
+- **缓存失效策略（#73）**：kvcli 读穿缓存仅在 `Put`/`Append` **成功**（网关返回 200）时才使该 key 失效；`Get` 命中且未过期直接返回、跳过回源。缓存是 best-effort 性能优化，**不提供强一致保证**（可能短暂返回过期值）——需要强一致的调用方应不开启缓存（默认关闭）。这一定义须固化，避免「读后写未失效」或「失败也失效」两类正确性问题。
+- **客户端重试语义（#74）**：kvcli 仅对**瞬态**故障重试——网络错误与 503/504；4xx（含 429/404）一律不重试，客户端错误应快速失败而非盲目重试放大后端负载。重试安全的前提是后端幂等：`Put`/`Append` 经网关 Clerk 的 `clientId+seq` 去重（见下条），`Get` 天然幂等。
+- **幂等去重保证（#77）**：KV 层以 `clientId+seq` 去重，同 seq 的重复命令复用 `LastResult`，**绝不二次应用**——这是 leader 切换下客户端重试不产生重复写 / 重复 Append 的硬性保证。`kvraft_dedup_test.go` 直接喂 `applyCh` 白盒守护（重复命令返回值=首次 `LastResult`，而非重新读 data / 重新写入）。
+- **可观测性命名规范（#75/#80）**：直方图一律额外暴露 `min`/`max`/`p50`/`p95`/`p99`；网关层指标统一加 `http_` 前缀，与 KV 层（`shardkv_`/`raft_`）分离，避免 scrape 时名称冲突与语义混淆。空直方图的 `min`/`max` 须归零（而非 ±Inf），否则 JSON 出现非有限数被 Prometheus 拒绝。
+- **退避复用约定（#78/#79）**：所有指数退避统一走 `util.Backoff`（base·2^(n-1) 封顶 + 抖动），禁止各调用点手写 `time.Sleep` 退避，确保退避语义一致、可单测。
 - **raft 选举/心跳 Timer 并发守卫（n=25）**：`electionTimer`/`heartbeatTimer` 同时被 ticker 与
   选举/心跳 goroutine 改写，而 `time.Timer` 非并发安全——构成 `-race` 数据竞争。已加 `timerMu`
   守卫 `resetElectionTimer`/`resetHeartbeatTimer`；锁序保证 `timerMu` 不会在持有 `rf.mu` 的反向
