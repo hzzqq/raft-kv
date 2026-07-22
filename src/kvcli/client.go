@@ -366,6 +366,51 @@ func (c *Client) getCtx(ctx context.Context, key string) (string, error) {
 	return s, nil
 }
 
+// MGetResult 是 MGet 批量读取的结果：Results 为成功 key→value，Errors 为失败
+// key→error（按 key 索引）。部分 key 失败不会阻断其余 key，便于调用方做降级处理。
+type MGetResult struct {
+	Results map[string]string
+	Errors  map[string]error
+}
+
+// MGet 并发批量读取多个 key（见 MGetCtx）。无 ctx 版本用 Background，适合一次性批量拉取。
+func (c *Client) MGet(keys []string) MGetResult {
+	return c.MGetCtx(context.Background(), keys)
+}
+
+// MGetCtx 并发批量读取多个 key，复用单 key 的回源/缓存/单飞/重试全链路，
+// 连接复用（同一个 *http.Client，HTTP keep-alive）。每个 key 独立成功/失败，
+// 互不阻断：成功的进入 Results，失败的进入 Errors。并发由 goroutine+WaitGroup
+// 驱动（key 数通常有限；超大批量由调用方自行分批）。空输入安全返回空结果。
+// 注意：当某 key 在 keys 中重复出现且已启用单飞时，重复项会被合并为一次回源。
+func (c *Client) MGetCtx(ctx context.Context, keys []string) MGetResult {
+	res := MGetResult{
+		Results: make(map[string]string, len(keys)),
+		Errors:  make(map[string]error, 0),
+	}
+	if len(keys) == 0 {
+		return res
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, k := range keys {
+		wg.Add(1)
+		go func(k string) {
+			defer wg.Done()
+			v, err := c.getCtx(ctx, k)
+			mu.Lock()
+			if err != nil {
+				res.Errors[k] = err
+			} else {
+				res.Results[k] = v
+			}
+			mu.Unlock()
+		}(k)
+	}
+	wg.Wait()
+	return res
+}
+
 // CacheStats 汇总客户端缓存层的可观测指标（并发原子计数快照）。
 type CacheStats struct {
 	Hits      int64 // 缓存命中（含负向空值命中）
