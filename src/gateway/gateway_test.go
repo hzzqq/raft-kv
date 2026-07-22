@@ -1302,3 +1302,63 @@ func TestGatewayConfigValidate(t *testing.T) {
 		}
 	}
 }
+
+// TestGatewayCircuitBreaker：验证后端健康熔断（I61）。cluster-free 构造 Server（阈值=3，
+// 冷却=50ms），内部 handler 连续返回 500 触发熔断打开，随后请求快速失败 503；冷却后切换
+// 正常 handler 半开探测成功，熔断关闭，恢复 200。
+func TestGatewayCircuitBreaker(t *testing.T) {
+	s := &Server{
+		sem:              make(chan struct{}, maxConcurrent),
+		accessCap:        256,
+		logCap:           256,
+		requestTimeout:   30 * time.Second,
+		breakerThreshold: 3,
+		breakerCooldown:  50 * time.Millisecond,
+	}
+	failing := func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) }
+	h := s.wrap(failing)
+	ts := httptest.NewServer(http.HandlerFunc(h))
+	defer ts.Close()
+
+	// 连续 3 次 500 -> 熔断打开
+	for i := 0; i < 3; i++ {
+		resp, err := http.Get(ts.URL + "/x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	// 第 4 次（冷却未到）应被熔断快速失败 503
+	resp, err := http.Get(ts.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("after open, status=%d want 503", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 等待冷却窗口后，半开探测应放行
+	time.Sleep(80 * time.Millisecond)
+	ok := func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }
+	h2 := s.wrap(ok)
+	ts2 := httptest.NewServer(http.HandlerFunc(h2))
+	defer ts2.Close()
+	resp2, err := http.Get(ts2.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("half-open probe status=%d want 200", resp2.StatusCode)
+	}
+	resp2.Body.Close()
+	// 熔断已关闭，后续请求正常 200
+	resp3, err := http.Get(ts2.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp3.StatusCode != http.StatusOK {
+		t.Fatalf("after recover status=%d want 200", resp3.StatusCode)
+	}
+	resp3.Body.Close()
+}

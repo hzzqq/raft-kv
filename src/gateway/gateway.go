@@ -106,6 +106,15 @@ type Server struct {
 	// I59：启动时间与版本号，供 /debug/version 暴露，便于运行时透明与 uptime 监控。
 	startedAt time.Time
 	version   string
+
+	// I61：后端健康熔断状态。连续 5xx 达阈值进入打开态，后续请求快速失败（503）保护
+	// 后端；冷却窗口后半开探测，成功即恢复。4xx 视为客户端问题不计入后端故障。
+	breakerMu        sync.Mutex
+	breakerErrs      int
+	breakerOpen      bool
+	breakerOpenAt    time.Time
+	breakerCooldown  time.Duration
+	breakerThreshold int
 }
 
 // tokenBucket 是单客户端的令牌桶：按时间补充令牌，桶满截断；取用时需至少 1 枚令牌。
@@ -147,6 +156,56 @@ func (s *Server) SetSecurityHeaders(on bool) { s.secHeaders = on }
 
 // SetVersion 配置网关版本号（生产可用），供 /debug/version 暴露。
 func (s *Server) SetVersion(v string) { s.version = v }
+
+// I61：后端健康熔断。连续 5xx 错误达到阈值后进入「打开」态，后续请求快速失败（503），
+// 避免持续打满已不健康的后端；冷却窗口后半开探测，成功即恢复。4xx 视为客户端问题，
+// 不计入后端故障，会重置计数（含熔断恢复）。
+func (s *Server) breakerOpenNow() bool {
+	s.breakerMu.Lock()
+	defer s.breakerMu.Unlock()
+	if !s.breakerOpen {
+		return false
+	}
+	if time.Since(s.breakerOpenAt) >= s.breakerCooldown {
+		return false // 冷却已过，半开探测放行
+	}
+	return true
+}
+
+func (s *Server) observeBackend(status int) {
+	s.breakerMu.Lock()
+	defer s.breakerMu.Unlock()
+	if status >= 500 {
+		s.breakerErrs++
+		if !s.breakerOpen && s.breakerErrs >= s.breakerThreshold {
+			s.breakerOpen = true
+			s.breakerOpenAt = time.Now()
+			s.logf(levelWarn, "circuit breaker opened", map[string]string{"consecutive_errors": strconv.Itoa(s.breakerErrs)})
+		}
+		return
+	}
+	// 成功或客户端错误：重置连续错误计数；若处于打开态则关闭（半开探测成功）。
+	if s.breakerErrs > 0 {
+		s.breakerErrs = 0
+	}
+	if s.breakerOpen {
+		s.breakerOpen = false
+		s.logf(levelInfo, "circuit breaker closed (recovered)", nil)
+	}
+}
+
+// SetBreaker 配置熔断阈值与冷却窗口（生产可用）。threshold 为连续 5xx 触发数，
+// cooldown 为打开态持续时间（半开探测前的等待）。
+func (s *Server) SetBreaker(threshold int, cooldown time.Duration) {
+	s.breakerMu.Lock()
+	defer s.breakerMu.Unlock()
+	if threshold > 0 {
+		s.breakerThreshold = threshold
+	}
+	if cooldown > 0 {
+		s.breakerCooldown = cooldown
+	}
+}
 
 // SetIPAllow 配置 IP 白名单（CIDR 字符串列表）。解析失败的条目被跳过并记录警告；
 // 空列表表示关闭白名单（允许所有来源）。并发安全。
@@ -337,7 +396,7 @@ func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 
 // NewServer 用给定集群构造网关（不立即加入 group，需先 Init）。
 func NewServer(c *cluster.Cluster) *Server {
-	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20, compress: true, secHeaders: true, startedAt: time.Now(), version: "dev"}
+	return &Server{c: c, clerk: c.Clerk(), sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20, compress: true, secHeaders: true, startedAt: time.Now(), version: "dev", breakerCooldown: 10 * time.Second, breakerThreshold: 5}
 }
 
 // logLevel 是结构化日志级别，数值越大越严重。
@@ -487,6 +546,14 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			s.logf(levelWarn, "ip not allowed", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
 			return
 		}
+		// I61：后端健康熔断（打开态）快速失败，保护已不健康的后端（早于请求体/限流）。
+		if s.breakerOpenNow() {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, `{"error":"circuit breaker open","code":503}`)
+			s.logf(levelWarn, "circuit breaker reject (open)", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
+			return
+		}
 		// I54：请求体大小上限。已知 Content-Length 超阈值直接 413 拒绝；并对 body 套
 		// MaxBytesReader 兜底（覆盖 chunked / 流式超发），避免超大 body 打爆内存或后端。
 		if s.maxBodySize > 0 {
@@ -554,6 +621,8 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			s.logf(levelInfo, "request", fields)
 		}
 		record(st, time.Since(start))
+		// I61：后端健康熔断观测。按最终状态码更新熔断状态（5xx 累计，非 5xx 重置/恢复）。
+		s.observeBackend(st)
 	}
 }
 
