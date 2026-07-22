@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"raftkv/src/util"
 	"sort"
 	"strings"
 	"sync"
@@ -33,6 +34,10 @@ type Client struct {
 	// 重试：对网络错误与 503/504 瞬态最多重试 maxRetries 次，指数退避（retryBase 起，上限 2s）。
 	maxRetries int
 	retryBase  time.Duration
+
+	// 单飞：启用后并发同 key 回源只打一次后端（防缓存击穿）。默认 nil = 关闭。
+	sfOnce sync.Once
+	sf     *util.Group
 }
 
 // cacheEntry 是单条缓存值及其绝对过期时刻。
@@ -237,6 +242,15 @@ func (c *Client) backoffFor(attempt int) time.Duration {
 	return d
 }
 
+// EnableSingleFlight 开启回源单飞：并发同 key 的 Get 只回源一次，其余复用，
+// 防止热点 key 同时失效时把压力集中打到后端（缓存击穿）。默认关闭，
+// 对未启用单飞的调用方完全透明。
+func (c *Client) EnableSingleFlight() {
+	c.sfOnce.Do(func() {
+		c.sf = util.NewGroup()
+	})
+}
+
 // maxErrBody 是错误响应体在错误信息中保留的最大字节数，避免把巨大响应体塞进 error。
 const maxErrBody = 256
 
@@ -257,16 +271,8 @@ func (c *Client) Get(key string) (string, error) {
 	return c.getCtx(context.Background(), key)
 }
 
-func (c *Client) getCtx(ctx context.Context, key string) (string, error) {
-	// 读穿缓存：命中且未过期直接返回，跳过回源（零额外网络开销）。
-	if c.cache != nil {
-		c.cacheMu.Lock()
-		if e, ok := c.cache[key]; ok && time.Now().Before(e.exp) {
-			c.cacheMu.Unlock()
-			return e.val, nil
-		}
-		c.cacheMu.Unlock()
-	}
+// fetchGet 是 Get 的纯回源逻辑（含重试），不含缓存/单飞。返回后端原始响应体字符串。
+func (c *Client) fetchGet(ctx context.Context, key string) (string, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if attempt > 0 {
@@ -290,12 +296,43 @@ func (c *Client) getCtx(ctx context.Context, key string) (string, error) {
 			return "", respErr("GET", key, resp)
 		}
 		b, _ := io.ReadAll(resp.Body)
-		if c.cache != nil {
-			c.storeCache(key, string(b))
-		}
 		return string(b), nil
 	}
 	return "", lastErr
+}
+
+func (c *Client) getCtx(ctx context.Context, key string) (string, error) {
+	// 读穿缓存：命中且未过期直接返回，跳过回源（零额外网络开销）。
+	if c.cache != nil {
+		c.cacheMu.Lock()
+		if e, ok := c.cache[key]; ok && time.Now().Before(e.exp) {
+			c.cacheMu.Unlock()
+			return e.val, nil
+		}
+		c.cacheMu.Unlock()
+	}
+	// 回源：若开启单飞，并发同 key 只回源一次（防缓存击穿）；否则直接回源。
+	var s string
+	var err error
+	if c.sf != nil {
+		v, ferr, _ := c.sf.Do(key, func() (interface{}, error) {
+			return c.fetchGet(ctx, key)
+		})
+		if ferr == nil {
+			s = v.(string)
+		}
+		err = ferr
+	} else {
+		s, err = c.fetchGet(ctx, key)
+	}
+	if err != nil {
+		return "", err
+	}
+	// 回源成功则写缓存（无论是否单飞、是否复用结果，幂等无害，且仅刷新 TTL）。
+	if c.cache != nil {
+		c.storeCache(key, s)
+	}
+	return s, nil
 }
 
 // Put 写入 key = value。网关返回非 200 时返回错误（含响应体）。
