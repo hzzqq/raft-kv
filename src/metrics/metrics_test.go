@@ -106,3 +106,61 @@ func TestPeriodicReporter(t *testing.T) {
 		t.Fatalf("reporter kept writing after stop: %d -> %d", lenAfterStop, buf.Len())
 	}
 }
+
+func TestSanitizeMetricName(t *testing.T) {
+	cases := map[string]string{
+		"":              "_",
+		"shardkv.op_ms": "shardkv_op_ms",
+		"raft-apply":    "raft_apply",
+		"9bad":          "_bad",
+		"with space":    "with_space",
+		"ok_name:vec":   "ok_name:vec",
+	}
+	for in, want := range cases {
+		if got := sanitizeMetricName(in); got != want {
+			t.Fatalf("sanitizeMetricName(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
+func TestWritePrometheus(t *testing.T) {
+	r := NewRegistry()
+	r.Counter("shardkv.ops_total").Inc()
+	r.Gauge("raft.applied_index").Set(42)
+	r.Histogram("shardkv.op_latency_ms").Record(10)
+	r.Histogram("shardkv.op_latency_ms").Record(20)
+
+	var buf bytes.Buffer
+	if err := r.WritePrometheus(&buf); err != nil {
+		t.Fatalf("WritePrometheus error: %v", err)
+	}
+	out := buf.String()
+
+	// 1) 带点的名字必须被清洗，输出中不应残留裸点序列名
+	if bytes.Contains([]byte(out), []byte("shardkv.ops_total ")) ||
+		bytes.Contains([]byte(out), []byte("raft.applied_index ")) ||
+		bytes.Contains([]byte(out), []byte("shardkv.op_latency_ms ")) {
+		t.Fatalf("metric name not sanitized, dot leaked:\n%s", out)
+	}
+	// 2) 简单序列以清洗后的名字正确输出
+	if !bytes.Contains([]byte(out), []byte("shardkv_ops_total 1\n")) {
+		t.Fatalf("counter not emitted:\n%s", out)
+	}
+	if !bytes.Contains([]byte(out), []byte("raft_applied_index 42\n")) {
+		t.Fatalf("gauge not emitted:\n%s", out)
+	}
+	// 3) 禁止对聚合名声明错误的 histogram TYPE（会让 scrape 客户端解析失败）
+	if bytes.Contains([]byte(out), []byte("# TYPE shardkv_op_latency_ms histogram")) {
+		t.Fatalf("must NOT emit histogram TYPE:\n%s", out)
+	}
+	// 4) 直方图派生序列各声明正确 TYPE
+	if !bytes.Contains([]byte(out), []byte("# TYPE shardkv_op_latency_ms_count counter")) {
+		t.Fatalf("missing _count counter TYPE:\n%s", out)
+	}
+	if !bytes.Contains([]byte(out), []byte("# TYPE shardkv_op_latency_ms_sum gauge")) {
+		t.Fatalf("missing _sum gauge TYPE:\n%s", out)
+	}
+	if !bytes.Contains([]byte(out), []byte("# TYPE shardkv_op_latency_ms_p99 gauge")) {
+		t.Fatalf("missing _p99 gauge TYPE:\n%s", out)
+	}
+}

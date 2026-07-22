@@ -53,12 +53,12 @@ func (g *Gauge) Value() float64 {
 // Histogram 记录 float64 样本（如延迟毫秒数），使用固定容量环形缓冲，
 // 无论样本量多大都保持内存有界、分位数查询廉价。
 type Histogram struct {
-	mu    sync.Mutex
-	cap   int
-	pos   int
+	mu      sync.Mutex
+	cap     int
+	pos     int
 	samples []float64
-	count int64
-	sum   float64
+	count   int64
+	sum     float64
 }
 
 const defaultHistCap = 4096
@@ -222,12 +222,39 @@ func (r *Registry) DumpJSON() ([]byte, error) {
 	return json.Marshal(r.Snapshot())
 }
 
+// sanitizeMetricName 把任意注册名转换为合法的 Prometheus 序列名。
+// Prometheus 规范：名字必须匹配 [a-zA-Z_:][a-zA-Z0-9_:]*。各包用带点前缀
+// （如 "shardkv.op_latency_ms"）或连字符命名时，直接写入 exposition 会被
+// scrape 客户端判为非法而整体拒绝——这是一个静默的可观测性缺陷。此处把非法
+// 字符统一替换为 '_'，并对以数字开头的名字前置 '_'，保证输出恒为合法格式。
+func sanitizeMetricName(name string) string {
+	if name == "" {
+		return "_"
+	}
+	b := make([]byte, 0, len(name))
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == ':' ||
+			(c >= '0' && c <= '9' && i > 0)
+		if ok {
+			b = append(b, c)
+		} else {
+			b = append(b, '_')
+		}
+	}
+	return string(b)
+}
+
 // WritePrometheus 把注册表以 Prometheus 文本 exposition 格式写入 w，便于被
 // Prometheus / 任意 scrape 客户端采集。轻量级实现：
-//   - counter / gauge 直接输出为同名序列；
-//   - histogram 输出 _count / _sum 及 p50/p95/p99 四个分位数序列（以 gauge 形式，
-//     便于直接画图；完整的 native histogram 超出本库范围）。
-// 序列名按字母序稳定输出，便于测试断言。Content-Type 由调用方设置。
+//   - counter / gauge 直接输出为同名序列（各自声明对应 TYPE）；
+//   - histogram 拆为多条派生序列：_count 声明为 counter，_sum / _p50 / _p95 /
+//     _p99 声明为 gauge（分位数就是瞬时值）。注意：不再对聚合名声明
+//     "# TYPE <name> histogram"，因为本库输出的是分位数派生序列而非规范要求的
+//     `_bucket{le=...}`；错误地声明 histogram 类型会导致 scrape 客户端解析失败。
+//
+// 所有序列名经 sanitizeMetricName 清洗为合法格式；序列按字母序稳定输出，便于
+// 测试断言。Content-Type 由调用方设置。
 func (r *Registry) WritePrometheus(w io.Writer) error {
 	snap := r.Snapshot()
 	counters, _ := snap["counters"].(map[string]int64)
@@ -245,29 +272,36 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 
 	// 先输出纯 counter/gauge 序列
 	for _, name := range names {
+		sn := sanitizeMetricName(name)
 		if v, ok := counters[name]; ok {
-			if _, err := fmt.Fprintf(w, "# TYPE %s counter\n%s %d\n", name, name, v); err != nil {
+			if _, err := fmt.Fprintf(w, "# TYPE %s counter\n%s %d\n", sn, sn, v); err != nil {
 				return err
 			}
 			continue
 		}
 		if v, ok := gauges[name]; ok {
-			if _, err := fmt.Fprintf(w, "# TYPE %s gauge\n%s %g\n", name, name, v); err != nil {
+			if _, err := fmt.Fprintf(w, "# TYPE %s gauge\n%s %g\n", sn, sn, v); err != nil {
 				return err
 			}
 		}
 	}
 
-	// 直方图序列（顺序稳定）
+	// 直方图派生序列（顺序稳定，每条序列 TYPE 与其真实语义一致）
 	hnames := make([]string, 0, len(hists))
 	for k := range hists {
 		hnames = append(hnames, k)
 	}
 	sort.Strings(hnames)
 	for _, name := range hnames {
+		sn := sanitizeMetricName(name)
 		h := hists[name]
-		if _, err := fmt.Fprintf(w, "# TYPE %s histogram\n%s_count %d\n%s_sum %g\n%s_p50 %g\n%s_p95 %g\n%s_p99 %g\n",
-			name, name, h.Count, name, h.Sum, name, h.P50, name, h.P95, name, h.P99); err != nil {
+		if _, err := fmt.Fprintf(w,
+			"# TYPE %s_count counter\n%s_count %d\n"+
+				"# TYPE %s_sum gauge\n%s_sum %g\n"+
+				"# TYPE %s_p50 gauge\n%s_p50 %g\n"+
+				"# TYPE %s_p95 gauge\n%s_p95 %g\n"+
+				"# TYPE %s_p99 gauge\n%s_p99 %g\n",
+			sn, sn, h.Count, sn, sn, h.Sum, sn, sn, h.P50, sn, sn, h.P95, sn, sn, h.P99); err != nil {
 			return err
 		}
 	}
