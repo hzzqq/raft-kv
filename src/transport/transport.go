@@ -118,11 +118,27 @@ type Server struct {
 	bytesSent   atomic.Int64
 	bytesRecv   atomic.Int64
 	errs        atomic.Int64
+
+	// idleTimeoutNanos 是读空闲超时（纳秒，atomic 存储以支持 Serve 后动态配置）。
+	// >0 时，每个连接在两次帧读取之间的空闲若超过该值，将被主动关闭，从而回收
+	// 半开/慢速连接占用的 goroutine；<=0 表示禁用（默认行为，与历史版本一致）。
+	idleTimeoutNanos atomic.Int64
 }
 
-// NewServer 构造空 Server。
+// NewServer 构造空 Server。默认禁用读空闲超时。
 func NewServer() *Server {
 	return &Server{handlers: make(map[string]MethodHandler), quit: make(chan struct{})}
+}
+
+// SetIdleTimeout 设置服务端读空闲超时：>0 时，连接在两次帧读取之间空闲超过该值将被关闭，
+// 用于回收半开（建连后只发部分帧即 hang）或慢速连接占用的 goroutine；<=0 表示禁用（默认）。
+func (s *Server) SetIdleTimeout(d time.Duration) {
+	s.idleTimeoutNanos.Store(int64(d))
+}
+
+// IdleTimeout 返回当前读空闲超时配置（<=0 表示禁用）。
+func (s *Server) IdleTimeout() time.Duration {
+	return time.Duration(s.idleTimeoutNanos.Load())
 }
 
 // Register 注册一个服务的方法处理器（重复注册同名方法后者覆盖）。
@@ -185,6 +201,14 @@ func (s *Server) serveConn(conn net.Conn) {
 	connCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	for {
+		// 读空闲超时：回收半开/慢速连接占用的 goroutine。每次读帧前刷新
+		// deadline，因此 handler 处理期间的耗时不会误杀下一次读帧（handler
+		// 在两次 readFrame 之间执行，下一次读帧前会重新设定 deadline）。
+		if d := time.Duration(s.idleTimeoutNanos.Load()); d > 0 {
+			if err := conn.SetReadDeadline(time.Now().Add(d)); err != nil {
+				return
+			}
+		}
 		// 方法名帧
 		typ, method, err := readFrame(r)
 		if err != nil {
