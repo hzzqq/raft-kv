@@ -87,6 +87,9 @@ func (s *clerkKvService) Append(ctx context.Context, req *KvRequest) (*KvRespons
 // ServeGRPCWith 在给定监听器上用 transport 暴露 KvService（真实 TCP，非内存桩）。
 // 阻塞直至监听器关闭或出错。
 func (s *Server) ServeGRPCWith(lis net.Listener, svc KvService) error {
+	s.mu.Lock()
+	s.grpcLis = lis
+	s.mu.Unlock()
 	tsvr := transport.NewServer()
 	tsvr.Register(kvServiceDesc(svc))
 	return tsvr.Serve(lis)

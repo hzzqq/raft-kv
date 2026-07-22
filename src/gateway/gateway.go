@@ -55,6 +55,10 @@ type Server struct {
 	mu  sync.Mutex
 	srv *http.Server
 
+	// 可选：gRPC 风格 TCP 监听器（ServeGRPC 时设置），供 Shutdown 一并关闭，
+	// 避免 gRPC 端口在优雅关闭时泄漏（I86 补齐）。
+	grpcLis net.Listener
+
 	// testDelay 仅用于单测：wrap 在取得信号量后休眠该时长，人为拉长在途窗口，
 	// 使并发限流（429）路径能被确定性触发（内存集群后端极快时，正常请求难以
 	// 让在途数打满 64 槽）。生产环境恒为 0，零行为影响。
@@ -174,6 +178,35 @@ func (b *tokenBucket) allow(now time.Time) bool {
 		return true
 	}
 	return false
+}
+
+// inspect 读取当前时刻的令牌桶快照（不消耗令牌）：返回 limit(桶容量)、
+// remaining(当前可用令牌，截断到整数)、resetUnix(下一个令牌可用时的 unix 秒)。
+// 供 X-RateLimit-* 响应头下发，使客户端感知限额与重置时刻。
+func (b *tokenBucket) inspect(now time.Time) (limit, remaining, resetUnix int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	elapsed := now.Sub(b.last).Seconds()
+	tokens := b.tokens + elapsed*b.rate
+	if tokens > b.burst {
+		tokens = b.burst
+	}
+	limit = int64(b.burst)
+	remaining = int64(tokens)
+	if remaining < 0 {
+		remaining = 0
+	}
+	if tokens >= 1 {
+		resetUnix = now.Unix()
+		return
+	}
+	need := 1 - tokens
+	secs := need / b.rate
+	if secs < 0 {
+		secs = 0
+	}
+	resetUnix = now.Add(time.Duration(secs * 1e9)).Unix()
+	return
 }
 
 // SetRequestTimeout 仅供单测覆盖默认单请求超时（生产不可用）。
@@ -413,6 +446,28 @@ func (s *Server) allowClient(r *http.Request) bool {
 	allowed := b.allow(time.Now())
 	s.limitMu.Unlock()
 	return allowed
+}
+
+// setRateLimitHeaders 下发 X-RateLimit-Limit / X-RateLimit-Remaining / X-RateLimit-Reset
+// 响应头（限流开启时），便于客户端感知限额、剩余配额与下一个令牌可用时刻。
+// 在 wrap 早期（限流校验通过后）调用，对所有正常响应一致生效。
+func (s *Server) setRateLimitHeaders(w http.ResponseWriter, r *http.Request) {
+	if s.clientRate <= 0 {
+		return
+	}
+	key := s.clientKey(r)
+	s.limitMu.Lock()
+	b, ok := s.clientLimiters[key]
+	if !ok {
+		// 该客户端桶尚不存在：视为满桶（无消耗），与 allowClient 惰性创建保持一致。
+		b = &tokenBucket{tokens: s.clientBurst, last: time.Now(), rate: s.clientRate, burst: s.clientBurst}
+		s.clientLimiters[key] = b
+	}
+	limit, remaining, resetUnix := b.inspect(time.Now())
+	s.limitMu.Unlock()
+	w.Header().Set("X-RateLimit-Limit", strconv.FormatInt(limit, 10))
+	w.Header().Set("X-RateLimit-Remaining", strconv.FormatInt(remaining, 10))
+	w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(resetUnix, 10))
 }
 
 // accessEntry 是 /debug/accesslog 中单条请求记录。
@@ -850,6 +905,9 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			s.logf(levelWarn, "route rate limit exceeded", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": reqID})
 			return
 		}
+		// I85：下发 X-RateLimit-* 头，便于客户端感知限额与重置时刻（限流开启时）。
+		// 早于后续缓存/ETag/回源，对所有正常响应一致生效。
+		s.setRateLimitHeaders(w, r)
 		// I68：GET 命中响应缓存则直接回放，跳过并发信号量与回源（限流/安全语义已于上方校验）。
 		if s.cacheOn && r.Method == http.MethodGet {
 			if cv := s.cacheGet(s.cacheKey(r)); cv != nil {
@@ -1152,7 +1210,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	srv := s.srv
+	glis := s.grpcLis
 	s.mu.Unlock()
+	// I86：一并关闭 gRPC 监听器，避免 gRPC 端口在优雅关闭时泄漏（此前仅关 HTTP）。
+	if glis != nil {
+		glis.Close()
+	}
 	if srv != nil {
 		return srv.Shutdown(ctx)
 	}
