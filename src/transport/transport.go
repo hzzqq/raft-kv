@@ -18,6 +18,7 @@ package transport
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -152,6 +153,27 @@ func (s *Server) Serve(lis net.Listener) error {
 	}
 }
 
+// ServeTLS 在监听器上以 TLS 提供服务（cert 为已加载证书，可用 tls.X509KeyPair 构造）。
+// 接受连接后先完成 TLS 握手再进入 RPC 处理，其余语义与 Serve 一致。
+func (s *Server) ServeTLS(lis net.Listener, cert tls.Certificate) error {
+	cfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+	s.mu.Lock()
+	s.lis = lis
+	s.mu.Unlock()
+	for {
+		conn, err := lis.Accept()
+		if err != nil {
+			select {
+			case <-s.quit:
+				return ErrClosed
+			default:
+				return err
+			}
+		}
+		go s.serveConn(tls.Server(conn, cfg))
+	}
+}
+
 func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
 	s.connsActive.Add(1)
@@ -251,6 +273,7 @@ type ClientConn struct {
 	dialTO      time.Duration
 	maxIdle     int
 	idleTimeout time.Duration
+	tlsCfg      *tls.Config
 
 	mu     sync.Mutex
 	idle   []*pooledConn
@@ -267,6 +290,14 @@ type ClientConn struct {
 // Dial 构造到 target 的客户端（不立即建链）。默认开启连接池（maxIdle=4，空闲 30s 回收）。
 func Dial(target string) *ClientConn {
 	return &ClientConn{target: target, codec: JSONCodec{}, dialTO: 5 * time.Second, maxIdle: 4, idleTimeout: 30 * time.Second}
+}
+
+// DialTLS 构造到 target 的 TLS 客户端（不立即建链）。cfg 用于握手校验（如 InsecureSkipVerify）。
+// 连接池与明文客户端一致，TLS 会话在首次握手后随连接复用。
+func DialTLS(target string, cfg *tls.Config) *ClientConn {
+	cc := Dial(target)
+	cc.tlsCfg = cfg
+	return cc
 }
 
 // SetPool 配置连接池：maxIdle 为最大空闲连接数（<=0 表示关闭池、每次 RPC 建链/拆链），
@@ -330,11 +361,17 @@ func (cc *ClientConn) getConn() (*pooledConn, error) {
 	cc.dials++
 	cc.mu.Unlock()
 
-	conn, err := net.DialTimeout("tcp", cc.target, cc.dialTO)
+	var raw net.Conn
+	var err error
+	if cc.tlsCfg != nil {
+		raw, err = tls.DialWithDialer(&net.Dialer{Timeout: cc.dialTO}, "tcp", cc.target, cc.tlsCfg)
+	} else {
+		raw, err = net.DialTimeout("tcp", cc.target, cc.dialTO)
+	}
 	if err != nil {
 		return nil, err
 	}
-	return &pooledConn{conn: conn, r: bufio.NewReader(conn), w: bufio.NewWriter(conn), usedAt: time.Now()}, nil
+	return &pooledConn{conn: raw, r: bufio.NewReader(raw), w: bufio.NewWriter(raw), usedAt: time.Now()}, nil
 }
 
 // putConn 归还连接：若池满或已关闭则直接关闭，否则放回空闲池。
