@@ -90,6 +90,15 @@ CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh conf
   目标必须一致（统一为 `serverId(g,r)=1000+g*100+r`）；`g>=1` 时若错配为 `1000+g*nReplicas+r2`
   会使重启副本 RPC 全部静默失败（目标 server 不存在）、永久分裂投票选不出主。**所有注册/连接/
   分区操作都已收敛到 `serverId()` 单一来源**，禁止再散落字面量。
+- **RPC 分发器必须覆盖全部 Raft 内部 RPC（n=44/#47/#71）**：#44/#45 给 raft 层新增
+  `RequestPreVote`/`TimeoutNow` 后，**所有**为 ShardMaster/ShardKV 注册 RPC 处理的分发器都必须
+  登记这两个方法，否则集群测试启动即 `panic: unexpected method RequestPreVote`。共四处必须一致：
+  ① `cluster.StartCluster` 的 ShardMaster 与 ShardKV 分发器（`src/cluster/cluster.go`）；
+  ② 生产侧 `ShardMaster.RaftRPC`（`src/shardmaster/shardmaster.go`，需把 PreVote/TimeoutNow 派发给
+  `sm.rf`）；③ `makeSMConfig` 测试桩（`src/shardmaster/shardmaster_test.go`）；④ `makeSKVConfig`
+  测试桩（`src/shardkv/shardkv_test.go`，其 ShardMaster 分发器**与** kv 分发器都要加）。#47 只修了
+  ①、漏了 ②③④，导致 ShardMaster/ShardKV 集群测试长期 panic（被沙箱选举 flake 掩盖）；#71 已补全
+  ②③④ 并验证 `TestShardMasterValidation`/`TestSKVBasic` 跑通。后续任何新增 raft 内部 RPC 都须同步这四处。
 - **raft 选举/心跳 Timer 并发守卫（n=25）**：`electionTimer`/`heartbeatTimer` 同时被 ticker 与
   选举/心跳 goroutine 改写，而 `time.Timer` 非并发安全——构成 `-race` 数据竞争。已加 `timerMu`
   守卫 `resetElectionTimer`/`resetHeartbeatTimer`；锁序保证 `timerMu` 不会在持有 `rf.mu` 的反向
