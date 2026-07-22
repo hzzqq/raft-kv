@@ -299,12 +299,31 @@ func (s *Server) SetRouteLimit(route string, rps float64, burst int) {
 	s.routeLimiters[route] = &tokenBucket{tokens: float64(burst), last: time.Now(), rate: rps, burst: float64(burst)}
 }
 
-// routeLimiterFor 返回该请求匹配路由的令牌桶（若存在）。key 为 "METHOD /path"。
+// routeLimiterFor 返回该请求匹配路由的令牌桶（若存在）。
+// 匹配规则：先精确匹配 "METHOD /path"；无精确命中时，再尝试通配键（形如 "GET /kv/*"，
+// 末尾 "/*" 表示匹配该前缀下任意路径）。通配使「按路由限流」可聚焦某类路径而不必逐条注册，
+// 也契合网关路由的 method+path 模式风格。
 func (s *Server) routeLimiterFor(r *http.Request) *tokenBucket {
 	key := r.Method + " " + r.URL.Path
 	s.routeLimitMu.Lock()
 	defer s.routeLimitMu.Unlock()
-	return s.routeLimiters[key]
+	if b, ok := s.routeLimiters[key]; ok {
+		return b
+	}
+	for k, b := range s.routeLimiters {
+		if strings.HasSuffix(k, "/*") {
+			sp := strings.IndexByte(k, ' ')
+			if sp < 0 {
+				continue
+			}
+			meth := k[:sp]
+			prefix := k[sp+1 : len(k)-1] // 去掉末尾 "/*"
+			if r.Method == meth && strings.HasPrefix(r.URL.Path, prefix) {
+				return b
+			}
+		}
+	}
+	return nil
 }
 
 // SetCORS 配置允许跨域的源列表（生产可用）。空切片表示允许任意源（"*"）。

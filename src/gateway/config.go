@@ -15,16 +15,27 @@ import (
 // （ParseGatewayConfig），仅支持本项目所需的 top-level `key: value` 与 `[a, b]` 列表；
 // 生产环境建议改用 gopkg.in/yaml.v3 等成熟库，这里以自包含换取可构建性。
 type GatewayConfig struct {
-	ListenAddr      string   `yaml:"listen_addr"`
-	RequestTimeout  int      `yaml:"request_timeout_sec"`
-	MaxConcurrent   int      `yaml:"max_concurrent"`
-	ClientRate      float64  `yaml:"client_rate"`
-	ClientBurst     int      `yaml:"client_burst"`
-	CORSOrigins     []string `yaml:"cors_origins"`
-	MaxBodySize     int      `yaml:"max_body_size"`
-	Compress        bool     `yaml:"compress"`
-	SecurityHeaders bool     `yaml:"security_headers"`
-	AllowCIDRs      []string `yaml:"allow_cidrs"`
+	ListenAddr      string       `yaml:"listen_addr"`
+	RequestTimeout  int          `yaml:"request_timeout_sec"`
+	MaxConcurrent   int          `yaml:"max_concurrent"`
+	ClientRate      float64      `yaml:"client_rate"`
+	ClientBurst     int          `yaml:"client_burst"`
+	CORSOrigins     []string     `yaml:"cors_origins"`
+	MaxBodySize     int          `yaml:"max_body_size"`
+	Compress        bool         `yaml:"compress"`
+	SecurityHeaders bool         `yaml:"security_headers"`
+	AllowCIDRs      []string     `yaml:"allow_cidrs"`
+	RouteLimits     []RouteLimit `yaml:"route_limits"`
+}
+
+// RouteLimit 是单条「按路由限流」配置：对匹配 route（"METHOD /path"，支持末尾 "/*"
+// 通配）的请求设独立令牌桶。比 per-client 限流更细粒度，可单独保护热点写路径。
+// 格式示例（配置文件内）：route_limits: [POST /kv/*=5/10, GET /status=20/5]
+// 含义：POST /kv/ 下任意路径 5 rps/突发 10；GET /status 20 rps/突发 5。
+type RouteLimit struct {
+	Route string  `yaml:"route"`
+	RPS   float64 `yaml:"rps"`
+	Burst int     `yaml:"burst"`
 }
 
 // DefaultGatewayConfig 返回代码内默认值。
@@ -40,6 +51,7 @@ func DefaultGatewayConfig() GatewayConfig {
 		Compress:        true,
 		SecurityHeaders: true,
 		AllowCIDRs:      nil,
+		RouteLimits:     nil,
 	}
 }
 
@@ -91,6 +103,8 @@ func ParseGatewayConfig(data []byte) (GatewayConfig, error) {
 			cfg.SecurityHeaders = (val == "true" || val == "1" || val == "yes")
 		case "allow_cidrs":
 			cfg.AllowCIDRs = parseList(val)
+		case "route_limits":
+			cfg.RouteLimits = parseRouteLimits(val)
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -116,6 +130,34 @@ func parseList(val string) []string {
 		if p != "" {
 			out = append(out, p)
 		}
+	}
+	return out
+}
+
+// parseRouteLimits 解析 route_limits 列表，每条格式为 "METHOD /path=rps/burst"。
+// 解析失败（缺字段/非数字）的条目被跳过并记录告警，不阻断整体配置加载。
+func parseRouteLimits(val string) []RouteLimit {
+	var out []RouteLimit
+	for _, entry := range parseList(val) {
+		eq := strings.Index(entry, "=")
+		if eq < 0 {
+			continue
+		}
+		route := strings.TrimSpace(entry[:eq])
+		spec := strings.TrimSpace(entry[eq+1:])
+		slash := strings.Index(spec, "/")
+		if slash < 0 {
+			continue
+		}
+		rps, err1 := strconv.ParseFloat(strings.TrimSpace(spec[:slash]), 64)
+		burst, err2 := strconv.Atoi(strings.TrimSpace(spec[slash+1:]))
+		if err1 != nil || err2 != nil || route == "" {
+			continue
+		}
+		out = append(out, RouteLimit{Route: route, RPS: rps, Burst: burst})
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
@@ -175,6 +217,17 @@ func (c GatewayConfig) Validate() []string {
 			problems = append(problems, fmt.Sprintf("allow_cidrs %q invalid CIDR: %v", cidr, err))
 		}
 	}
+	for _, rl := range c.RouteLimits {
+		if rl.Route == "" {
+			problems = append(problems, "route_limits: empty route")
+		}
+		if rl.RPS < 0 {
+			problems = append(problems, fmt.Sprintf("route_limits %q: rps must be >= 0", rl.Route))
+		}
+		if rl.Burst < 0 {
+			problems = append(problems, fmt.Sprintf("route_limits %q: burst must be >= 0", rl.Route))
+		}
+	}
 	return problems
 }
 
@@ -223,6 +276,15 @@ func (c GatewayConfig) Apply(s *Server) {
 	s.SetCORS(c.CORSOrigins)
 	if len(c.AllowCIDRs) > 0 {
 		s.SetIPAllow(c.AllowCIDRs)
+	}
+	// I62：按路由限流配置接线。每条约独立令牌桶，支持 "METHOD /path" 精确或
+	// "METHOD /path/*" 通配（由 routeLimiterFor 解析）。burst<=0 视为关闭该条。
+	for _, rl := range c.RouteLimits {
+		if rl.Burst <= 0 {
+			s.logf(levelWarn, "config: route_limit burst<=0 ignored", map[string]string{"route": rl.Route})
+			continue
+		}
+		s.SetRouteLimit(rl.Route, rl.RPS, rl.Burst)
 	}
 	s.curCfg = c
 }
