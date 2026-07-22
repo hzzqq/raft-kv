@@ -168,8 +168,9 @@ type Registry struct {
 	counters   map[string]*Counter
 	histograms map[string]*Histogram
 	gauges     map[string]*Gauge
-	descs      map[string]string // 指标 HELP 描述（Prometheus 规范推荐）
-	prefix     string            // 非空表示该表是某父表的子系统，所有名字加此前缀
+	funcGauges map[string]*FuncGauge // 函数式瞬时指标（延迟取值）
+	descs      map[string]string     // 指标 HELP 描述（Prometheus 规范推荐）
+	prefix     string                // 非空表示该表是某父表的子系统，所有名字加此前缀
 }
 
 // NewRegistry 创建一个空的指标注册表。
@@ -179,6 +180,7 @@ func NewRegistry() *Registry {
 		counters:   map[string]*Counter{},
 		histograms: map[string]*Histogram{},
 		gauges:     map[string]*Gauge{},
+		funcGauges: map[string]*FuncGauge{},
 		descs:      map[string]string{},
 	}
 }
@@ -194,6 +196,7 @@ func (r *Registry) Subsystem(name string) *Registry {
 		counters:   r.counters,
 		histograms: r.histograms,
 		gauges:     r.gauges,
+		funcGauges: r.funcGauges,
 		descs:      r.descs,
 		prefix:     r.prefix + name + "_",
 	}
@@ -264,6 +267,66 @@ func (r *Registry) HistWithHelp(name, help string) *Histogram {
 	return h
 }
 
+// FuncGauge 是延迟取值的瞬时指标：持有取值函数，每次快照/导出时调用，反映实时状态
+// （如运行时 goroutine 数、内存占用、连接池使用中数量等无法靠事件 Set 的瞬时量）。
+// 与 Gauge（手动 Set）互补：FuncGauge 的数据源是外部状态，自动刷新。
+type FuncGauge struct {
+	mu   sync.Mutex
+	fn   func() float64
+	desc string
+}
+
+// NewFuncGauge 创建一个函数式 gauge；fn 为 nil 时 Value 恒返回 0。
+func NewFuncGauge(fn func() float64) *FuncGauge {
+	return &FuncGauge{fn: fn}
+}
+
+// Value 调用取值函数返回当前瞬时值（线程安全）。
+func (g *FuncGauge) Value() float64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.fn == nil {
+		return 0
+	}
+	return g.fn()
+}
+
+// SetDesc 设置 HELP 描述（供独立导出或 Registry 同步）。
+func (g *FuncGauge) SetDesc(desc string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.desc = desc
+}
+
+// Desc 返回当前描述。
+func (g *FuncGauge) Desc() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.desc
+}
+
+// FuncGauge 取得（不存在则创建）命名函数式瞬时指标，注册取值函数。
+func (r *Registry) FuncGauge(name string, fn func() float64) *FuncGauge {
+	name = r.name(name)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if g, ok := r.funcGauges[name]; ok {
+		g.fn = fn
+		return g
+	}
+	g := NewFuncGauge(fn)
+	r.funcGauges[name] = g
+	return g
+}
+
+// FuncGaugeWithHelp 取得函数式 gauge 并登记 HELP 描述。
+func (r *Registry) FuncGaugeWithHelp(name, help string, fn func() float64) *FuncGauge {
+	g := r.FuncGauge(name, fn)
+	g.SetDesc(help)
+	r.setDesc(name, help)
+	return g
+}
+
 // setDesc 登记指标的 HELP 描述（多行归一成单行，避免破坏 exposition）。
 // 与注册方法一致加本表前缀，保证描述键与指标序列名（可能带 subsystem 前缀）对齐。
 func (r *Registry) setDesc(name, help string) {
@@ -310,6 +373,11 @@ func (r *Registry) Snapshot() map[string]interface{} {
 			gauges[k] = v.Value()
 		}
 	}
+	for k, v := range r.funcGauges {
+		if r.prefix == "" || strings.HasPrefix(k, r.prefix) {
+			gauges[k] = v.Value()
+		}
+	}
 	return map[string]interface{}{
 		"counters":   counters,
 		"histograms": hists,
@@ -326,6 +394,7 @@ func (r *Registry) Reset() {
 		r.counters = map[string]*Counter{}
 		r.histograms = map[string]*Histogram{}
 		r.gauges = map[string]*Gauge{}
+		r.funcGauges = map[string]*FuncGauge{}
 		r.descs = map[string]string{}
 		return
 	}
@@ -342,6 +411,11 @@ func (r *Registry) Reset() {
 	for k := range r.gauges {
 		if strings.HasPrefix(k, r.prefix) {
 			delete(r.gauges, k)
+		}
+	}
+	for k := range r.funcGauges {
+		if strings.HasPrefix(k, r.prefix) {
+			delete(r.funcGauges, k)
 		}
 	}
 	for k := range r.descs {
