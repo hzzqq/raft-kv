@@ -26,12 +26,19 @@ import (
 	"time"
 
 	"raftkv/src/cluster"
+	"raftkv/src/metrics"
 	"raftkv/src/shardkv"
 	"raftkv/src/shardmaster"
 )
 
 // maxConcurrent 是网关在途请求的信号量上限（I12）。超过即返回 429，避免资源被压垮。
 const maxConcurrent = 64
+
+// Metrics 是网关自身的可观测性指标（best-effort 进程级聚合），与 shardkv.Metrics 分开，
+// 避免与 KV 层指标混淆。由 wrap 在每次请求完成后记录：请求总数、请求延迟直方图、
+// 以及按 HTTP 状态码分桶的计数。经 /metrics 与 shardkv.Metrics 一并暴露，便于统一
+// 采集「网关 HTTP 面」与「KV 层」两方面的健康度。
+var Metrics = metrics.NewRegistry()
 
 // Server 持有集群与绑定到它的 ShardKV 客户端。
 type Server struct {
@@ -659,6 +666,11 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			s.logf(levelInfo, "request", fields)
 		}
 		record(st, time.Since(start))
+		// 网关自身指标埋点（与 KV 层 shardkv.Metrics 分离）：请求总数、按状态码分桶计数、
+		// 以及请求延迟直方图。纯原子操作，零行为影响；供 /metrics 统一暴露。
+		Metrics.Counter("http_requests_total").Inc()
+		Metrics.Counter(fmt.Sprintf("http_responses_%d", st)).Inc()
+		Metrics.Histogram("http_request_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
 		// I61：后端健康熔断观测。按最终状态码更新熔断状态（5xx 累计，非 5xx 重置/恢复）。
 		s.observeBackend(st)
 	}
@@ -1024,9 +1036,16 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		if err := shardkv.Metrics.WritePrometheus(w); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
+		// 追加网关自身指标（名称与 KV 层不冲突），便于一次 scrape 同时采集两侧。
+		if err := Metrics.WritePrometheus(w); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 	snap := shardkv.Metrics.Snapshot()
+	// 在 KV 层快照顶层附加 gateway 子键；保持顶层 counters/histograms 不变，
+	// 既有消费方（按顶层字段解析）不受影响。
+	snap["gateway"] = Metrics.Snapshot()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(snap); err != nil {
