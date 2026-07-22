@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -181,9 +182,79 @@ func waitHealth(base string, client *http.Client) {
 	}
 }
 
+// StartupReport 是 demo 启动前的环境诊断快照（cluster-free，不触碰 raft/kv 集群）。
+// 用于在真正拉起内存集群前，先把运行期环境与轻量自检结果打印出来，便于排障。
+type StartupReport struct {
+	Time       time.Time
+	GoVersion  string
+	OS         string
+	Arch       string
+	NumCPU     int
+	GOMAXPROCS int
+	CWD        string
+	Mode       string // "normal" 或 "quiet"（由 RAFt_KV_DEMO_QUIET 控制）
+	Warnings   []string
+}
+
+// CollectStartupReport 采集运行期环境信息并做轻量本地自检，生成诊断报告。
+// 自检项均 cluster-free：不启动集群、不发网络；仅检查临时目录可写、NShards 常量 sanity 等本地能力。
+func CollectStartupReport() StartupReport {
+	r := StartupReport{
+		Time:       time.Now(),
+		GoVersion:  runtime.Version(),
+		OS:         runtime.GOOS,
+		Arch:       runtime.GOARCH,
+		NumCPU:     runtime.NumCPU(),
+		GOMAXPROCS: runtime.GOMAXPROCS(0),
+		Mode:       "normal",
+	}
+	if os.Getenv("RAFT_KV_DEMO_QUIET") != "" {
+		r.Mode = "quiet"
+	}
+	if wd, err := os.Getwd(); err == nil {
+		r.CWD = wd
+	} else {
+		r.Warnings = append(r.Warnings, "getwd failed: "+err.Error())
+	}
+	// 轻量自检 1：临时目录可写（demo 过程中可能写中间文件）。
+	if tmp, err := os.MkdirTemp("", "raftkv-diag-"); err != nil {
+		r.Warnings = append(r.Warnings, "temp dir unwritable: "+err.Error())
+	} else {
+		os.RemoveAll(tmp)
+	}
+	// 轻量自检 2：分片数常量 sanity（与 shardmaster 包一致，>0 才可分片）。
+	if shardmaster.NShards <= 0 {
+		r.Warnings = append(r.Warnings, "invalid NShards <= 0")
+	}
+	return r
+}
+
+// FormatStartupReport 把诊断报告渲染为可读多行文本（纯函数，便于单测断言）。
+func FormatStartupReport(r StartupReport) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "[demo-diag] time=%s go=%s os=%s/%s cpu=%d gomax=%d\n",
+		r.Time.Format(time.RFC3339), r.GoVersion, r.OS, r.Arch, r.NumCPU, r.GOMAXPROCS)
+	fmt.Fprintf(&b, "[demo-diag] cwd=%s mode=%s\n", r.CWD, r.Mode)
+	if len(r.Warnings) == 0 {
+		b.WriteString("[demo-diag] checks: all passed\n")
+	} else {
+		fmt.Fprintf(&b, "[demo-diag] checks: %d warning(s)\n", len(r.Warnings))
+		for _, w := range r.Warnings {
+			fmt.Fprintf(&b, "[demo-diag]   ! %s\n", w)
+		}
+	}
+	return b.String()
+}
+
 func main() {
-	fmt.Println("raft-kv demo starting...")
+	report := CollectStartupReport()
+	if report.Mode != "quiet" {
+		fmt.Print(FormatStartupReport(report))
+		fmt.Println("raft-kv demo starting...")
+	}
 	out := RunDemo()
-	fmt.Println("demo result:", out)
-	fmt.Println("raft-kv demo done.")
+	if report.Mode != "quiet" {
+		fmt.Println("demo result:", out)
+		fmt.Println("raft-kv demo done.")
+	}
 }
