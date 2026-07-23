@@ -114,6 +114,7 @@ type Server struct {
 	closed   bool
 
 	connsActive atomic.Int64
+	inFlight    atomic.Int64
 	rpcs        atomic.Int64
 	bytesSent   atomic.Int64
 	bytesRecv   atomic.Int64
@@ -244,7 +245,9 @@ func (s *Server) serveConn(conn net.Conn) {
 			_ = writeFrame(w, frameError, []byte(ErrMethodNotFound.Error()))
 			continue
 		}
+		s.inFlight.Add(1)
 		resp, herr := s.safeCall(h, connCtx, reqData)
+		s.inFlight.Add(-1)
 		s.rpcs.Add(1)
 		s.bytesRecv.Add(int64(len(reqData)))
 		if herr != nil {
@@ -271,9 +274,31 @@ func (s *Server) Stop() {
 	}
 }
 
+// GracefulStop 优雅关闭：停止接受新连接，但等待所有在途 RPC 处理完毕（连接本身
+// 保持，不强制断开）后再返回；超时则返回错误（仍残留 in-flight 数量）。幂等。
+// 与 Stop 的区别：Stop 立即关闭监听器、在途 RPC 继续在后台跑完但调用方不等待；
+// GracefulStop 会阻塞到在途清空，适合需要"先排空再退出"的滚动发布场景。
+func (s *Server) GracefulStop(timeout time.Duration) error {
+	s.Stop()
+	deadline := time.Now().Add(timeout)
+	for {
+		if s.inFlight.Load() == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("transport: graceful stop timed out, %d in-flight RPCs remain", s.inFlight.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// InFlight 返回当前在途 RPC 数（仅已读到完整请求帧、进入 handler 调用阶段的请求）。
+func (s *Server) InFlight() int64 { return s.inFlight.Load() }
+
 // ServerMetrics 是 Server 的观测快照。
 type ServerMetrics struct {
 	ConnsActive int64 // 当前活动连接数
+	InFlight    int64 // 当前在途 RPC 数
 	RPCs        int64 // 累计 RPC 次数
 	BytesSent   int64 // 累计响应字节
 	BytesRecv   int64 // 累计请求字节
@@ -284,6 +309,7 @@ type ServerMetrics struct {
 func (s *Server) Metrics() ServerMetrics {
 	return ServerMetrics{
 		ConnsActive: s.connsActive.Load(),
+		InFlight:    s.inFlight.Load(),
 		RPCs:        s.rpcs.Load(),
 		BytesSent:   s.bytesSent.Load(),
 		BytesRecv:   s.bytesRecv.Load(),
