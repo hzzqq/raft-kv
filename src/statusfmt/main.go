@@ -6,6 +6,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -30,19 +31,74 @@ type clusterStatus struct {
 	MaxConfigNum int           `json:"max_config_num"`
 }
 
-func main() {
-	data, err := io.ReadAll(os.Stdin)
+// run 是 statusfmt 的可测试核心：从 in 读取原始 /status 文本，按 jsonMode 渲染到 out。
+// 返回 (exitCode, error)：exitCode 为 2 表示集群非健康（供 -check 探活/CI 用），
+// 0 表示健康或仅透传（非 JSON 输入无法判健康，按透传处理）。分离后 main 与单测共用同一逻辑。
+func run(in io.Reader, out io.Writer, jsonMode bool) (int, error) {
+	data, err := io.ReadAll(in)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "read error:", err)
-		os.Exit(1)
+		return 1, fmt.Errorf("read error: %w", err)
 	}
 	var st clusterStatus
 	if err := json.Unmarshal(data, &st); err != nil {
-		// 非 JSON（如网关未启动的错误文本）→ 原样透传。
-		fmt.Print(string(data))
-		return
+		// 非 JSON（如网关未启动的错误文本）→ 原样透传，不判健康。
+		fmt.Fprint(out, string(data))
+		return 0, nil
 	}
-	fmt.Print(formatClusterStatus(st))
+	if jsonMode {
+		return renderJSON(out, st)
+	}
+	return renderHuman(out, st)
+}
+
+// report 聚合健康分、均衡分与摘要，供 human/json 两种渲染共用（纯函数，便于单测）。
+func report(st clusterStatus) map[string]interface{} {
+	health, healthSummary := clusterHealthScore(st)
+	bal, balDetail := shardBalance(st)
+	return map[string]interface{}{
+		"healthy":        st.Healthy,
+		"max_config_num": st.MaxConfigNum,
+		"health_score":   health,
+		"health_summary": healthSummary,
+		"balance_score":  bal,
+		"balance_detail": balDetail,
+		"group_count":    len(st.Groups),
+	}
+}
+
+func renderHuman(out io.Writer, st clusterStatus) (int, error) {
+	fmt.Fprint(out, formatClusterStatus(st))
+	r := report(st)
+	fmt.Fprintf(out, "health_score=%.1f (%s)\n", r["health_score"], r["health_summary"])
+	fmt.Fprintf(out, "balance_score=%.1f (%s)\n", r["balance_score"], r["balance_detail"])
+	if !st.Healthy {
+		return 2, nil
+	}
+	return 0, nil
+}
+
+func renderJSON(out io.Writer, st clusterStatus) (int, error) {
+	r := report(st)
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(r); err != nil {
+		return 1, fmt.Errorf("encode report: %w", err)
+	}
+	if !st.Healthy {
+		return 2, nil
+	}
+	return 0, nil
+}
+
+func main() {
+	jsonMode := flag.Bool("json", false, "以 JSON 输出机器可读的健康/均衡评分报告")
+	flag.Parse()
+	code, err := run(os.Stdin, os.Stdout, *jsonMode)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "statusfmt:", err)
+		os.Exit(1)
+	}
+	os.Exit(code)
 }
 
 // formatClusterStatus 把集群状态渲染为人类可读总览字符串（末尾含换行）。
