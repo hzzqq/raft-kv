@@ -522,8 +522,10 @@ func (cc *ClientConn) Invoke(ctx context.Context, method string, reqData []byte)
 }
 
 // InvokeMsg 是 Invoke 的类型安全封装：用 codec 编解码 req/reply。
+// codec 经锁内快照读取，可与 SetCodec 并发安全共用。
 func (cc *ClientConn) InvokeMsg(ctx context.Context, method string, req, reply interface{}) error {
-	reqData, err := cc.codec.Marshal(req)
+	codec := cc.codecRef()
+	reqData, err := codec.Marshal(req)
 	if err != nil {
 		return err
 	}
@@ -531,7 +533,7 @@ func (cc *ClientConn) InvokeMsg(ctx context.Context, method string, req, reply i
 	if err != nil {
 		return err
 	}
-	return cc.codec.Unmarshal(respData, reply)
+	return codec.Unmarshal(respData, reply)
 }
 
 // Target 返回客户端目标地址。
