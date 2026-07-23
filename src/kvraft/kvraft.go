@@ -136,9 +136,11 @@ func (kv *KVServer) applier() {
 		}
 		if msg.SnapshotValid {
 			// 落后 follower 或重启节点通过快照追平状态机。
-			kv.installSnapshot(msg.Snapshot)
-			kv.appliedIndex = msg.SnapshotIndex
-			Metrics.Counter("snapshots_installed").Inc()
+			// installSnapshot 内部持锁完成「陈旧快照拒绝 + 状态覆盖 + appliedIndex 推进」，
+			// 修复此前 appliedIndex 无锁写的数据竞态与陈旧快照回滚状态机的正确性隐患。
+			if kv.installSnapshot(msg.Snapshot, msg.SnapshotIndex) {
+				Metrics.Counter("snapshots_installed").Inc()
+			}
 			continue
 		}
 		if !msg.CommandValid {
@@ -204,18 +206,36 @@ func (kv *KVServer) encodeSnapshot() []byte {
 }
 
 // installSnapshot 从 Raft 快照恢复 KV 状态机（重启或落后 follower 追平时调用）。
-func (kv *KVServer) installSnapshot(data []byte) {
+// snapIndex 为快照对应的日志绝对索引：若不高于当前 appliedIndex（陈旧/重复快照），
+// 拒绝安装并返回 false——否则会把状态机倒回旧状态、破坏线性一致性。
+// appliedIndex 的推进与状态覆盖在同一临界区内完成（消除无锁写竞态）。
+// snapIndex 传 0 表示无索引信息的恢复路径：跳过陈旧检查、安装但不推进 appliedIndex。
+func (kv *KVServer) installSnapshot(data []byte, snapIndex int) bool {
 	if len(data) == 0 {
-		return
+		return false
 	}
 	var st KVPersistState
 	if err := gob.NewDecoder(bytes.NewBuffer(data)).Decode(&st); err != nil {
-		return
+		return false
+	}
+	// gob 解码空 map 可能得到 nil：归一为空 map，防后续写入 panic。
+	if st.Data == nil {
+		st.Data = make(map[string]string)
+	}
+	if st.Sessions == nil {
+		st.Sessions = make(map[int64]*clientSession)
 	}
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	if snapIndex > 0 && snapIndex <= kv.appliedIndex {
+		return false // 陈旧快照：状态机已应用得更远，安装会回滚
+	}
 	kv.data = st.Data
 	kv.sessions = st.Sessions
+	if snapIndex > 0 {
+		kv.appliedIndex = snapIndex
+	}
+	return true
 }
 
 // waitAppliedIndex 轮询等待本服务器状态机已应用到索引 idx（ReadIndex 快路径用），
