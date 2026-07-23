@@ -838,6 +838,11 @@ func (s *Server) Handler() http.Handler {
 	register("GET /debug/routes", s.handleDebugRoutes)
 	// I59：版本与 uptime，便于运行时透明与监控（不含任何敏感配置）。
 	register("GET /debug/version", s.handleDebugVersion)
+	// I92：未匹配路由走 Go 默认 NotFound（不经 wrap），会绕过 timingWriter 与 X-Request-ID/
+	// 安全头。Go 1.22 的 ServeMux 尚无 NotFoundHandler 字段（1.23+ 才有），因此注册通配
+	// 兜底路由 /{path...} 并套 wrap，保证未知路径同样带 X-Process-Time 等头；具体路由
+	// 前缀更具体、优先级更高，不会被通配覆盖。
+	mux.HandleFunc("/{path...}", s.wrap(http.NotFound))
 	s.routeMu.Lock()
 	s.routes = routes
 	s.routeMu.Unlock()
@@ -853,6 +858,9 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		// I92：X-Process-Time 处理耗时头。外层包装保证在任何路径首次写头前注入
+		//（含下方各类 4xx/5xx 早退与正常回源路径），头冻结语义安全。
+		w = &timingWriter{ResponseWriter: w, start: start}
 		// X-Request-ID 透传：入站已带则沿用，否则生成。回写响应头，便于跨服务链路追踪。
 		reqID := r.Header.Get("X-Request-ID")
 		if reqID == "" {
