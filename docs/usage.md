@@ -166,5 +166,13 @@ make demo         # 构建二进制并运行全栈 demo
 ```
 
 `status` 子命令把 `/status` 的 JSON 输出渲染为表格（未安装 jq/python 也能用）；
+statusfmt 也可独立使用，支持机器可读模式与探活退出码：
+
+```bash
+curl -s localhost:8080/status | go run ./src/statusfmt          # 可读表格 + 健康/均衡评分摘要
+curl -s localhost:8080/status | go run ./src/statusfmt -json    # JSON 评分报告（health_score/balance_score 等）
+# 退出码：0=健康或透传；2=集群 STALLED（可直接接 CI/巡检脚本判活）
+```
+
 `migrate` 子命令直接打印 `/debug/migrate` 文本，pendingIn/pendingOut 有残留且 stall>0
 即配置冻结风险信号。
