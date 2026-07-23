@@ -190,6 +190,18 @@ func (s *Server) ServeTLS(lis net.Listener, cert tls.Certificate) error {
 	}
 }
 
+// safeCall 调用 handler 并恢复其 panic，保证单个 handler 崩溃不会拖垮整个服务端
+// goroutine乃至进程（R2 隐性健壮性修复）。panic 被归一为错误帧，连接继续服务后续
+// 请求。错误计数交回 serveConn 统一处理，避免重复累加。
+func (s *Server) safeCall(h MethodHandler, ctx context.Context, reqData []byte) (resp []byte, herr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			herr = fmt.Errorf("transport: handler panic recovered: %v", r)
+		}
+	}()
+	return h(ctx, reqData)
+}
+
 func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
 	s.connsActive.Add(1)
@@ -232,7 +244,7 @@ func (s *Server) serveConn(conn net.Conn) {
 			_ = writeFrame(w, frameError, []byte(ErrMethodNotFound.Error()))
 			continue
 		}
-		resp, herr := h(connCtx, reqData)
+		resp, herr := s.safeCall(h, connCtx, reqData)
 		s.rpcs.Add(1)
 		s.bytesRecv.Add(int64(len(reqData)))
 		if herr != nil {

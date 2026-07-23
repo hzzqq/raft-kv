@@ -82,5 +82,14 @@ func (b *ServiceBuilder) Method(name string, h MethodHandler) *ServiceBuilder {
 	return b
 }
 
+// RegisterFunc 便捷注册：把一个「类型化的业务函数」直接挂到方法名，内部用
+// TypedHandler（默认 JSON 编解码）包装，省去手写 TypedHandler 样板代码。
+// 默认 JSON 编码；若需二进制/gob 等其它编解码，仍用 Method(name, TypedHandler(codec, fn))。
+// 注意：Go 不支持带类型参数的方法，故以包级泛型函数形式提供（返回 *ServiceBuilder
+// 仍可继续 .Method(...).Build() 链式调用）。
+func RegisterFunc[Req any, Resp any](b *ServiceBuilder, name string, fn func(ctx context.Context, req *Req) (*Resp, error)) *ServiceBuilder {
+	return b.Method(name, TypedHandler[Req, Resp](nil, fn))
+}
+
 // Build 产出最终 ServiceDesc，可直接交给 Server.Register。
 func (b *ServiceBuilder) Build() ServiceDesc { return b.desc }
