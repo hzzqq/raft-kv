@@ -365,6 +365,41 @@ func (cc *ClientConn) Stats() ClientStats {
 	}
 }
 
+// SetDialTimeout 设置建链超时（默认 5s），仅影响后续新建连接。
+func (cc *ClientConn) SetDialTimeout(d time.Duration) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.dialTO = d
+}
+
+// DialTimeout 返回当前建链超时配置。
+func (cc *ClientConn) DialTimeout() time.Duration {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return cc.dialTO
+}
+
+// Warmup 主动建立一条空闲连接放入池中（池开启时），降低首次 Invoke 的建链延迟尖刺；
+// 池关闭(maxIdle<=0)或已关闭时为空操作，返回错误仅在建链失败。
+func (cc *ClientConn) Warmup() error {
+	cc.mu.Lock()
+	if cc.closed {
+		cc.mu.Unlock()
+		return ErrClosed
+	}
+	if cc.maxIdle <= 0 {
+		cc.mu.Unlock()
+		return nil
+	}
+	cc.mu.Unlock()
+	pc, err := cc.getConn()
+	if err != nil {
+		return err
+	}
+	cc.putConn(pc)
+	return nil
+}
+
 // getConn 取一条可用连接：优先复用空闲池中的健康连接，否则新建。
 func (cc *ClientConn) getConn() (*pooledConn, error) {
 	cc.mu.Lock()
@@ -372,6 +407,7 @@ func (cc *ClientConn) getConn() (*pooledConn, error) {
 		cc.mu.Unlock()
 		return nil, ErrClosed
 	}
+	dialTO := cc.dialTO // 锁内拷出，避免 SetDialTimeout 并发写竞态
 	for len(cc.idle) > 0 {
 		pc := cc.idle[len(cc.idle)-1]
 		cc.idle = cc.idle[:len(cc.idle)-1]
@@ -388,9 +424,9 @@ func (cc *ClientConn) getConn() (*pooledConn, error) {
 	var raw net.Conn
 	var err error
 	if cc.tlsCfg != nil {
-		raw, err = tls.DialWithDialer(&net.Dialer{Timeout: cc.dialTO}, "tcp", cc.target, cc.tlsCfg)
+		raw, err = tls.DialWithDialer(&net.Dialer{Timeout: dialTO}, "tcp", cc.target, cc.tlsCfg)
 	} else {
-		raw, err = net.DialTimeout("tcp", cc.target, cc.dialTO)
+		raw, err = net.DialTimeout("tcp", cc.target, dialTO)
 	}
 	if err != nil {
 		return nil, err
