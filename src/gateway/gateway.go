@@ -31,6 +31,7 @@ import (
 	"raftkv/src/metrics"
 	"raftkv/src/shardkv"
 	"raftkv/src/shardmaster"
+	"raftkv/src/version"
 )
 
 // maxConcurrent 是网关在途请求的信号量上限（I12）。超过即返回 429，避免资源被压垮。
@@ -1175,8 +1176,16 @@ func (s *Server) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
 // 不含任何敏感配置字段。
 func (s *Server) handleDebugVersion(w http.ResponseWriter, r *http.Request) {
 	uptime := time.Since(s.startedAt).Seconds()
+	// 未显式 SetVersion 时回退到构建期注入的 version 包信息（-ldflags -X），
+	// 使裸启动的网关也能自报版本，而非空字符串（修复 version 包零引用的死代码状态）。
+	v := s.version
+	if v == "" {
+		v = version.BuildVersion
+	}
 	out := map[string]interface{}{
-		"version":    s.version,
+		"version":    v,
+		"commit":     version.Commit,
+		"build_time": version.BuildTime,
 		"go_version": runtime.Version(),
 		"started_at": s.startedAt.UTC().Format(time.RFC3339),
 		"uptime_sec": uptime,

@@ -28,3 +28,16 @@ func Get() Info {
 func String() string {
 	return fmt.Sprintf("raft-kv %s (commit %s, built %s)", BuildVersion, Commit, BuildTime)
 }
+
+// IsDev 报告当前是否开发构建（未经 -ldflags 注入正式版本号）。
+// 网关/日志可据此差异化行为（如 dev 才开 verbose 调试端点）。
+func IsDev() bool { return BuildVersion == "dev" }
+
+// Short 返回紧凑版本标识："<version>@<commit前7位>"，适合放响应头或日志前缀。
+func Short() string {
+	c := Commit
+	if len(c) > 7 {
+		c = c[:7]
+	}
+	return BuildVersion + "@" + c
+}
