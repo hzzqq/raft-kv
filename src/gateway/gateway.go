@@ -858,9 +858,10 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		// I92：X-Process-Time 处理耗时头。外层包装保证在任何路径首次写头前注入
-		//（含下方各类 4xx/5xx 早退与正常回源路径），头冻结语义安全。
-		w = &timingWriter{ResponseWriter: w, start: start}
+		// I92 / #205：外层 writer 包装。保证在任何路径首次写头前注入 X-Process-Time
+		//（处理耗时）与 X-Response-Size（首写时响应字节），头冻结语义安全。
+		mw := &metricsWriter{ResponseWriter: w, start: start}
+		w = mw
 		// X-Request-ID 透传：入站已带则沿用，否则生成。回写响应头，便于跨服务链路追踪。
 		reqID := r.Header.Get("X-Request-ID")
 		if reqID == "" {
@@ -1034,6 +1035,9 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		Metrics.Counter("http_requests_total").Inc()
 		Metrics.Counter(fmt.Sprintf("http_responses_%d", st)).Inc()
 		Metrics.Histogram("http_request_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
+		// #205：响应体大小直方图（线上字节，gzip 开启时为压缩后字节），与延迟直方图
+		// 并列，供 /metrics 观测带宽与大响应分布。纯观测，零行为影响。
+		Metrics.Histogram("gateway_response_bytes").Record(float64(mw.respBytes))
 		// I61：后端健康熔断观测。按最终状态码更新熔断状态（5xx 累计，非 5xx 重置/恢复）。
 		s.observeBackend(st)
 	}
