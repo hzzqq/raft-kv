@@ -22,14 +22,19 @@ const processTimeHeader = "X-Process-Time"
 // respSizeHeader 是响应体大小响应头名（线上字节数）。
 const respSizeHeader = "X-Response-Size"
 
+// reqSizeHeader 是请求体大小响应头名（声明的内容长度 Content-Length）。
+const reqSizeHeader = "X-Request-Size"
+
 // metricsWriter 在首次写头前注入 X-Process-Time 与 X-Response-Size（首写时），
 // 并累计响应字节数供请求级直方图上报（X-Response-Size 的 header 形式因头冻结
-// 语义仅能反映首块，但进程内计数始终为完整线上字节）。
+// 语义仅能反映首块，但进程内计数始终为完整线上字节）。X-Request-Size 反映入站
+// 请求的声明体大小，便于识别超大请求（带宽/限流可观测）。
 type metricsWriter struct {
 	http.ResponseWriter
 	start     time.Time
 	wrote     bool
 	respBytes int64
+	reqSize   int64 // 入站请求体声明大小（来自 r.ContentLength），-1 表示未知（分块）
 }
 
 func (t *metricsWriter) inject() {
@@ -39,6 +44,11 @@ func (t *metricsWriter) inject() {
 	t.wrote = true
 	ms := float64(time.Since(t.start).Microseconds()) / 1000.0
 	t.Header().Set(processTimeHeader, strconv.FormatFloat(ms, 'f', 3, 64)+"ms")
+	// X-Request-Size：仅当声明长度已知（>=0）时输出；分块上传 ContentLength=-1
+	// 跳过，避免输出无意义负值。
+	if t.reqSize >= 0 {
+		t.Header().Set(reqSizeHeader, strconv.FormatInt(t.reqSize, 10))
+	}
 }
 
 func (t *metricsWriter) WriteHeader(code int) {

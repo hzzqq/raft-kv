@@ -862,6 +862,7 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		// I92 / #205：外层 writer 包装。保证在任何路径首次写头前注入 X-Process-Time
 		//（处理耗时）与 X-Response-Size（首写时响应字节），头冻结语义安全。
 		mw := &metricsWriter{ResponseWriter: w, start: start}
+		mw.reqSize = r.ContentLength // 入站请求体声明大小；分块为 -1（已知未知，跳过头）
 		w = mw
 		// X-Request-ID 透传：入站已带则沿用，否则生成。回写响应头，便于跨服务链路追踪。
 		reqID := r.Header.Get("X-Request-ID")

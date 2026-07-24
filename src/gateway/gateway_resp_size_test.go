@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -78,5 +79,35 @@ func TestGatewayResponseSizeOverGzip(t *testing.T) {
 	}
 	if n < 0 {
 		t.Fatalf("X-Response-Size = %d, want >=0", n)
+	}
+}
+
+// TestGatewayRequestSizeHeader 验证：入站请求带已知 Content-Length 时，响应头
+// X-Request-Size 精确等于请求体声明字节数（与 X-Response-Size 配对，便于识别
+// 超大请求/带宽可观测）。分块（ContentLength=-1）的未知长度由 metricsWriter 跳过（不输出负值）。
+func TestGatewayRequestSizeHeader(t *testing.T) {
+	s := timingTestServer()
+	body := `{"key":"value","payload":"raft-kv-request"}`
+	ts := httptest.NewServer(s.Wrap(respSizeStub("ok")))
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/upload", strings.NewReader(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+
+	v := resp.Header.Get("X-Request-Size")
+	if v == "" {
+		t.Fatalf("missing X-Request-Size header")
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		t.Fatalf("X-Request-Size = %q not an integer: %v", v, err)
+	}
+	if n != int64(len(body)) {
+		t.Fatalf("X-Request-Size = %d, want %d", n, len(body))
 	}
 }
