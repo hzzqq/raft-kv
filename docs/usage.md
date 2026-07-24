@@ -91,8 +91,15 @@ go run ./src/gateway :9090           # 自定义地址
 | `GET /metrics` | 返回 `shardkv.Metrics` 的 JSON 快照（counters + 直方图分位数） |
 | `GET /status` | 集群健康总览（JSON `ClusterStatus`）：每 group leader/config/持有/待收/待迁/孤儿中转计数 + 卡滞秒数 + 整体 `healthy` 标志（卡滞 >2s 判冻结），供监控/告警轮询 |
 | `GET /debug/migrate` | 纯文本迁移进度（每 group leader 副本的 pendingIn/pendingOut/incoming 分布 + 集群最新 config 号），供线下排障 |
+| `POST /debug/migrate-plan` | 配置变更 **dry-run** 预览：提交 `current` 配置 + `PlanOp`（Join/Leave/Move），返回目标配置/结构错误/演进错误/迁移步骤（`shardmaster.Plan` 在内存模拟，不触碰 Raft）。运维提交前安全评估迁移代价与风险 |
 
 `Handler()` 返回 `http.Handler`，便于用 `httptest` 做单测而无需绑定端口。
+
+**可观测响应头（经 `wrap` 统一注入，所有路由自动受益）**：
+
+- `X-Process-Time`：服务端处理耗时（TTFB 口径，毫秒，三位小数），用于定位慢路径。
+- `X-Response-Size`：响应体「线上」字节数（gzip 开启时为压缩后字节）；直方图指标 `gateway_response_bytes`。
+- `X-Request-Size`：入站请求体声明大小（`Content-Length`）；分块上传（`-1`）跳过以避免无意义负值，便于识别超大请求。
 
 ---
 
@@ -114,6 +121,11 @@ go run ./src/kvcli [-addr http://localhost:8080] bench put 500 4
 （`ops/sec`）与延迟分位数（`p50/p95/p99`，毫秒）。每个 worker 操作独立 key 命名空间，
 保证 `mixed`/`get` 下读到的都是本 worker 写入的数据。客户端对非 200 响应会返回错误
 （不会静默返回空串）。
+
+作为 Go 库使用时，`Client` 还提供：
+
+- `MGet(keys)` / `MSet(pairs)`：并发批量读/写，单 key 失败互不阻断（结果里 `Errors` 归集失败项）。
+- `SetMaxConcurrent(n int)`：限制 `MGet`/`MSet` 内部并发回源 goroutine 数（默认 `0`=不限制，保留历史语义；非 0 时仅该数量请求同时在途，复用 `util.Semaphore`，ctx 取消时立即退出不挂死），防止超大批量一次性拉起成千上万 goroutine 打爆客户端/后端。
 
 ---
 
