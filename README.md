@@ -145,8 +145,8 @@ curl http://localhost:8080/metrics           # -> JSON 指标快照
 
 ## 全栈组件与可观测性
 
-在 Lab 4 核心之上，仓库额外提供一组「可直接跑起来」的上层组件（详见
-[`docs/usage.md`](docs/usage.md)）：
+在 Lab 4 核心之上，仓库额外提供一组「可直接跑起来」的上层组件（使用指南见
+[`docs/usage.md`](docs/usage.md)，可观测性统一总览见 [`docs/observability.md`](docs/observability.md)）：
 
 - **`cluster` 包**（`src/cluster`）：把测试里的内存集群搭建逻辑抽成可 import 的包，
   供 demo / gateway / kvcli 复用。`StartCluster` / `Clerk` / `Join` / `Leave` / `Move` / `WaitConfig`。

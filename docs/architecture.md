@@ -89,6 +89,7 @@ raft-kv/
 │   ├── architecture.md          # 本文：系统架构地图
 │   ├── lab4-shardkv-design.md  # ShardKV 深层设计笔记（含 §7 冻结根治）
 │   ├── usage.md                 # 各组件使用指南 / 命令表
+│   ├── observability.md         # 可观测性统一总览（指标目录 / 端点 / 响应头 / 健康评分 / Prometheus 告警配方）
 │   ├── runbook.md               # 运维排障手册（含观测性告警段）
 │   └── coverage.md              # 测试覆盖与近期迭代清单（时效性说明）
 ├── ITERATION_RULES.md       # 自主迭代（self-driving）规则
