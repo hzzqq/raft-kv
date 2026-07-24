@@ -25,6 +25,24 @@ total:  (statements)  74.2%
 | `src/gateway` | 66.7% | HTTP 网关，读写/健康检查/指标/调试端点均覆盖；错误分支（504/503 映射）有 `TestGatewayFailFast` |
 | `src/kvcli` | 54.1% | HTTP 客户端 + CLI；`bench` 子命令与错误路径覆盖较弱（CLI 参数解析分支多） |
 
+> 时效性说明：上表数值为「可观测性/韧性收口（#212–#226）」**之前**的一次全量快照。
+> 该推送为 `util.WorkerPool`(#217)、`kvcli` 批量扇出(#218)、`raft`/`shardkv` 健康快照(#219–#220)、
+> 网关 `/debug/raft`(#221)/`raft_min_health_score`(#222)、`kvraft` 状态机可观测(#223) 等新增了
+> 大量 **cluster-free 单测**（见下），故当前真实覆盖率应高于上表。重新生成请用 `make cover`。
+
+## 近期新增 cluster-free 单测（#212 起，不触发进程内 Raft 选举，规避 Windows `time.Now()` 分辨率 flaky）
+
+| 测试文件 | 覆盖的增量能力 |
+|----|------|
+| `src/util/worker_pool_test.go` | `TrySubmit`(非阻塞) / `SubmitCtx`(ctx 取消) / 停止无 panic |
+| `src/kvcli/client_batch_concurrency_test.go` | `MGet`/`MSet` 有界并发 + ctx 取消不挂死 |
+| `src/raft/raft_status_test.go` · `raft_metrics_test.go` | `Raft.Status()` 只读快照 · 共识层计数 |
+| `src/diagnostics/diagnostics_selfcheck_test.go` | `RaftCheck` 不变量自检（健康 / commit 越界 / apply 越界 / leader 无租约） |
+| `src/shardkv/raft_status_test.go` | `ShardKV.RaftStatus()` 透出底层共识健康 |
+| `src/gateway/gateway_debug_raft_test.go` · `gateway_raft_health_metric_test.go` · `gateway_proc_metrics_test.go` · `gateway_concurrency_test.go` | `/debug/raft` 汇聚 · `raft_min_health_score` · 进程级 gauge · 并发信号量 |
+| `src/shardmaster/shardmaster_metrics_test.go` · `src/transport/transport_metrics_test.go` | 控制面 / 框架层指标埋点 |
+| `src/kvraft/kvraft_status_test.go` | `KVServer.Status()` + GC 计数（**注：该文件尚未提交，待 go 工具链验证后入册**） |
+
 ## 如何复现
 
 ```bash
