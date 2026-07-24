@@ -9,12 +9,20 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"raftkv/src/metrics"
 	"raftkv/src/raft"
 )
+
+// Metrics 是 ShardMaster 控制面的可观测性指标（best-effort 进程级聚合）。
+// 此前控制面（配置变更）对运维完全不可见：Join/Leave/Move 的频次、rebalance
+// 搬运的分片数、配置版本演进都无埋点，分区/抖动时无法判断"配置是否还在正常推进"。
+// 经网关 /metrics 与 shardkv.Metrics 一并暴露，便于统一 scrape 与排障。
+var Metrics = metrics.NewRegistry()
 
 // ============================== 常量与类型 ==============================
 
@@ -211,6 +219,22 @@ func (sm *ShardMaster) applyOp(op Op) {
 		newCfg.Shards[op.Shard] = op.Gid
 	}
 	sm.configs = append(sm.configs, newCfg)
+
+	// 控制面可观测性（best-effort，纯原子操作，零行为影响）：
+	// 记录本次配置变更的类别与触发的 rebalance 搬运分片数，并把当前配置版本
+	// 暴露为 gauge，便于运维在 /metrics 看到配置是否在正常演进、rebalance 抖动幅度。
+	Metrics.CounterWithHelp("sm_config_applied_total", "累计应用的配置变更次数（按 kind 维度再细分）").Inc()
+	Metrics.CounterWithHelp("sm_"+strings.ToLower(op.Kind)+"_total", "累计 "+op.Kind+" 配置变更次数").Inc()
+	var moved int
+	for i := 0; i < NShards; i++ {
+		if last.Shards[i] != newCfg.Shards[i] {
+			moved++
+		}
+	}
+	if moved > 0 {
+		Metrics.CounterWithHelp("sm_rebalance_moves_total", "累计因配置变更而重新分配的分片数").Add(int64(moved))
+	}
+	Metrics.GaugeWithHelp("sm_config_num", "当前生效的配置版本号(Num)").Set(float64(newCfg.Num))
 }
 
 // rebalance 在保持尽可能多已有 shard→gid 分配的前提下，把 NShards 个分片
@@ -382,6 +406,7 @@ func (sm *ShardMaster) propose(op Op) Err {
 		sm.mu.Lock()
 		delete(sm.notified, nid)
 		sm.mu.Unlock()
+		Metrics.CounterWithHelp("sm_propose_errors_total", "累计 propose 失败次数(非 OK 返回)").Inc()
 		return ErrTimeout
 	}
 }
@@ -391,6 +416,7 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	ok := validateJoin(sm.configs[len(sm.configs)-1].Groups, args.Servers)
 	sm.mu.Unlock()
 	if !ok {
+		Metrics.CounterWithHelp("sm_invalid_args_total", "累计因参数校验失败被拒的配置变更次数").Inc()
 		reply.Err = ErrInvalid
 		return
 	}
@@ -401,6 +427,7 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	ok := validateLeave(sm.configs[len(sm.configs)-1].Groups, args.Gids)
 	sm.mu.Unlock()
 	if !ok {
+		Metrics.CounterWithHelp("sm_invalid_args_total", "累计因参数校验失败被拒的配置变更次数").Inc()
 		reply.Err = ErrInvalid
 		return
 	}
@@ -411,6 +438,7 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	ok := validateMove(sm.configs[len(sm.configs)-1].Groups, args.Shard, args.Gid)
 	sm.mu.Unlock()
 	if !ok {
+		Metrics.CounterWithHelp("sm_invalid_args_total", "累计因参数校验失败被拒的配置变更次数").Inc()
 		reply.Err = ErrInvalid
 		return
 	}
@@ -419,11 +447,11 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 
 // Query 直接返回已提交的内存配置（不进 Raft，只读最新提交态）。
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
-	_, isLeader := sm.rf.GetState()
-	if !isLeader {
+	if _, isLeader := sm.rf.GetState(); !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	Metrics.CounterWithHelp("sm_queries_total", "累计 Query 读取配置次数").Inc()
 	sm.mu.Lock()
 	n := len(sm.configs)
 	if args.Num < 0 || args.Num >= n {

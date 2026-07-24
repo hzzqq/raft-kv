@@ -1427,6 +1427,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		if err := shardkv.Metrics.WritePrometheus(w); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
+		// 追加控制面(shardmaster)指标，使配置变更/ rebalance 也能一次 scrape 采集到。
+		if err := shardmaster.Metrics.WritePrometheus(w); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		// 追加网关自身指标（名称与 KV 层不冲突），便于一次 scrape 同时采集两侧。
 		if err := Metrics.WritePrometheus(w); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1434,8 +1438,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap := shardkv.Metrics.Snapshot()
-	// 在 KV 层快照顶层附加 gateway 子键；保持顶层 counters/histograms 不变，
+	// 在 KV 层快照顶层附加 gateway / shardmaster 子键；保持顶层 counters/histograms 不变，
 	// 既有消费方（按顶层字段解析）不受影响。
+	snap["shardmaster"] = shardmaster.Metrics.Snapshot()
 	snap["gateway"] = Metrics.Snapshot()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
