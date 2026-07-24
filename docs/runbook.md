@@ -10,11 +10,11 @@
 | 端点 | 用途 |
 |------|------|
 | `GET /status` | 集群健康总览 JSON：每 group 是否有 leader、当前 config 号、拥有分片数、`pending_in` / `pending_out` / `incoming` 分片列表、卡滞秒数（`stall_seconds`）。`healthy=false` 表示存在卡滞。 |
-| `GET /debug/shards` | 全集群每副本的分片归属 + 迁移态（`pending_in` / `pending_out` / `incoming`）+ 卡滞时间戳。最细粒度。 |
+| `GET /debug/shards` | 全集群每副本的分片归属 + 迁移态（`pending_in` / `pending_out` / `incoming`）+ 卡滞时间戳；含 #230 `diagnosis` 数据面自检段（`pendingIn`∩`pendingOut` 自相矛盾 / `Owned` 重复 / 迁移卡滞 `StallSeconds>60s` 等不变量），一眼判读是否冻结。最细粒度。 |
 | `GET /debug/migrate` | 纯文本迁移进度，供 `./start.sh migrate` 直接看。 |
 | `GET /debug/configs` | shardmaster 完整配置历史（初始 → 最新），复盘 rebalance 轨迹，确认分片在哪些 group 间迁移。 |
 | `GET /debug/groups` | 各 replica group 的 `gid` / 副本数 / leader / 当前 config 号 / 持有分片数，快速核对「哪个 group 当前拥有哪些分片」。 |
-| `GET /metrics` | 计数器 + 直方图 + 瞬时 Gauge（含 `shard_migration_ms` 迁移延迟、`op_latency_ms` 操作延迟、`config_stalls` 冻结计数、`config_changes` 配置变更次数、`config_num` 当前生效配置号 Gauge、`apply_lag` 应用滞后 Gauge、`shard_bytes` 分片字节直方图、`shard_bytes_overflow` 超大分片告警、`send_shard_latency` 每跳迁移延迟、`read_leases` ReadIndex 快读命中计数）。**格式协商**：`Accept` 含 `text/plain`/`prometheus` 时输出 Prometheus 文本 exposition（可被 scrape 客户端采集），否则默认 JSON。 |
+| `GET /metrics` | 计数器 + 直方图 + 瞬时 Gauge（含 `shard_migration_ms` 迁移延迟、`op_latency_ms` 操作延迟、`config_stalls` 冻结计数、`config_changes` 配置变更次数、`config_num` 当前生效配置号 Gauge、`apply_lag` 应用滞后 Gauge、`shard_bytes` 分片字节直方图、`shard_bytes_overflow` 超大分片告警、`send_shard_latency` 每跳迁移延迟、`read_leases` ReadIndex 快读命中计数；**ShardKV 迁移积压 Gauge（#229，阈值告警主指标）**：`shardkv_pending_in`（本组待接收分片数，长期 >0 提示迁移卡死）、`shardkv_pending_out`（本组待迁出分片数，同上）、`shardkv_shards_owned`（本组当前实际持有分片数）、`shardkv_pending_total`（本组积压总量 = pending_in+pending_out，综合告警用））。**格式协商**：`Accept` 含 `text/plain`/`prometheus` 时输出 Prometheus 文本 exposition（可被 scrape 客户端采集），否则默认 JSON。 |
 | `GET /debug/accesslog?limit=N` | 进程内访问日志环形缓冲（最近 N 条，默认 50）：每请求的方法 / 路径 / 状态码 / 延迟 / `request_id`，供审计排障（无需外部日志采集）。 |
 | `GET /readyz` | **就绪探针**：集群每个 group 都有「持租约的 leader」且无迁移卡滞时返回 `200`，否则 `503`；与恒 `200` 的存活探针 `/healthz` 区分，可直接作 k8s `readinessProbe`。 |
 | `GET /healthz` | 存活探针，恒 `200`。 |
@@ -206,4 +206,32 @@ CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh conf
 
 排障时若 `Sessions` 持续增长而 `gc_sessions_evicted_total` 长期为 0，多半是 `gcTTL`
 配置过大或 GC 周期未触发，可调小 `gcTTL`/`gcInterval`（KVServer 字段，测试可临时覆盖）。
+
+## 7. 数据面迁移积压告警（Prometheus）
+
+冻结根因已根治（§4），但 `shardkv_pending_*` 四个 Gauge 仍是最灵敏的回归/异常信号——
+正常再平衡期间它们会瞬间 >0 随后清零，**持续 >0 即意味着迁移卡死或配置未推进**，应优先于
+`config_stalls` 计数接入告警。指标语义见 §1 `/metrics`：
+
+| 指标 | 含义 | 告警建议 |
+|------|------|----------|
+| `shardkv_pending_in` | 本组待接收分片数（已配置但数据未到位） | 单 replica group 持续 >0 超分钟级 → 配 §2 症状 A 排查 |
+| `shardkv_pending_out` | 本组待迁出分片数（已不再拥有但数据未推走） | 同 `pending_in`，对应 §2 症状 C |
+| `shardkv_shards_owned` | 本组当前实际持有分片数 | 与 `/debug/groups` 持有数长期不符 → 配置/归属漂移 |
+| `shardkv_pending_total` | 本组积压总量（`pending_in`+`pending_out`） | **主告警指标**：`max by (instance) > 0` 持续窗口即触发 |
+
+示例告警规则（Prometheus / Alertmanager）：
+
+```yaml
+- alert: ShardKV_MigrationStalled
+  expr: max by (instance) (shardkv_pending_total) > 0
+  for: 5m
+  annotations:
+    summary: "ShardKV 迁移积压未清零（疑似再平衡冻结/卡滞）"
+```
+
+注：`ShardCheck`（§1 `/debug/shards` 的 `diagnosis` 字段）提供同类信号的人类可读版
+（`pendingIn`∩`pendingOut` 自相矛盾 / `StallSeconds>60s`），与 Prometheus 数值告警互补——
+前者用于人肉判读，后者用于自动化值守。
+
 

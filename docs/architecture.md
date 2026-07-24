@@ -185,7 +185,7 @@ Raft 从 Persister 恢复：currentTerm / votedFor / log[] / snapshot
 - `Registry.Snapshot()` / `DumpJSON()` / `StartPeriodicReporter()`
 
 挂载点：
-- `gateway` 的 `GET /metrics` 按 `Accept` 协商格式：含 `text/plain`/`prometheus` → Prometheus 文本 exposition（聚合 `shardkv.Metrics` + `shardmaster.Metrics` + 网关自身 `Metrics` 三套注册表，含 `raft_min_health_score` 等共识健康 gauge）；否则 → JSON 快照（`shardkv` 顶层计数/直方图 + `{"shardmaster":…,"gateway":…}` 子键）。
+- `gateway` 的 `GET /metrics` 按 `Accept` 协商格式：含 `text/plain`/`prometheus` → Prometheus 文本 exposition（聚合 `shardkv.Metrics` + `shardmaster.Metrics` + 网关自身 `Metrics` 三套注册表，含 `raft_min_health_score` 等共识健康 gauge）；否则 → JSON 快照（`shardkv` 顶层计数/直方图 + `{"shardmaster":…,"gateway":…}` 子键）。其中 `shardkv.Metrics` 含迁移积压 Gauge：`shardkv_pending_in`/`shardkv_pending_out`（待接收/待迁出分片数，长期 >0 提示卡死）、`shardkv_shards_owned`（实际持有分片数）、`shardkv_pending_total`（积压总量，#229 阈值告警主指标）。
 - `demo` 每 400ms 往 stderr 流一份指标快照，演示时可见吞吐与延迟。
 - `kvcli bench` 报告 ops/sec + p50/p95/p99。
 
