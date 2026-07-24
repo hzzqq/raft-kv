@@ -88,7 +88,8 @@ go run ./src/gateway :9090           # 自定义地址
 | `GET /kv/{key}` | 读取 `key` 当前值 |
 | `POST /kv/{key}/append` | 把 body 追加到 `key` 当前值之后 |
 | `GET /healthz` | 健康检查（200） |
-| `GET /metrics` | 返回 `shardkv.Metrics` 的 JSON 快照（counters + 直方图分位数） |
+| `GET /metrics` | 按 `Accept` 协商：`text/plain`/`prometheus` → Prometheus 文本（聚合 `shardkv`+`shardmaster`+网关三套注册表，含 `raft_min_health_score`）；否则 → JSON 快照（`shardkv` 顶层 + `{"shardmaster":…,"gateway":…}` 子键） |
+| `GET /debug/raft` | 共识健康汇聚：各 group/副本的 `RaftStatus` + `diagnostics.RaftCheck` 自检（角色/任期/认知 leader/租约/不变量），一眼看清脑裂/任期翻滚/apply 落后 |
 | `GET /status` | 集群健康总览（JSON `ClusterStatus`）：每 group leader/config/持有/待收/待迁/孤儿中转计数 + 卡滞秒数 + 整体 `healthy` 标志（卡滞 >2s 判冻结），供监控/告警轮询 |
 | `GET /debug/migrate` | 纯文本迁移进度（每 group leader 副本的 pendingIn/pendingOut/incoming 分布 + 集群最新 config 号），供线下排障 |
 | `POST /debug/migrate-plan` | 配置变更 **dry-run** 预览：提交 `current` 配置 + `PlanOp`（Join/Leave/Move），返回目标配置/结构错误/演进错误/迁移步骤（`shardmaster.Plan` 在内存模拟，不触碰 Raft）。运维提交前安全评估迁移代价与风险 |
@@ -154,7 +155,7 @@ snap := reg.Snapshot() // map[string]interface{}，可直接 json 序列化
 reg.Reset()            // 跨用例重置，避免进程级指标累积
 ```
 
-网关的 `GET /metrics` 直接序列化 `shardkv.Metrics.Snapshot()`，便于接入外部监控。
+网关的 `GET /metrics` 按 `Accept` 协商格式（Prometheus 文本 / JSON 快照），聚合 `shardkv`+`shardmaster`+网关三套 `Metrics` 注册表，便于接入外部监控与阈值告警。
 新增 `shard_migration_ms` 直方图记录分片入站迁移端到端耗时（从 `pendingInSince` 起算，
 到 `applyInstallShard` 落盘或 `applyNewConfig` 消费 incoming 为止）。
 
