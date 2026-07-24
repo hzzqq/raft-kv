@@ -25,10 +25,13 @@ total:  (statements)  74.2%
 | `src/gateway` | 66.7% | HTTP 网关，读写/健康检查/指标/调试端点均覆盖；错误分支（504/503 映射）有 `TestGatewayFailFast` |
 | `src/kvcli` | 54.1% | HTTP 客户端 + CLI；`bench` 子命令与错误路径覆盖较弱（CLI 参数解析分支多） |
 
-> 时效性说明：上表数值为「可观测性/韧性收口（#212–#226）」**之前**的一次全量快照。
-> 该推送为 `util.WorkerPool`(#217)、`kvcli` 批量扇出(#218)、`raft`/`shardkv` 健康快照(#219–#220)、
-> 网关 `/debug/raft`(#221)/`raft_min_health_score`(#222)、`kvraft` 状态机可观测(#223) 等新增了
-> 大量 **cluster-free 单测**（见下），故当前真实覆盖率应高于上表。重新生成请用 `make cover`。
+> 时效性说明：上表数值为较早一次全量快照（早于 #227–#234 的可观测/文档收口）。
+> #212–#226 推送为 `util.WorkerPool`(#217)、`kvcli` 批量扇出(#218)、`raft`/`shardkv` 健康快照(#219–#220)、
+> 网关 `/debug/raft`(#221)/`raft_min_health_score`(#222)、`kvraft` 状态机可观测(#223) 新增了大量
+> **cluster-free 单测**；#227–#234 又追加 `kvraft` 状态机可观测收口(#228，含 `kvraft_status_test.go`
+> 已于 #228 提交 `8e93ef7`)、`shardkv` 迁移积压 gauge(#229)、`diagnostics.ShardCheck` 数据面自检(#230)
+> 以及文档同步(#231–#234，含新增 `docs/observability.md` 统一指标总览）。故当前真实覆盖率应高于上表。
+> 重新生成请用 `make cover`。
 
 ## 近期新增 cluster-free 单测（#212 起，不触发进程内 Raft 选举，规避 Windows `time.Now()` 分辨率 flaky）
 
@@ -41,7 +44,7 @@ total:  (statements)  74.2%
 | `src/shardkv/raft_status_test.go` | `ShardKV.RaftStatus()` 透出底层共识健康 |
 | `src/gateway/gateway_debug_raft_test.go` · `gateway_raft_health_metric_test.go` · `gateway_proc_metrics_test.go` · `gateway_concurrency_test.go` | `/debug/raft` 汇聚 · `raft_min_health_score` · 进程级 gauge · 并发信号量 |
 | `src/shardmaster/shardmaster_metrics_test.go` · `src/transport/transport_metrics_test.go` | 控制面 / 框架层指标埋点 |
-| `src/kvraft/kvraft_status_test.go` | `KVServer.Status()` + GC 计数（**注：该文件尚未提交，待 go 工具链验证后入册**） |
+| `src/kvraft/kvraft_status_test.go` | `KVServer.Status()` + GC 计数（已于 #228 提交 `8e93ef7`） |
 
 ## 如何复现
 
@@ -63,3 +66,8 @@ CI 的 `coverage` job 也会跑同样的命令并把 `cover.out` 作为 artifact
 1. `src/kvcli`（54.1%）最薄弱：补 `bench` 子命令的单测与 CLI 错误路径，预计可拉到 70%+。
 2. `src/shardkv`（66.5%）：针对 `pendingIn/pendingOut` 冻结的异常路径补「恢复后自愈」用例（与 §7 根因修复配套），可同时提升覆盖率与鲁棒性。
 3. `src/raft`（77.8%）：补快照截断 / 日志压缩边界的单测。
+
+## 相关文档
+
+- [`docs/observability.md`](observability.md) —— 指标目录与各子系统单测的对应关系（含 `raft_*` / `kv_*` / `shardkv_*` / `sm_*` / `gateway_*` 指标来源），提交覆盖前后均可据此核对可观测性是否随单测同步增长。
+- [`docs/architecture.md`](architecture.md) · [`docs/usage.md`](usage.md) · [`docs/runbook.md`](runbook.md) —— 架构 / 使用 / 运维排障。
