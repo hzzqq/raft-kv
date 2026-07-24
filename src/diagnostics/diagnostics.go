@@ -4,6 +4,7 @@
 package diagnostics
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"raftkv/src/shardmaster"
@@ -60,4 +61,31 @@ func DiagnoseConfig(c *shardmaster.Config) Diagnosis {
 		issues = []string{"ok"}
 	}
 	return Diagnosis{Score: score, Issues: issues}
+}
+
+// Level 把 0-100 健康分映射为机器可读的严重度等级，供自动化按健康度门禁
+//（如 CI/巡检脚本依等级决定是否阻断发布）：critical(<50) / warn(<80) / ok(>=80)。
+func (d Diagnosis) Level() string {
+	switch {
+	case d.Score < 50:
+		return "critical"
+	case d.Score < 80:
+		return "warn"
+	default:
+		return "ok"
+	}
+}
+
+// JSON 以机器可读形态导出诊断结果（含 level 维度），便于被 Prometheus/CI/巡检脚本
+// 直接消费做自动化门禁，而无需重新解析人类可读文本。
+func (d Diagnosis) JSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Score  int      `json:"score"`
+		Level  string   `json:"level"`
+		Issues []string `json:"issues"`
+	}{
+		Score:  d.Score,
+		Level:  d.Level(),
+		Issues: d.Issues,
+	})
 }

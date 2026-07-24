@@ -44,6 +44,26 @@ const maxConcurrent = 64
 // 采集「网关 HTTP 面」与「KV 层」两方面的健康度。
 var Metrics = metrics.NewRegistry()
 
+// ensureProcGauges 注册进程级观测 gauge（幂等，可重复调用）：
+//   - gw_uptime_seconds：进程运行时长，便于发现"进程是否刚重启/抖动"；
+//   - gw_goroutines：当前 goroutine 数，goroutine 暴涨往往是连接/协程泄漏的前兆。
+//
+// 幂等设计使得即便 Metrics.Reset() 清空 funcGauges（如其它单测做指标隔离）后，
+// 仍可重新注册恢复，避免进程级观测被一次性清空。
+func ensureProcGauges() {
+	start := time.Now()
+	Metrics.FuncGaugeWithHelp("gw_uptime_seconds", "网关进程已运行时长(秒)", func() float64 {
+		return time.Since(start).Seconds()
+	})
+	Metrics.FuncGaugeWithHelp("gw_goroutines", "网关进程当前 goroutine 数", func() float64 {
+		return float64(runtime.NumGoroutine())
+	})
+}
+
+func init() {
+	ensureProcGauges()
+}
+
 // Server 持有集群与绑定到它的 ShardKV 客户端。
 type Server struct {
 	c     *cluster.Cluster
