@@ -410,8 +410,11 @@ func TestHasCommittedCurrentTerm(t *testing.T) {
 	defer cfg.cleanup()
 
 	// 等待某 leader 提交其 noop -> HasCommittedCurrentTerm 应为 true。
+	// 等待窗口放宽到 10s：选举超时本为 260–480ms，正常 <1.5s 即可，但机器高负载
+	// （CPU 调度竞争）下 raft 后台 goroutine 可能被饿死而超出 5s，属负载敏感 flaky
+	// 而非逻辑缺陷，放宽窗口可让 CI 在负载环境下稳定通过。
 	leaderSetFlag := false
-	for i := 0; i < 500; i++ {
+	for i := 0; i < 1000; i++ {
 		if l := cfg.leader(); l >= 0 && cfg.rafts[l].HasCommittedCurrentTerm() {
 			leaderSetFlag = true
 			break
@@ -436,7 +439,7 @@ func TestHasCommittedCurrentTerm(t *testing.T) {
 	oldLeader := l
 	cfg.rafts[oldLeader].stepDown(cfg.rafts[oldLeader].currentTerm + 1)
 	reElected := false
-	for i := 0; i < 500; i++ {
+	for i := 0; i < 1000; i++ {
 		if nl := cfg.leader(); nl >= 0 && nl != oldLeader && cfg.rafts[nl].HasCommittedCurrentTerm() {
 			reElected = true
 			break

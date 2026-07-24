@@ -292,6 +292,15 @@ R3 #54–#82 全部本地提交；#54–#72 已按授权 fast-forward 推送，�
 - **version 包自动补全构建信息（#210）**：`applyBuildInfo` 纯函数（仅默认 `dev`/`unknown` 用 `runtime/debug.ReadBuildInfo()` 的 VCS 信息补全，显式 `-ldflags` 注入不覆盖）+ `LoadFromBuildInfo`（`sync.Once` 幂等全局填充）；未注入的裸 `go build`/`go run` 二进制也能自报 `commit`/`build_time`，排障可定位构建来源。
 - **gateway 并发上限收敛到 util.Semaphore（#211）**：网关在途请求信号量由散落裸 `make(chan struct{})` 收敛为 `util.Semaphore`（与 kvcli #207 对齐），新增非阻塞 `TryAcquire`（满即拒 429、不残留部分获取）+ `InUse` 观测；网关新增 `gateway_concurrent_in_use` 实时并发占用 gauge。
 
+### R7 自主迭代交付（#212–#216，可观测性收口）
+
+扫描统一 `metrics` 注册表接入情况，定位控制面/框架层盲区（shardmaster 控制面、transport 框架层、gateway 进程级、raft 共识层此前零埋点），补齐后 `shardmaster`/`transport`/`gateway`/`raft` 四个包的控制面与框架层指标全部经 `/metrics`（Prometheus/JSON）暴露；全部 cluster-free 单测验证（绕开进程内 raft 选举，规避 Windows `time.Now()` 分辨率导致的 flaky），沿用「验收不过绝不提交」纪律：
+
+- **shardmaster 控制面指标（#213）**：`applyOp` 末尾埋点 `sm_config_applied_total`（累计生效配置数）、`sm_<kind>_total`（Join/Leave/Move 各类操作计数）、`sm_rebalance_moves_total`（再平衡搬动分片数）、`sm_config_num`（当前生效 config 号 gauge）；`propose` 超时分支 `sm_propose_errors_total`、`Join/Leave/Move` 入参校验失败 `sm_invalid_args_total`、`Query` `sm_queries_total`。配套 `TestMetricsConfigApplied` 以 cluster-free 直接驱动 `applyOp` 验证埋点递增；网关 `/metrics` 的 Prometheus/JSON 分支同步汇总 `shardmaster.Metrics`。
+- **transport 框架层指标（#214）**：`serveConn` 在 `safeCall` 后按 `fullMethod`（如 `/T/Ping`）埋点 `rpc_<method>`（每方法调用计数）、`transport_rpc_latency_ms`（有界环形 Histogram，记录 `_count`/`_sum`/`_p50`/`_p95`/`_p99`）、`transport_rpc_errors`（handler panic/错误计数）。配套 `TestServerMetricsPerMethod` 起真实 TCP 服务端/客户端验证三类指标按方法名递增。
+- **gateway 进程级 gauge（#215）**：新增 `gw_uptime_seconds`（进程运行时长 FuncGauge）与 `gw_goroutines`（当前 goroutine 数 FuncGauge），由 `ensureProcGauges()` 幂等注册（抵抗 `Metrics.Reset()` 清空 `funcGauges`），经 `/metrics` 暴露便于发现进程重启与 goroutine 泄漏；配套 `TestProcGaugesRegistered`。同轮为 `diagnostics` 新增 `Level()`（critical<50 / warn<80 / ok>=80）与 `JSON()` 机器可读导出（`score`/`level`/`issues`），配套 `TestDiagnosisLevel` / `TestDiagnosisJSON`，供监控/告警直接消费诊断评分。
+- **raft 共识层指标（#216）**：`Start` 中 `persist()` 前 `raft_log_appends_total`（leader 追加日志条目计数，与既有 `raft_log_applied` 区分，观察写入吞吐与复制滞后）；`doRealElection` 发起选举 `raft_term_changes_total`、`stepDown` 因更高任期退位 `raft_term_changes_total`（观察任期翻转频率，频繁变更往往是网络分区/不稳定信号）。配套 `TestRaftLogAppendsMetric`（cluster-free 最小 `Raft` 结构）验证计数递增；全包其余测试无回归。
+
 ## 说明
 - 这是面向学习的实验性实现，重点在正确性与可读性，非生产级部署。
 - 持久化、RPC、网络均使用 MIT 6.824 提供的实验脚手架（`persister.go` / `labrpc.go`）。
