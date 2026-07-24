@@ -184,7 +184,26 @@ CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh conf
 
 ### 6.3 集成建议
 
-- 监控脚本：周期调用各节点 `Status()` → `RaftCheck()` → 上报 `raft_status_score` gauge；
+- 监控脚本（数据面/网关场景）：直接轮询网关 `GET /debug/raft` 即可一次拿全集群各副本
+  `RaftStatus` + `RaftCheck` 自检，无需逐节点登录；另可 scrape 网关 `GET /metrics`
+  的 `raft_min_health_score` gauge（min 语义，任一副本不变量被破坏即拉低），接阈值告警。
+- 单节点/裸 Raft 场景：周期调用各节点 `Status()` → `RaftCheck()` → 上报 `raft_status_score` gauge；
 - 脑裂排查：对比多节点的 `Term` 与 `LeaderID`，若同时出现两个 `LeaderID!= -1` 且 `Term` 相近，
   即疑似脑裂；
 - 排障 SOP 第 1 步之前，可先用 `RaftCheck` 确认单节点运行时不变量未被破坏。
+
+### 6.4 kvraft 状态机可观测（KVServer.Status / GC 计数）
+
+基于 Raft 的 Lab3 KV（`src/kvraft`）此前对运维完全不透明，现已补齐数据面一手信号：
+
+- `KVServer.Status()`：持 `kv.mu` 的只读快照，含 `Role`/`Term`/`LeaderID`（透出底层
+  `raft.Raft.Status()`）、`AppliedIndex`（状态机应用进度）、`DataKeys`（数据键数）、
+  `Sessions`（去重会话表大小）、`GCTTLSec`/`GCIntervalSec`（GC 配置）。
+- 规模 gauge：`kv_data_keys` / `kv_sessions`（每次 apply / GC 后刷新，近似多实例共享
+  注册表时取最后写入者）。
+- GC 计数：`gc_sweeps_total`（扫描次数）、`gc_sessions_evicted_total`（累计回收会话数），
+  用于观测会话表增长与回收节奏，定位「会话表只增不减」类泄漏。
+
+排障时若 `Sessions` 持续增长而 `gc_sessions_evicted_total` 长期为 0，多半是 `gcTTL`
+配置过大或 GC 周期未触发，可调小 `gcTTL`/`gcInterval`（KVServer 字段，测试可临时覆盖）。
+
