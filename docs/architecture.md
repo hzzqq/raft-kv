@@ -63,7 +63,7 @@
 | 配置服务 | `src/shardmaster` | 维护 `Config` 序列（Join/Leave/Move/Query），自身跑在 Raft 上 | `ShardMaster` · `Config` |
 | 数据面 | `src/shardkv` | 分片路由、迁移状态机、线性一致读、快照压缩 | `ShardKV` · `MakeShardKV` |
 | 集群工具 | `src/cluster` | 可复用的 in-process labrpc 集群封装（测试 / 演示 / 网关都用它起集群） | `StartCluster` · `Clerk` |
-| HTTP 网关 | `src/gateway` | 把集群暴露成 REST：`/kv/{key}`(GET/PUT/POST-append) · `/healthz`(存活) · `/readyz`(就绪) · `/metrics`(JSON/Prometheus 协商) · `/status`(集群健康) · `/debug/shards` · `/debug/migrate` · `/debug/configs` · `/debug/groups` · `/debug/accesslog` · `/debug/log`(分级结构化日志) · `/debug/config`(生效配置快照) | `Handler` · `main` |
+| HTTP 网关 | `src/gateway` | 把集群暴露成 REST：`/kv/{key}`(GET/PUT/POST-append) · `/healthz`(存活) · `/readyz`(就绪) · `/metrics`(JSON/Prometheus 协商，聚合 shardkv+shardmaster+gateway 三套注册表) · `/status`(集群健康) · `/debug/shards` · `/debug/migrate`(迁移进度) · `/debug/migrate-plan`(POST，配置变更 dry-run) · `/debug/configs` · `/debug/groups` · `/debug/raft`(共识健康汇聚) · `/debug/version`(构建信息) · `/debug/routes`(路由表) · `/debug/accesslog` · `/debug/log`(分级结构化日志) · `/debug/config`(生效配置快照) | `Handler` · `main` |
 | 客户端 | `src/kvcli` | HTTP 客户端 + 命令行（get/put/append/bench） | `Client` · `main` |
 | 演示 | `src/demo` | 全栈冒烟：Clerk 路径 + HTTP 网关路径 | `main` |
 | 可观测 | `src/metrics` | 零依赖 Counter + 有界直方图（p50/p95/p99） | `Registry` · `Snapshot` |
@@ -183,7 +183,7 @@ Raft 从 Persister 恢复：currentTerm / votedFor / log[] / snapshot
 - `Registry.Snapshot()` / `DumpJSON()` / `StartPeriodicReporter()`
 
 挂载点：
-- `gateway` 的 `GET /metrics` 把 `shardkv.Metrics.Snapshot()` 序列化成 JSON（计数器 + 分位延迟）。
+- `gateway` 的 `GET /metrics` 按 `Accept` 协商格式：含 `text/plain`/`prometheus` → Prometheus 文本 exposition（聚合 `shardkv.Metrics` + `shardmaster.Metrics` + 网关自身 `Metrics` 三套注册表，含 `raft_min_health_score` 等共识健康 gauge）；否则 → JSON 快照（`shardkv` 顶层计数/直方图 + `{"shardmaster":…,"gateway":…}` 子键）。
 - `demo` 每 400ms 往 stderr 流一份指标快照，演示时可见吞吐与延迟。
 - `kvcli bench` 报告 ops/sec + p50/p95/p99。
 
