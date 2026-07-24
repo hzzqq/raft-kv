@@ -62,6 +62,9 @@ type Client struct {
 	// maxConcurrent 限制 MGet/MSet 批量操作内部并发回源的 goroutine 数，
 	// 防止超大批量一次性拉起成千上万 goroutine 打爆客户端/后端。0=不限制（保留历史语义）。
 	maxConcurrent int
+	// sem 是 maxConcurrent>0 时复用的有界信号量（util.Semaphore，支持 ctx 取消）；
+	// nil 表示不限制并发。构造一次后跨多次批量调用复用，避免每批新建 channel。
+	sem *util.Semaphore
 }
 
 // cacheEntry 是单条缓存值及其绝对过期时刻。
@@ -219,16 +222,14 @@ func (c *Client) Close() {
 // SetMaxConcurrent 限制 MGet/MSet 批量操作内部并发回源的 goroutine 数（R2 隐性健壮性：
 // 默认 MGet/MSet 每 key 起一个 goroutine 且无上限，超大批量会一次性拉起成千上万
 // goroutine 打爆客户端与后端）。0=不限制（保留历史语义）。非 0 时仅该数量请求同时在途。
+// 复用 util.Semaphore 有界信号量（支持 ctx 取消），构造一次缓存复用。
 func (c *Client) SetMaxConcurrent(n int) {
 	c.maxConcurrent = n
-}
-
-// batchSem 返回一个容量为 maxConcurrent 的信号量；0 或负返回 nil（不限制并发）。
-func (c *Client) batchSem() chan struct{} {
-	if c.maxConcurrent > 0 {
-		return make(chan struct{}, c.maxConcurrent)
+	if n > 0 {
+		c.sem = util.NewSemaphore(n)
+	} else {
+		c.sem = nil
 	}
-	return nil
 }
 
 // EnableCache 开启读穿缓存：ttl 为条目有效期，max 为容量上限（超出按近似 FIFO
@@ -490,16 +491,22 @@ func (c *Client) MGetCtx(ctx context.Context, keys []string) MGetResult {
 	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	sem := c.batchSem()
+	sem := c.sem
 	for _, k := range keys {
 		if sem != nil {
-			sem <- struct{}{}
+			// 有界信号量：满则阻塞直至有空位；ctx 取消时及时退出，避免批量挂死。
+			if err := sem.Acquire(ctx); err != nil {
+				mu.Lock()
+				res.Errors[k] = err
+				mu.Unlock()
+				continue
+			}
 		}
 		wg.Add(1)
 		go func(k string) {
 			defer wg.Done()
 			if sem != nil {
-				defer func() { <-sem }()
+				defer sem.Release()
 			}
 			v, err := c.getCtx(ctx, k)
 			mu.Lock()
@@ -544,16 +551,22 @@ func (c *Client) MSetCtx(ctx context.Context, pairs map[string]string) MSetResul
 	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	sem := c.batchSem()
+	sem := c.sem
 	for k, v := range pairs {
 		if sem != nil {
-			sem <- struct{}{}
+			if err := sem.Acquire(ctx); err != nil {
+				mu.Lock()
+				res.Results[k] = err
+				res.Errors[k] = err
+				mu.Unlock()
+				continue
+			}
 		}
 		wg.Add(1)
 		go func(k, v string) {
 			defer wg.Done()
 			if sem != nil {
-				defer func() { <-sem }()
+				defer sem.Release()
 			}
 			err := c.putCtx(ctx, k, v)
 			mu.Lock()

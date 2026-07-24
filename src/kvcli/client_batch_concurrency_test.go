@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -81,5 +82,40 @@ func TestMGetUnboundedByDefault(t *testing.T) {
 	}
 	if atomic.LoadInt64(&maxInflight) <= 2 {
 		t.Fatalf("default should allow >2 in-flight, got %d (limit unexpectedly active)", atomic.LoadInt64(&maxInflight))
+	}
+}
+
+// TestMGetBoundedContextCancel 验证：限流信号量支持 ctx 取消——当 ctx 已取消时，
+// sem.Acquire(ctx) 立即返回 ctx.Err()（而非阻塞在满信号量上），MGet 不应挂死，
+// 且被阻塞的 key 被记为 ctx 错误。这是 #207 用 util.Semaphore 替换裸 channel 后
+// 新增的取消语义（cluster-free，mock 网关即可触发）。
+func TestMGetBoundedContextCancel(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// ctx 已取消时 handler 不应被调用（信号量在派发 goroutine 前就拦截）。
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "x")
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL)
+	c.SetMaxConcurrent(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 预先取消
+
+	keys := []string{"a", "b", "c", "d"}
+	done := make(chan struct{})
+	var res MGetResult
+	go func() {
+		res = c.MGetCtx(ctx, keys)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("MGetCtx hung despite cancelled ctx + bounded concurrency")
+	}
+	if len(res.Errors) != len(keys) {
+		t.Fatalf("want all %d keys errored (ctx), got %d: %v", len(keys), len(res.Errors), res.Errors)
 	}
 }
