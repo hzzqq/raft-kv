@@ -9,11 +9,13 @@ import (
 	"time"
 
 	"raftkv/src/shardmaster"
+
+	"raftkv/src/util"
 )
 
 func migratePlanServer() *Server {
 	return &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,

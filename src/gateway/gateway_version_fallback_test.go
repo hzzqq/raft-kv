@@ -9,13 +9,15 @@ import (
 	"time"
 
 	"raftkv/src/version"
+
+	"raftkv/src/util"
 )
 
 // TestGatewayDebugVersionFallback：未 SetVersion 时 version 字段回退到构建期注入的
 // version.BuildVersion（默认 "dev"），且新增 commit/build_time 字段透传。
 func TestGatewayDebugVersionFallback(t *testing.T) {
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,
@@ -49,7 +51,7 @@ func TestGatewayDebugVersionFallback(t *testing.T) {
 // TestGatewayDebugVersionExplicitWins：显式 SetVersion 后不回退。
 func TestGatewayDebugVersionExplicitWins(t *testing.T) {
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,

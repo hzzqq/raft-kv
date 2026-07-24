@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"raftkv/src/util"
 )
 
 // GatewayConfig 是网关可配置项。代码常量作为默认值，配置文件可覆盖其中任意项。
@@ -253,7 +255,7 @@ func (c GatewayConfig) Apply(s *Server) {
 		if c.MaxConcurrent < 4 {
 			s.logf(levelWarn, "config: max_concurrent very low (frequent 429 risk)", map[string]string{"value": strconv.Itoa(c.MaxConcurrent)})
 		}
-		s.sem = make(chan struct{}, c.MaxConcurrent)
+		s.sem = util.NewSemaphore(c.MaxConcurrent)
 	} else if c.MaxConcurrent < 0 {
 		s.logf(levelWarn, "config: negative max_concurrent ignored", map[string]string{"value": strconv.Itoa(c.MaxConcurrent)})
 	}

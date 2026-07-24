@@ -102,3 +102,50 @@ func TestSemaphoreNoUnderflow(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestSemaphoreTryAcquire 验证：TryAcquire 非阻塞——满时立即失败，释放后可成功；InUse 准确。
+func TestSemaphoreTryAcquire(t *testing.T) {
+	s := NewSemaphore(2)
+	if !s.TryAcquire() || !s.TryAcquire() {
+		t.Fatal("前两个 TryAcquire 应成功")
+	}
+	if s.InUse() != 2 {
+		t.Fatalf("InUse=%d want 2", s.InUse())
+	}
+	if s.TryAcquire() {
+		t.Fatal("已满时 TryAcquire 应失败（满即拒）")
+	}
+	if s.InUse() != 2 {
+		t.Fatalf("失败后 InUse 应仍为 2，实际 %d", s.InUse())
+	}
+	s.Release()
+	if !s.TryAcquire() {
+		t.Fatal("释放一个后 TryAcquire 应成功")
+	}
+	if s.InUse() != 2 {
+		t.Fatalf("InUse=%d want 2", s.InUse())
+	}
+	s.Release()
+	s.Release()
+	if s.InUse() != 0 {
+		t.Fatalf("全释放后 InUse=%d want 0", s.InUse())
+	}
+}
+
+// TestSemaphoreTryAcquireNoPartial 验证：权重不足时 TryAcquireWeighted 不残留部分获取。
+func TestSemaphoreTryAcquireNoPartial(t *testing.T) {
+	s := NewSemaphore(2)
+	if !s.TryAcquireWeighted(2) {
+		t.Fatal("恰好 2 许可应成功")
+	}
+	if s.TryAcquireWeighted(1) {
+		t.Fatal("已满时权重获取应失败")
+	}
+	if s.InUse() != 2 {
+		t.Fatalf("失败不应残留许可，InUse=%d want 2", s.InUse())
+	}
+	s.ReleaseWeighted(2)
+	if s.InUse() != 0 {
+		t.Fatalf("释放后 InUse=%d want 0", s.InUse())
+	}
+}

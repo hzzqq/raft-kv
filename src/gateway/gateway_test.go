@@ -14,6 +14,8 @@ import (
 
 	"raftkv/src/cluster"
 	"raftkv/src/shardmaster"
+
+	"raftkv/src/util"
 )
 
 func TestGatewayHTTP(t *testing.T) {
@@ -709,7 +711,7 @@ func TestGatewayLogLevel(t *testing.T) {
 func TestGatewayRequestID(t *testing.T) {
 	// 直接构造 Server（不经由 cluster，避免集群启动），仅需 wrap 用到的字段。
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,
@@ -750,7 +752,7 @@ func TestGatewayRequestID(t *testing.T) {
 // 用极小补充速率（0.001 rps）使测试窗口内几乎不补充，从而突发上限即精确允许数。
 func TestGatewayClientLimit(t *testing.T) {
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,
@@ -917,7 +919,7 @@ unknown_key: ignored
 
 	// Apply 后 Server 配置应生效：限流桶被创建、CORS 被设置。
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,
@@ -926,8 +928,8 @@ unknown_key: ignored
 	if s.RequestTimeout() != 15*time.Second {
 		t.Fatalf("RequestTimeout after Apply = %v, want 15s", s.RequestTimeout())
 	}
-	if cap(s.sem) != 32 {
-		t.Fatalf("sem cap after Apply = %d, want 32", cap(s.sem))
+	if s.sem.Cap() != 32 {
+		t.Fatalf("sem cap after Apply = %d, want 32", s.sem.Cap())
 	}
 	s.limitMu.Lock()
 	nilMap := s.clientLimiters == nil
@@ -944,7 +946,7 @@ unknown_key: ignored
 // 直接构造 Server + Apply 配置，再用 httptest 调用 handleDebugConfig。
 func TestGatewayDebugConfig(t *testing.T) {
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,
@@ -990,7 +992,7 @@ func TestGatewayDebugConfig(t *testing.T) {
 // Content-Length 超过 maxBodySize 必须返回 413，未超限则正常放行。
 func TestGatewayMaxBodySize(t *testing.T) {
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,
@@ -1038,7 +1040,7 @@ func TestGatewayMaxBodySize(t *testing.T) {
 // 且 body 可解压回原文；不带则原样返回。
 func TestGatewayCompress(t *testing.T) {
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,
@@ -1091,7 +1093,7 @@ func TestGatewayCompress(t *testing.T) {
 // no-op handler，断言响应带 X-Content-Type-Options / X-Frame-Options / Referrer-Policy。
 func TestGatewaySecurityHeaders(t *testing.T) {
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,
@@ -1121,7 +1123,7 @@ func TestGatewayIPAllow(t *testing.T) {
 
 	// 拒绝：来源 127.0.0.1 不在 10.0.0.0/8
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,
@@ -1141,7 +1143,7 @@ func TestGatewayIPAllow(t *testing.T) {
 
 	// 放行：来源 127.0.0.1 在 127.0.0.0/8
 	s2 := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,
@@ -1165,7 +1167,7 @@ func TestGatewayIPAllow(t *testing.T) {
 // 的 routes 包含全部已注册模式且含本端点自身。
 func TestGatewayDebugRoutes(t *testing.T) {
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,
@@ -1220,7 +1222,7 @@ func TestGatewayDebugRoutes(t *testing.T) {
 // version 透传、含 go_version。
 func TestGatewayDebugVersion(t *testing.T) {
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,
@@ -1263,7 +1265,7 @@ func TestGatewayDebugVersion(t *testing.T) {
 // client_rate<=0 与 client_burst 共存、max_body_size 过小、allow_cidr 解析失败）。
 func TestGatewayConfigValidate(t *testing.T) {
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,
@@ -1308,7 +1310,7 @@ func TestGatewayConfigValidate(t *testing.T) {
 // 正常 handler 半开探测成功，熔断关闭，恢复 200。
 func TestGatewayCircuitBreaker(t *testing.T) {
 	s := &Server{
-		sem:              make(chan struct{}, maxConcurrent),
+		sem:              util.NewSemaphore(maxConcurrent),
 		accessCap:        256,
 		logCap:           256,
 		requestTimeout:   30 * time.Second,
@@ -1367,7 +1369,7 @@ func TestGatewayCircuitBreaker(t *testing.T) {
 // 设 rps=1/burst=1，连续请求第 1 个放行、后续因桶空 429。
 func TestGatewayRouteLimit(t *testing.T) {
 	s := &Server{
-		sem:            make(chan struct{}, maxConcurrent),
+		sem:            util.NewSemaphore(maxConcurrent),
 		accessCap:      256,
 		logCap:         256,
 		requestTimeout: 30 * time.Second,

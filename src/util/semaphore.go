@@ -61,3 +61,33 @@ func (s *Semaphore) ReleaseWeighted(w int) {
 
 // Cap 返回信号量容量。
 func (s *Semaphore) Cap() int { return cap(s.ch) }
+
+// InUse 返回当前已获取的许可数（并发快照，仅用于观测，不保证强一致）。
+func (s *Semaphore) InUse() int { return len(s.ch) }
+
+// TryAcquire 非阻塞获取一个许可：成功返回 true，已满时立即返回 false（不等待、不阻塞）。
+// 用于"满即拒"语义（如网关并发上限超限直接 429）。
+func (s *Semaphore) TryAcquire() bool { return s.TryAcquireWeighted(1) }
+
+// TryAcquireWeighted 非阻塞获取 w 个许可：足够则全部获取并返回 true，
+// 不足（或并发竞争下刚好满）时立即返回 false 且不会残留部分获取（整体回滚）。
+func (s *Semaphore) TryAcquireWeighted(w int) bool {
+	if w < 1 {
+		w = 1
+	}
+	// 先探测容量是否足够，避免无谓的部分获取。
+	if len(s.ch)+w > cap(s.ch) {
+		return false
+	}
+	for i := 0; i < w; i++ {
+		select {
+		case s.ch <- struct{}{}:
+		default:
+			for j := 0; j < i; j++ { // 并发竞争致刚好满，回滚已获取部分
+				<-s.ch
+			}
+			return false
+		}
+	}
+	return true
+}

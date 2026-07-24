@@ -31,6 +31,7 @@ import (
 	"raftkv/src/metrics"
 	"raftkv/src/shardkv"
 	"raftkv/src/shardmaster"
+	"raftkv/src/util"
 	"raftkv/src/version"
 )
 
@@ -49,7 +50,7 @@ type Server struct {
 	clerk *shardkv.Clerk
 
 	// I12：有界并发信号量；I13：在途请求计数，供优雅关闭等待。
-	sem chan struct{}
+	sem *util.Semaphore
 	wg  sync.WaitGroup
 
 	// 可选：底层 HTTP Server，供 Shutdown 一并关闭监听。
@@ -719,7 +720,7 @@ func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 // NewServer 用给定集群构造网关（不立即加入 group，需先 Init）。
 // c 为 nil 时构造一个不依赖内存集群的实例（仅用于暴露 gRPC 等独立服务）。
 func NewServer(c *cluster.Cluster) *Server {
-	s := &Server{sem: make(chan struct{}, maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20, compress: true, secHeaders: true, startedAt: time.Now(), version: "dev", breakerCooldown: 10 * time.Second, breakerThreshold: 5}
+	s := &Server{sem: util.NewSemaphore(maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20, compress: true, secHeaders: true, startedAt: time.Now(), version: "dev", breakerCooldown: 10 * time.Second, breakerThreshold: 5}
 	if c != nil {
 		s.c = c
 		s.clerk = c.Clerk()
@@ -951,10 +952,9 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		record := func(status int, d time.Duration) {
 			s.recordAccess(r.Method, r.URL.Path, status, d, reqID)
 		}
-		select {
-		case s.sem <- struct{}{}:
-			defer func() { <-s.sem }()
-		default:
+		// I69b：并发上限用 util.Semaphore 统一管控（与 kvcli #207 对齐，消除散落裸 channel）。
+		// 满即拒（429），不阻塞在途请求；非阻塞 TryAcquire 保留原"满即拒"语义。
+		if !s.sem.TryAcquire() {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusTooManyRequests)
 			io.WriteString(w, `{"error":"too many concurrent requests","code":429}`)
@@ -963,6 +963,11 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			record(http.StatusTooManyRequests, time.Since(start))
 			return
 		}
+		Metrics.Gauge("gateway_concurrent_in_use").Set(float64(s.sem.InUse()))
+		defer func() {
+			s.sem.Release()
+			Metrics.Gauge("gateway_concurrent_in_use").Set(float64(s.sem.InUse()))
+		}()
 		s.wg.Add(1)
 		defer s.wg.Done()
 		if s.testDelay > 0 {
