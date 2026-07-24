@@ -28,6 +28,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"raftkv/src/metrics"
 )
 
 const (
@@ -36,6 +38,12 @@ const (
 
 	defaultMaxFrame = 16 << 20 // 16 MiB 单帧上限，防御超大帧打爆内存
 )
+
+// Metrics 是 transport 服务端(RPC 框架层)的可观测性指标（best-effort 进程级聚合）。
+// 此前框架只在内置原子计数里记总量(bytesSent/rpcs/errs)，既无按方法拆分、也无延迟分布，
+// 且未被统一 metrics 注册表纳管(无法走 Prometheus/JSON 暴露)。本注册表补齐这两点：
+// 按方法计数的 RPC、错误数、以及整体 RPC 延迟直方图，便于定位"哪个方法慢/哪个方法在报错"。
+var Metrics = metrics.NewRegistry()
 
 // ErrMethodNotFound 表示方法未注册。
 var ErrMethodNotFound = errors.New("transport: method not found")
@@ -246,12 +254,20 @@ func (s *Server) serveConn(conn net.Conn) {
 			continue
 		}
 		s.inFlight.Add(1)
+		rpcStart := time.Now()
 		resp, herr := s.safeCall(h, connCtx, reqData)
+		rpcDurMs := float64(time.Since(rpcStart).Microseconds()) / 1000.0
 		s.inFlight.Add(-1)
 		s.rpcs.Add(1)
 		s.bytesRecv.Add(int64(len(reqData)))
+		// 框架层可观测性（best-effort，纯原子操作，零行为影响）：
+		// 按方法累计 RPC 次数、错误次数，并记录整体 RPC 延迟分布。
+		mName := "rpc_" + string(method)
+		Metrics.CounterWithHelp(mName, "累计 RPC 次数(按方法)").Inc()
+		Metrics.HistWithHelp("transport_rpc_latency_ms", "RPC 端到端延迟(毫秒)分布").Record(rpcDurMs)
 		if herr != nil {
 			s.errs.Add(1)
+			Metrics.CounterWithHelp("transport_rpc_errors", "累计 handler 返回错误的 RPC 次数").Inc()
 			_ = writeFrame(w, frameError, []byte(herr.Error()))
 			continue
 		}

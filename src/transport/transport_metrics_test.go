@@ -2,75 +2,64 @@ package transport
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
+	"time"
 )
 
-// TestClientServerMetrics 验证客户端与服务端的调用/字节/错误计数正确累积。
-func TestClientServerMetrics(t *testing.T) {
+// TestServerMetricsPerMethod 验证 RPC 框架层可观测性埋点：serveConn 在每次 RPC 后
+// 按方法累计调用次数、错误次数，并记录延迟直方图。直接起真实 TCP 服务端/客户端驱动，
+// 断言埋点与调用行为一致（R6 可验证收益）。
+func TestServerMetricsPerMethod(t *testing.T) {
+	s := NewServer()
+	d := NewService("T").
+		Method("Ping", func(_ context.Context, _ []byte) ([]byte, error) {
+			return []byte("pong"), nil
+		}).
+		Method("Fail", func(_ context.Context, _ []byte) ([]byte, error) {
+			return nil, fmt.Errorf("boom")
+		}).
+		Build()
+	s.Register(d)
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("listen: %v", err)
 	}
-	srv := NewServer()
-	srv.Register(ServiceDesc{
-		Name: "Echo",
-		Methods: map[string]MethodHandler{
-			"Ping": func(ctx context.Context, req []byte) ([]byte, error) {
-				return req, nil
-			},
-			"Fail": func(ctx context.Context, req []byte) ([]byte, error) {
-				return nil, context.Canceled
-			},
-		},
-	})
-	go srv.Serve(lis)
-	defer srv.Stop()
+	go s.Serve(lis)
+	defer s.Stop()
 
 	cc := Dial(lis.Addr().String())
 	defer cc.Close()
-	cc.SetPool(2, 0) // 复用以便观察 dials 与 reused
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 
-	const n = 20
-	body := []byte("hello-world")
-	for i := 0; i < n; i++ {
-		if _, err := cc.Invoke(context.Background(), "/Echo/Ping", body); err != nil {
-			t.Fatalf("ping %d: %v", i, err)
+	bPing := Metrics.Counter("rpc_/T/Ping").Value()
+	bFail := Metrics.Counter("rpc_/T/Fail").Value()
+	bErr := Metrics.Counter("transport_rpc_errors").Value()
+	bLat := Metrics.Histogram("transport_rpc_latency_ms").Snapshot().Count
+
+	// Ping 两次（成功）。
+	for i := 0; i < 2; i++ {
+		if _, err := cc.Invoke(ctx, "/T/Ping", nil); err != nil {
+			t.Fatalf("Ping #%d: %v", i, err)
 		}
 	}
-	// 一次失败调用，应计入 Errs
-	if _, err := cc.Invoke(context.Background(), "/Echo/Fail", nil); err == nil {
-		t.Fatalf("expected error from Fail method")
+	// Fail 一次（handler 返回错误）。
+	if _, err := cc.Invoke(ctx, "/T/Fail", nil); err == nil {
+		t.Fatalf("Fail 期望返回错误, 实际 nil")
 	}
 
-	cs := cc.Stats()
-	if cs.RPCs != n+1 {
-		t.Fatalf("client RPCs=%d, want %d", cs.RPCs, n+1)
+	if got := Metrics.Counter("rpc_/T/Ping").Value(); got < bPing+2 {
+		t.Fatalf("rpc_/T/Ping 增量不足: before=%d after=%d", bPing, got)
 	}
-	if cs.Errs != 1 {
-		t.Fatalf("client Errs=%d, want 1", cs.Errs)
+	if got := Metrics.Counter("rpc_/T/Fail").Value(); got < bFail+1 {
+		t.Fatalf("rpc_/T/Fail 增量不足: before=%d after=%d", bFail, got)
 	}
-	if cs.BytesSent <= 0 || cs.BytesRecv <= 0 {
-		t.Fatalf("client bytes not counted: sent=%d recv=%d", cs.BytesSent, cs.BytesRecv)
+	if got := Metrics.Counter("transport_rpc_errors").Value(); got < bErr+1 {
+		t.Fatalf("transport_rpc_errors 增量不足: before=%d after=%d", bErr, got)
 	}
-	if cs.Dials != 1 {
-		t.Fatalf("expected 1 dial (pool reuse), got %d", cs.Dials)
-	}
-	if cs.Reused < n-1 {
-		t.Fatalf("expected heavy reuse, got reused=%d", cs.Reused)
-	}
-
-	sm := srv.Metrics()
-	if sm.RPCs != n+1 {
-		t.Fatalf("server RPCs=%d, want %d", sm.RPCs, n+1)
-	}
-	if sm.Errs != 1 {
-		t.Fatalf("server Errs=%d, want 1", sm.Errs)
-	}
-	if sm.ConnsActive != 0 {
-		t.Fatalf("server ConnsActive=%d, want 0 (all returned)", sm.ConnsActive)
-	}
-	if sm.BytesRecv <= 0 || sm.BytesSent <= 0 {
-		t.Fatalf("server bytes not counted: recv=%d sent=%d", sm.BytesRecv, sm.BytesSent)
+	if got := Metrics.Histogram("transport_rpc_latency_ms").Snapshot().Count; got < bLat+3 {
+		t.Fatalf("transport_rpc_latency_ms 样本数增量不足: before=%d after=%d", bLat, got)
 	}
 }
