@@ -1774,3 +1774,13 @@ func (kv *ShardKV) ShardDebug() ShardDebug {
 		StallSeconds:    maxStall,
 	}
 }
+
+// RaftStatus 返回本副本底层 Raft 节点的只读健康快照（委托 raft.Raft.Status()）。
+// 与 ShardDebug（分片/迁移态）互补：前者管「共识层健康」（角色/任期/认知 leader/
+// 租约/不变量），后者管「数据层迁移态」。二者共同让 /debug/shards 与 /debug/raft
+// 能呈现完整节点画像。本方法零副作用、并发安全（raft.Status 内部持锁采集），可在
+// 监控/诊断高频调用（R6 可观测性：此前共识层状态完全封闭在 raft 包内，运维只能
+// 间接从分片态推测，脑裂/任期翻滚/apply 落后无一手信号）。
+func (kv *ShardKV) RaftStatus() raft.RaftStatus {
+	return kv.rf.Status()
+}
