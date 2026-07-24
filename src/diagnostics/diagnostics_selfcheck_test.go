@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"raftkv/src/raft"
+	"raftkv/src/shardkv"
 	"raftkv/src/shardmaster"
 )
 
@@ -104,5 +105,41 @@ func TestRaftCheckLeaderNoLease(t *testing.T) {
 	}
 	if len(d.Issues) == 0 || d.Issues[0] == "ok" {
 		t.Fatalf("leader without lease should emit a warning issue, got %v", d.Issues)
+	}
+}
+
+// TestShardCheck 锁死数据面不变量自检（#230）：健康态满分；自相矛盾
+// (pendingIn∩pendingOut)、重复 Owned、迁移卡滞(StallSeconds>60) 分别扣分。
+func TestShardCheck(t *testing.T) {
+	healthy := shardkv.ShardDebug{
+		GID:       1,
+		ConfigNum: 7,
+		Owned:     []int{3, 4},
+		PendingIn: []int{}, PendingOut: []int{},
+	}
+	if d := ShardCheck(healthy); d.Score != 100 || d.Issues[0] != "ok" {
+		t.Fatalf("healthy shard should be 100/ok, got %d %v", d.Score, d.Issues)
+	}
+
+	// pendingIn ∩ pendingOut 自相矛盾 -> 重扣。
+	conflict := shardkv.ShardDebug{GID: 1, Owned: []int{3}, PendingIn: []int{5}, PendingOut: []int{5}}
+	if d := ShardCheck(conflict); d.Score > 80 {
+		t.Fatalf("pendingIn∩pendingOut should lose >=30, got %d", d.Score)
+	}
+
+	// Owned 重复分片号 -> 中扣。
+	dup := shardkv.ShardDebug{GID: 1, Owned: []int{3, 3}, PendingIn: []int{}, PendingOut: []int{}}
+	if d := ShardCheck(dup); d.Score > 95 {
+		t.Fatalf("duplicate Owned should lose points, got %d", d.Score)
+	}
+
+	// 迁移卡滞：StallSeconds 超 60s -> 中扣；未超阈值仅提示不扣分。
+	stuck := shardkv.ShardDebug{GID: 1, Owned: []int{3}, PendingIn: []int{3}, PendingOut: []int{}, StallSeconds: 120}
+	if d := ShardCheck(stuck); d.Score > 85 {
+		t.Fatalf("stuck migration (120s) should lose >=20, got %d", d.Score)
+	}
+	inflight := shardkv.ShardDebug{GID: 1, Owned: []int{3}, PendingIn: []int{3}, PendingOut: []int{}, StallSeconds: 5}
+	if d := ShardCheck(inflight); d.Score != 100 {
+		t.Fatalf("in-flight migration (5s) should not lose points, got %d", d.Score)
 	}
 }

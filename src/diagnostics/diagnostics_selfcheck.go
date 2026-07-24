@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"raftkv/src/raft"
+	"raftkv/src/shardkv"
 	"raftkv/src/shardmaster"
 )
 
@@ -70,6 +71,59 @@ func RaftCheck(st raft.RaftStatus) Diagnosis {
 		// 新当选瞬间尚未建立租约属正常，仅提示不扣分。
 		issues = append(issues, "leader 尚未与多数派建立租约（刚当选或心跳丢失），线性一致读将走 ReadIndex 慢路径")
 	}
+	if score < 0 {
+		score = 0
+	}
+	if score > 100 {
+		score = 100
+	}
+	if len(issues) == 0 {
+		issues = []string{"ok"}
+	}
+	return Diagnosis{Score: score, Issues: issues}
+}
+
+// ShardCheck 对单个副本的数据面（分片归属与迁移态）做不变量自检（纯函数、零副作用，
+// 可直接单测）。它弥补了 RaftCheck（共识层）与 SelfCheck（配置链）都看不到的「数据面
+// 迁移健康」盲区：卡死迁移、自相矛盾的分片态、重复分片，此前只能人肉读 /debug/shards
+// JSON，无量化信号。检查项：
+//   - pendingIn ∩ pendingOut 非空 → 同一分片既要收又要发，逻辑自相矛盾（重扣）；
+//   - Owned 含重复分片号 → 状态机分片索引重复，属实现 bug（中扣）；
+//   - StallSeconds 超阈值（默认 60s）→ 迁移卡滞，运维盲点（中扣）；
+//     未超阈值但 >0 仅提示，不扣分（迁移刚发起属正常）。
+func ShardCheck(st shardkv.ShardDebug) Diagnosis {
+	issues := make([]string, 0)
+	score := 100
+
+	inSet := make(map[int]bool, len(st.PendingIn))
+	for _, s := range st.PendingIn {
+		inSet[s] = true
+	}
+	for _, s := range st.PendingOut {
+		if inSet[s] {
+			issues = append(issues, fmt.Sprintf("分片 %d 同时处于 pendingIn(待收) 与 pendingOut(待发)，状态自相矛盾", s))
+			score -= 30
+			break
+		}
+	}
+
+	seen := make(map[int]bool, len(st.Owned))
+	for _, s := range st.Owned {
+		if seen[s] {
+			issues = append(issues, fmt.Sprintf("Owned 含重复分片号 %d，状态机分片索引重复", s))
+			score -= 10
+			break
+		}
+		seen[s] = true
+	}
+
+	if st.StallSeconds > 60 {
+		issues = append(issues, fmt.Sprintf("迁移卡滞 StallSeconds=%.0f > 60s，pending 分片长期未推进（可能迁移冻结）", st.StallSeconds))
+		score -= 20
+	} else if st.StallSeconds > 0 {
+		issues = append(issues, fmt.Sprintf("迁移进行中 StallSeconds=%.0f（未达 60s 阈值，属正常窗口）", st.StallSeconds))
+	}
+
 	if score < 0 {
 		score = 0
 	}

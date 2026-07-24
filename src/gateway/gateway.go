@@ -1483,6 +1483,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 // 即拉低全集群评分，实现「有节点异常立刻告警」。按需（/metrics 被拉时）计算，零额外
 // 后台 goroutine、零行为影响（纯读 RaftStatus + RaftCheck）。
 func (s *Server) updateRaftHealthGauge() {
+	// 集群尚未挂载（如 /metrics 在集群就绪前被 scrape，或 cluster-free 测试）时
+	// s.c 为 nil：直接保留满分，避免 nil 解引用 panic（此前此处会崩，#230 修复）。
+	if s.c == nil {
+		Metrics.GaugeWithHelp("raft_min_health_score",
+			"全集群 Raft 不变量自检最低分(0-100,来自 diagnostics.RaftCheck)，任一副本异常即拉低，便于阈值告警").
+			Set(100)
+		return
+	}
 	minScore := 100
 	for g := range s.c.KVs {
 		for r := range s.c.KVs[g] {
@@ -1535,21 +1543,26 @@ func (s *Server) handleDebugGroups(w http.ResponseWriter, r *http.Request) {
 
 // ShardDebugView 把集群中某个 group/副本的 ShardDebug 与其坐标打包，便于 JSON 输出。
 type ShardDebugView struct {
-	Group   int
-	Replica int
+	Group     int
+	Replica   int
+	Diagnosis diagnostics.Diagnosis `json:"diagnosis,omitempty"`
 	shardkv.ShardDebug
 }
 
 // handleDebugShards 返回集群所有 group 所有副本的分片归属与迁移状态（JSON 数组），
 // 用于诊断 3-group 再平衡卡死等迁移问题（pendingIn/pendingOut 残留会冻结配置推进）。
+// 每副本附带 diagnostics.ShardCheck 不变量自检，把数据面迁移健康量化成可消费的信号
+// （#230：此前 /debug/shards 只给裸状态，盲点需人肉判读）。
 func (s *Server) handleDebugShards(w http.ResponseWriter, r *http.Request) {
 	var out []ShardDebugView
 	for g := range s.c.KVs {
 		for r := range s.c.KVs[g] {
+			sd := s.c.KVs[g][r].ShardDebug()
 			out = append(out, ShardDebugView{
-				Group:      g,
-				Replica:    r,
-				ShardDebug: s.c.KVs[g][r].ShardDebug(),
+				Group:        g,
+				Replica:      r,
+				Diagnosis:    diagnostics.ShardCheck(sd),
+				ShardDebug:   sd,
 			})
 		}
 	}
