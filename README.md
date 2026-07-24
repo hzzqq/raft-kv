@@ -301,6 +301,18 @@ R3 #54–#82 全部本地提交；#54–#72 已按授权 fast-forward 推送，�
 - **gateway 进程级 gauge（#215）**：新增 `gw_uptime_seconds`（进程运行时长 FuncGauge）与 `gw_goroutines`（当前 goroutine 数 FuncGauge），由 `ensureProcGauges()` 幂等注册（抵抗 `Metrics.Reset()` 清空 `funcGauges`），经 `/metrics` 暴露便于发现进程重启与 goroutine 泄漏；配套 `TestProcGaugesRegistered`。同轮为 `diagnostics` 新增 `Level()`（critical<50 / warn<80 / ok>=80）与 `JSON()` 机器可读导出（`score`/`level`/`issues`），配套 `TestDiagnosisLevel` / `TestDiagnosisJSON`，供监控/告警直接消费诊断评分。
 - **raft 共识层指标（#216）**：`Start` 中 `persist()` 前 `raft_log_appends_total`（leader 追加日志条目计数，与既有 `raft_log_applied` 区分，观察写入吞吐与复制滞后）；`doRealElection` 发起选举 `raft_term_changes_total`、`stepDown` 因更高任期退位 `raft_term_changes_total`（观察任期翻转频率，频繁变更往往是网络分区/不稳定信号）。配套 `TestRaftLogAppendsMetric`（cluster-free 最小 `Raft` 结构）验证计数递增；全包其余测试无回归。
 
+### R7 自主迭代交付（#217–#223，共识/数据面健康快照 + 客户端/工具韧性收口）
+
+在「控制面/框架层指标收口」基础上，把健康快照从共识层下钻到数据面与网关汇聚视图，并收口客户端/工具链：
+
+- **util.WorkerPool 增强（#217）**：`TrySubmit` 非阻塞提交 + `SubmitCtx` 感知 ctx 取消；停止语义改用 `stopCh`（tasks 通道永不关闭），消除「缓冲满 + 停止」并发下的死锁与向已关闭通道发送 panic 隐患；非阻塞/ctx 入口让调用方不再退化为无界 goroutine。
+- **kvcli 批量扇出收敛（#218）**：`MGet`/`MSet` 由手搓 goroutine+`util.Semaphore` 样板收敛为 `util.WorkerPool(SubmitCtx)`——常驻 worker 复用 + 有界任务通道 + ctx 取消/背压三位一体；`maxConcurrent<=0` 仍按 key 数开池保留历史无限制语义。
+- **Raft 节点健康自检（#219）**：`rf.Status()` 只读快照（leaderId 认知/租约/不变量）+ `diagnostics.RaftCheck` 不变量自检（commit>log / apply>commit 扣分清零、leader 无租约仅提示）；`runbook.md` 新增 §6 运维自检指南。
+- **ShardKV 透出共识健康（#220）**：`ShardKV.RaftStatus()` 把底层 `raft.Raft.Status()` 只读快照透出数据面（角色/任期/认知 leader/租约/不变量），与 `ShardDebug` 分片态互补。
+- **网关共识健康汇聚端点（#221）**：`GET /debug/raft` 汇聚各副本 `RaftStatus` + `RaftCheck` 自检，运维无需逐节点登录即可一眼看清脑裂/任期翻滚/apply 落后。
+- **网关共识健康可告警（#222）**：`/metrics` 暴露 `raft_min_health_score` gauge（按需计算各副本 `RaftCheck` 最低分，min 语义，任一副本异常即拉低），使共识健康可经 Prometheus scrape 与阈值告警（此前仅在 `/debug/raft` JSON 里不可告警）。
+- **kvraft 状态机可观测（#223）**：`KVServer.Status()` 只读健康快照（角色/任期/leader/apply 进度/数据键数/会话表大小/GC 配置）+ `kv_data_keys`/`kv_sessions` 规模 gauge + `gc_sweeps_total`/`gc_sessions_evicted_total` GC 计数；此前 KV 状态机对运维完全不透明，与 raft/shardkv 已暴露的健康快照不对齐。
+
 ## 说明
 - 这是面向学习的实验性实现，重点在正确性与可读性，非生产级部署。
 - 持久化、RPC、网络均使用 MIT 6.824 提供的实验脚手架（`persister.go` / `labrpc.go`）。
