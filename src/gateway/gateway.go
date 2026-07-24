@@ -28,7 +28,9 @@ import (
 	"time"
 
 	"raftkv/src/cluster"
+	"raftkv/src/diagnostics"
 	"raftkv/src/metrics"
+	"raftkv/src/raft"
 	"raftkv/src/shardkv"
 	"raftkv/src/shardmaster"
 	"raftkv/src/util"
@@ -837,6 +839,10 @@ func (s *Server) Handler() http.Handler {
 	// 诊断：暴露每个 group/副本的「分片归属 + 待接收/待迁出」状态，便于定位
 	// 3-group 再平衡卡死等迁移问题（pendingIn/pendingOut 残留会冻结配置推进）。
 	register("GET /debug/shards", s.handleDebugShards)
+	// 共识健康（I220 延伸）：暴露每个 group/副本的 Raft 只读快照（角色/任期/认知 leader/
+	// 租约/不变量）并跑 diagnostics.RaftCheck 自检，把 #220 的 raft 健康能力汇聚到网关，
+	// 运维无需登录各节点即可一眼看出脑裂/任期翻滚/apply 落后于 commit。
+	register("GET /debug/raft", s.handleDebugRaft)
 	// 集群健康总览（程序化消费）：每 group 是否有 leader、当前 config 号、拥有分片数、
 	// 待接收/待迁出/孤儿 incoming 分片，以及是否存在卡滞（StallSeconds>0 即冻结风险）。
 	register("GET /status", s.handleStatus)
@@ -1440,6 +1446,8 @@ func (s *Server) handleDebugConfigs(w http.ResponseWriter, r *http.Request) {
 //
 // 两种格式数据源相同，差异仅在序列化方式，零行为影响。
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	// 按需刷新共识健康 gauge（I220 延伸：让 raft 健康可 scrape / 告警）。
+	s.updateRaftHealthGauge()
 	accept := r.Header.Get("Accept")
 	if strings.Contains(accept, "text/plain") || strings.Contains(accept, "prometheus") {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -1467,6 +1475,25 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(snap); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+// updateRaftHealthGauge 把集群各副本 Raft 不变量自检的最低分写入 raft_min_health_score
+// gauge，使共识健康可经 /metrics 被 Prometheus 周期 scrape（I220 延伸：此前 raft 健康
+// 仅在 /debug/raft 的 JSON 里，无法接入阈值告警）。采用 min 语义——任一副本不变量被破坏
+// 即拉低全集群评分，实现「有节点异常立刻告警」。按需（/metrics 被拉时）计算，零额外
+// 后台 goroutine、零行为影响（纯读 RaftStatus + RaftCheck）。
+func (s *Server) updateRaftHealthGauge() {
+	minScore := 100
+	for g := range s.c.KVs {
+		for r := range s.c.KVs[g] {
+			st := s.c.KVs[g][r].RaftStatus()
+			if score := diagnostics.RaftCheck(st).Score; score < minScore {
+				minScore = score
+			}
+		}
+	}
+	Metrics.GaugeWithHelp("raft_min_health_score",
+		"全集群 Raft 不变量自检最低分(0-100,来自 diagnostics.RaftCheck)，任一副本异常即拉低，便于阈值告警").Set(float64(minScore))
 }
 
 // GroupView 是 /debug/groups 中单个 replica group 的视图：成员 server 列表 + 拥有的分片编号。
@@ -1524,6 +1551,50 @@ func (s *Server) handleDebugShards(w http.ResponseWriter, r *http.Request) {
 				Replica:    r,
 				ShardDebug: s.c.KVs[g][r].ShardDebug(),
 			})
+		}
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(out); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// RaftStatusView 把集群中某个 group/副本的 Raft 只读快照与诊断结果打包，便于 JSON 输出。
+// Diagnosis.Issues 仅含 "ok" 时表示不变量全部满足；否则列出具体问题（commit 越界/apply
+// 越界/leader 无租约提示），Score 钳制在 0–100 供监控阈值告警。
+type RaftStatusView struct {
+	Group     int             `json:"group"`
+	Replica   int             `json:"replica"`
+	Raft      raft.RaftStatus `json:"raft"`
+	Diagnosis diagnostics.Diagnosis `json:"diagnosis"`
+}
+
+// handleDebugRaft 返回集群所有 group 所有副本的共识层健康（JSON 数组）：每个副本的
+// raft.RaftStatus 只读快照 + diagnostics.RaftCheck 不变量自检。与 /debug/shards（数据层
+// 迁移态）互补，提供完整的「共识 + 数据」双维节点画像。逐副本调用 RaftStatus()/RaftCheck
+// 均为零副作用纯读，单副本 panic 不应拖垮整体（R3 健壮性：用命名返回值 + 单层 recover
+// 隔离单副本异常，其它副本照常上报）。
+func (s *Server) handleDebugRaft(w http.ResponseWriter, r *http.Request) {
+	var out []RaftStatusView
+	for g := range s.c.KVs {
+		for rp := range s.c.KVs[g] {
+			view := RaftStatusView{Group: g, Replica: rp}
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						view.Raft = raft.RaftStatus{Me: rp, Role: raft.Follower}
+						view.Diagnosis = diagnostics.Diagnosis{
+							Score:  0,
+							Issues: []string{fmt.Sprintf("raft status采集异常: %v", rec)},
+						}
+					}
+				}()
+				st := s.c.KVs[g][rp].RaftStatus()
+				view.Raft = st
+				view.Diagnosis = diagnostics.RaftCheck(st)
+			}()
+			out = append(out, view)
 		}
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
