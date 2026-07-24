@@ -822,6 +822,7 @@ func (s *Server) Handler() http.Handler {
 	// 迁移进度（人类可读，供 CLI `start.sh migrate` 直接展示）：每个 group leader 副本的
 	// 实时迁移状态 + 集群最新 config 号，一眼看清再平衡是否卡住。
 	register("GET /debug/migrate", s.handleDebugMigrate)
+	register("POST /debug/migrate-plan", s.handleDebugMigratePlan)
 	// 配置历史（人类/程序可读）：展示 shardmaster 从初始到最新的每段配置，便于复盘
 	// rebalance 轨迹、确认分片在哪些 group 间迁移（排查 3-group 冻结时尤其有用）。
 	register("GET /debug/configs", s.handleDebugConfigs)
