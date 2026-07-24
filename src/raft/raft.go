@@ -160,6 +160,10 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 	role        Role
+	// leaderId 记录本节点当前认知的 leader 编号（仅 follower/candidate 视角有意义；
+	// leader 自身在 Status() 中按 role 直接回报 me）。收到合法 AppendEntries 时更新，
+	// 退位时清零，供运维/诊断在脑裂、任期翻滚时快速判断「我在跟谁」。
+	leaderId int
 	// committedCurrentTerm 标记本 leader 是否已在「当前任期」提交过条目（通常为
 	// becomeLeader 时追加的 no-op）。Raft 提交安全性要求：leader 只能经由提交
 	// 当前任期条目来间接提交旧任期条目。故该标记置位前，commitIndex 可能仍落后
@@ -284,6 +288,12 @@ func (rf *Raft) ReadIndex() (int, bool) {
 func (rf *Raft) HasLeaderLease() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	return rf.hasLeaderLeaseLocked()
+}
+
+// hasLeaderLeaseLocked 在调用方已持有 rf.mu 时判断 leader 是否在 ElectionTimeoutMin
+// 内仍与多数派保持接触。抽出无锁版本供 Status() 在持锁态直接复用，避免重复加锁死锁。
+func (rf *Raft) hasLeaderLeaseLocked() bool {
 	if rf.role != Leader {
 		return false
 	}
@@ -310,6 +320,48 @@ func (rf *Raft) HasCommittedCurrentTerm() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.committedCurrentTerm
+}
+
+// RaftStatus 是 Raft 节点运行时的只读快照，供运维/诊断/监控在不打扰共识热路径的
+// 前提下读取关键状态。所有字段均在持 rf.mu 下采集，调用零副作用、可并发安全读取。
+type RaftStatus struct {
+	Me                   int    // 本节点编号
+	Role                 Role   // Follower / Candidate / Leader
+	Term                 int    // 当前任期
+	VotedFor             int    // 本任期投票对象（-1 表示未投）
+	LeaderID             int    // 认知的 leader 编号（role==Leader 时为 me；未知为 -1）
+	LastLogIndex         int    // 最后一条日志索引（含快照偏移）
+	LastLogTerm          int    // 最后一条日志任期
+	CommitIndex          int    // 已提交索引
+	LastApplied          int    // 已应用索引
+	CommittedCurrentTerm bool   // leader 是否已在当前任期提交过条目（线性一致读守卫）
+	HasLeaderLease       bool   // leader 是否在 ElectionTimeoutMin 内与多数派保持接触
+}
+
+// Status 返回当前节点的只读状态快照。仅在持锁下采集既有字段，不修改任何状态、
+// 不触发任何 RPC，因此可在监控/诊断/排障路径高频调用（R6 可观测性——共识层
+// 此前对运维完全不透明，脑裂/任期翻滚时无一手信号）。
+func (rf *Raft) Status() RaftStatus {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	st := RaftStatus{
+		Me:                   rf.me,
+		Role:                 rf.role,
+		Term:                 rf.currentTerm,
+		VotedFor:             rf.votedFor,
+		LeaderID:             rf.leaderId,
+		CommitIndex:          rf.commitIndex,
+		LastApplied:          rf.lastApplied,
+		CommittedCurrentTerm: rf.committedCurrentTerm,
+		HasLeaderLease:       rf.hasLeaderLeaseLocked(),
+	}
+	if rf.role == Leader {
+		st.LeaderID = rf.me
+	}
+	// 日志索引/任期经 lastLogIndex/lastLogTerm 统一计入快照偏移（与 Start 一致）。
+	st.LastLogIndex = rf.lastLogIndex()
+	st.LastLogTerm = rf.lastLogTerm()
+	return st
 }
 
 // LastApplied 返回已应用到状态机的最后索引（测试用，用于断言未达多数时不提交）。
@@ -552,6 +604,7 @@ func (rf *Raft) becomeLeader() {
 		return
 	}
 	rf.role = Leader
+	rf.leaderId = rf.me // 成为 leader 后自身即 leader，Status 据此回报 me
 	// 新任期必须重新提交一条当前任期 no-op 才能提交旧任期条目；重置该标记，
 	// 确保 GetShard 等传输守卫在重新提交 no-op 之前不会传出陈旧快照。
 	rf.committedCurrentTerm = false
@@ -586,6 +639,7 @@ func (rf *Raft) stepDown(term int) {
 	}
 	rf.role = Follower
 	rf.preVoteWon = false
+	rf.leaderId = -1 // 退位后失去对 leader 的认知，待下次合法 AppendEntries 重新确认
 	rf.resetElectionTimer()
 }
 
@@ -804,8 +858,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.stepDown(args.Term)
 	}
-	// 听到 leader，刷新选举计时
+	// 听到 leader，刷新选举计时并认知其编号（供 Status/诊断只读快照使用）。
 	rf.resetElectionTimer()
+	rf.leaderId = args.LeaderId
 	rf.lastContact[args.LeaderId] = time.Now()
 	reply.Term = rf.currentTerm
 

@@ -3,6 +3,7 @@ package diagnostics
 import (
 	"fmt"
 
+	"raftkv/src/raft"
 	"raftkv/src/shardmaster"
 )
 
@@ -33,6 +34,41 @@ func SelfCheck(configs []shardmaster.Config) Diagnosis {
 			score -= 20
 		}
 		prev = cur
+	}
+	if score < 0 {
+		score = 0
+	}
+	if score > 100 {
+		score = 100
+	}
+	if len(issues) == 0 {
+		issues = []string{"ok"}
+	}
+	return Diagnosis{Score: score, Issues: issues}
+}
+
+// RaftCheck 对一个 Raft 节点的只读状态快照做不变量自检（纯函数、零副作用，可直接单测）：
+//   - commitIndex > lastLogIndex → 已提交条目不在日志/快照中（状态机可能丢写），重扣；
+//   - lastApplied > commitIndex  → apply 越过已提交边界（违反 Raft 安全性），重扣；
+//   - leader 无多数派租约        → 仅提示（新当选瞬间或未宽限心跳丢失属正常，不扣分）。
+//
+// 与 SelfCheck（配置链）互补：前者管「配置演进」，本函数管「单节点运行时健康」，
+// 二者共同让诊断包覆盖「配置 + 共识」两条链路（R2 隐性：此前诊断完全看不到 raft 状态，
+// 脑裂/任期翻滚/apply 落后于 commit 时无一手信号）。
+func RaftCheck(st raft.RaftStatus) Diagnosis {
+	issues := make([]string, 0)
+	score := 100
+	if st.CommitIndex > st.LastLogIndex {
+		issues = append(issues, fmt.Sprintf("commitIndex(%d) 超出日志末尾 lastLogIndex(%d)：已提交条目不在内存/快照日志中，可能丢写", st.CommitIndex, st.LastLogIndex))
+		score -= 30
+	}
+	if st.LastApplied > st.CommitIndex {
+		issues = append(issues, fmt.Sprintf("lastApplied(%d) 超过 commitIndex(%d)：apply 越过已提交边界，违反 Raft 安全性", st.LastApplied, st.CommitIndex))
+		score -= 30
+	}
+	if st.Role == raft.Leader && !st.HasLeaderLease {
+		// 新当选瞬间尚未建立租约属正常，仅提示不扣分。
+		issues = append(issues, "leader 尚未与多数派建立租约（刚当选或心跳丢失），线性一致读将走 ReadIndex 慢路径")
 	}
 	if score < 0 {
 		score = 0

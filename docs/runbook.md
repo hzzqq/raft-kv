@@ -146,3 +146,45 @@ CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh conf
 3. `curl /debug/configs` 确认分片 owner 轨迹，判断是否多跳 rebalance 滞留。
 4. 对照 §2 症状表定位；若 `config_stalls` 计数持续增长，说明看门狗在持续自愈。
 5. 必要时增大 `stallUnhealthySec` 阈值或检查底层 labrpc 网络是否限流。
+
+## 6. Raft 节点健康自检（Status / RaftCheck）
+
+共识层此前对运维完全不透明——脑裂、任期翻滚、apply 落后于 commit 时无一手信号。
+现提供两条零副作用的只读能力，可在监控/诊断/排障路径高频调用：
+
+### 6.1 `Raft.Status()` —— 节点只读快照
+
+`rf.Status()` 在持 `rf.mu` 下采集并返回 `RaftStatus`（纯数据结构，不触发任何 RPC、
+不改任何状态），字段含义：
+
+| 字段 | 含义 |
+|------|------|
+| `Me` / `Role` / `Term` | 本节点编号、角色（Follower/Candidate/Leader）、当前任期 |
+| `VotedFor` | 本任期投票对象（`-1` 表示未投） |
+| `LeaderID` | 本节点**认知**的 leader 编号：`role==Leader` 时为 `me`；follower/candidate 收到合法 `AppendEntries` 时更新，退位（`stepDown`）时清零为 `-1`；未知为 `-1`。脑裂/任期翻滚时可直接据此判断「我在跟谁」 |
+| `LastLogIndex` / `LastLogTerm` | 最后一条日志索引/任期（已计入快照偏移，与 `Start` 一致） |
+| `CommitIndex` / `LastApplied` | 已提交 / 已应用索引 |
+| `CommittedCurrentTerm` | leader 是否已在当前任期提交过条目（线性一致读 `ReadIndex` 守卫） |
+| `HasLeaderLease` | leader 是否在 `ElectionTimeoutMin` 内与多数派保持接触 |
+
+`Status()` 内部复用无锁版 `hasLeaderLeaseLocked`，自身已在持锁态调用，不会因重复加锁死锁。
+
+### 6.2 `diagnostics.RaftCheck()` —— 单节点不变量自检
+
+`RaftCheck(st raft.RaftStatus)` 对一份 `RaftStatus` 做纯函数式不变量自检，返回
+`Diagnosis{Score, Issues}`，与配置链 `SelfCheck` 互补（一管配置演进、一管运行时健康）：
+
+- `commitIndex > lastLogIndex`：已提交条目不在日志/快照中（可能丢写）→ 扣 30；
+- `lastApplied > commitIndex`：apply 越过已提交边界（违反 Raft 安全性）→ 扣 30；
+- `role==Leader && !HasLeaderLease`：仅提示、不扣分（新当选瞬间或心跳丢失属正常，
+  线性一致读将走 `ReadIndex` 慢路径）。
+
+`Score` 钳制在 0–100。建议把 `Status()` 采样后喂给 `RaftCheck` 接入监控/告警，
+对 `Score<100` 或 `LastApplied` 长期落后于 `CommitIndex` 的节点优先排查。
+
+### 6.3 集成建议
+
+- 监控脚本：周期调用各节点 `Status()` → `RaftCheck()` → 上报 `raft_status_score` gauge；
+- 脑裂排查：对比多节点的 `Term` 与 `LeaderID`，若同时出现两个 `LeaderID!= -1` 且 `Term` 相近，
+  即疑似脑裂；
+- 排障 SOP 第 1 步之前，可先用 `RaftCheck` 确认单节点运行时不变量未被破坏。
