@@ -353,6 +353,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	idx := rf.lastLogIndex() + 1
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
+	// 控制面可观测性（best-effort，纯原子操作）：leader 追加日志条目计数，
+	// 与 raft_log_applied(已应用) 区分，便于观察写入吞吐与复制滞后。
+	Metrics.CounterWithHelp("raft_log_appends_total", "累计 leader 追加的日志条目数").Inc()
 	rf.persist()
 	// 复制由心跳计时器（~110ms）触发，避免持锁发 RPC 造成死锁。
 	return idx, rf.currentTerm, true
@@ -439,6 +442,9 @@ func (rf *Raft) doRealElection(preTerm int, lastIdx, lastTerm, me int) {
 	}
 	rf.preVoteWon = true
 	rf.currentTerm = preTerm
+	// 控制面可观测性：任期推进（发起选举）计数，配合 stepDown 的退位计数，
+	// 便于观察任期翻转频率（频繁变更往往是网络分区/不稳定信号）。
+	Metrics.CounterWithHelp("raft_term_changes_total", "累计任期变更次数(含选举发起与退位)").Inc()
 	rf.role = Candidate
 	rf.votedFor = me
 	rf.persist()
@@ -575,6 +581,8 @@ func (rf *Raft) stepDown(term int) {
 		rf.currentTerm = term
 		rf.votedFor = -1
 		rf.persist()
+		// 控制面可观测性：因发现更高任期而退位（任期变更）计数。
+		Metrics.CounterWithHelp("raft_term_changes_total", "累计任期变更次数(含选举发起与退位)").Inc()
 	}
 	rf.role = Follower
 	rf.preVoteWon = false
