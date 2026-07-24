@@ -232,3 +232,56 @@ func TestLargeShardMetric(t *testing.T) {
 		t.Fatalf("shard_bytes 直方图应记录样本")
 	}
 }
+
+// I16：迁移积压 gauge 把 pendingIn/pendingOut/shards 投影成可 scrape 指标（#229 新需求）。
+// 此前积压只出现在 /debug/shards 的 JSON 视图，Prometheus 无法告警；本测试锁死
+// publishMigrationGauges 的数值正确性及其进入全局注册表（供 /metrics 暴露）。
+func TestMigrationBacklogGauges(t *testing.T) {
+	Metrics.Reset()
+	kv := &ShardKV{
+		gid:             1,
+		config:          shardmaster.Config{Num: 5, Shards: [NShards]int{}},
+		shards:          map[int]*ShardData{5: {Data: map[string]string{}, LastSeq: map[int64]int64{}, LastResult: map[int64]string{}}},
+		pendingIn:       map[int]bool{3: true},
+		pendingOut:      map[int]bool{7: true},
+		installedCfgNum: map[int]int{},
+	}
+	kv.publishMigrationGauges()
+
+	want := map[string]float64{
+		"shardkv_pending_in":   1,
+		"shardkv_pending_out":  1,
+		"shardkv_shards_owned": 1,
+		"shardkv_pending_total": 2,
+	}
+	for name, v := range want {
+		if got := Metrics.Gauge(name).Value(); got != v {
+			t.Fatalf("gauge %s = %g, want %g", name, got, v)
+		}
+	}
+	// 进入全局注册表：网关 /metrics 才能 scrape 到（防 Help 注册静默 no-op）。
+	snap := Metrics.Snapshot()
+	gauges, ok := snap["gauges"].(map[string]float64)
+	if !ok {
+		t.Fatalf("Snapshot 未包含 gauges")
+	}
+	for name := range want {
+		if _, ok := gauges[name]; !ok {
+			t.Fatalf("注册表缺失 gauge %q（/metrics 将查无此指标）", name)
+		}
+	}
+
+	// 积压清除后 gauge 归零（模拟 GC 完成 pendingOut 与分片迁出）。
+	delete(kv.pendingOut, 7)
+	delete(kv.shards, 5)
+	kv.publishMigrationGauges()
+	if got := Metrics.Gauge("shardkv_pending_out").Value(); got != 0 {
+		t.Fatalf("清除后 shardkv_pending_out = %g, want 0", got)
+	}
+	if got := Metrics.Gauge("shardkv_shards_owned").Value(); got != 0 {
+		t.Fatalf("迁出后 shardkv_shards_owned = %g, want 0", got)
+	}
+	if got := Metrics.Gauge("shardkv_pending_total").Value(); got != 1 {
+		t.Fatalf("清除后 shardkv_pending_total = %g, want 1", got)
+	}
+}

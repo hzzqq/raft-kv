@@ -927,6 +927,7 @@ func (kv *ShardKV) applyNewConfig(cfg shardmaster.Config) {
 			}
 		}
 	}
+	kv.publishMigrationGauges()
 }
 
 func (kv *ShardKV) applyInstallShard(op Op, res *applyResult) {
@@ -1016,6 +1017,20 @@ func (kv *ShardKV) applyGC(s int) {
 		delete(kv.shards, s)
 	}
 	delete(kv.pendingOut, s)
+	kv.publishMigrationGauges()
+}
+
+// publishMigrationGauges 把数据面「迁移积压」与「分片拥有数」投影成可 scrape 的瞬时
+// 指标（此前仅有 /debug/shards 的 JSON 视图，Prometheus 无法告警）。卡死迁移
+// （pendingIn/pendingOut 长期非零）因此是运维盲点——本函数把 backlog 变成阈值可告警
+// 的时序信号。在 applyNewConfig / applyGC 末尾调用，覆盖积压的产生与清除两条主路径。
+func (kv *ShardKV) publishMigrationGauges() {
+	pin := len(kv.pendingIn)
+	pout := len(kv.pendingOut)
+	Metrics.GaugeWithHelp("shardkv_pending_in", "本组待接收分片数(已配置但数据未到位),长期>0 提示迁移卡死").Set(float64(pin))
+	Metrics.GaugeWithHelp("shardkv_pending_out", "本组待迁出分片数(已不再拥有但数据未推走),长期>0 提示迁移卡死").Set(float64(pout))
+	Metrics.GaugeWithHelp("shardkv_shards_owned", "本组当前实际持有的分片数").Set(float64(len(kv.shards)))
+	Metrics.GaugeWithHelp("shardkv_pending_total", "本组迁移积压总量(pending_in+pending_out),用于阈值告警").Set(float64(pin + pout))
 }
 
 // recordMigrationLatency 记录分片 s 从"进入待接收(pendingIn)"到"成功装入本组"的
