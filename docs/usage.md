@@ -99,7 +99,7 @@ go run ./src/gateway :9090           # 自定义地址
 **可观测响应头（经 `wrap` 统一注入，所有路由自动受益）**：
 
 - `X-Process-Time`：服务端处理耗时（TTFB 口径，毫秒，三位小数），用于定位慢路径。
-- `X-Response-Size`：响应体「线上」字节数（gzip 开启时为压缩后字节）；直方图指标 `gateway_response_bytes`。
+- `X-Response-Size`：响应体传输（wire）字节数（gzip 开启时为压缩后字节）；直方图指标 `gateway_response_bytes`。
 - `X-Request-Size`：入站请求体声明大小（`Content-Length`）；分块上传（`-1`）跳过以避免无意义负值，便于识别超大请求。
 
 **并发与容量**：`max_concurrent`（YAML，默认 64）限制网关在途请求数，超出返回 `429 too many concurrent requests`（满即拒，不阻塞在途请求）；实时占用见 `gateway_concurrent_in_use` 指标。实现基于 `util.Semaphore`，与 `kvcli` 的并发上限复用同一原语。
@@ -127,10 +127,38 @@ go run ./src/kvcli [-addr http://localhost:8080] bench put 500 4
 保证 `mixed`/`get` 下读到的都是本 worker 写入的数据。客户端对非 200 响应会返回错误
 （不会静默返回空串）。
 
-作为 Go 库使用时，`Client` 还提供：
+作为 Go 库使用时，`Client` 暴露的完整 API（CLI 仅提供 `get` / `put` / `append` / `bench` 四个子命令，其余均为库方法）：
 
-- `MGet(keys)` / `MSet(pairs)`：并发批量读/写，单 key 失败互不阻断（结果里 `Errors` 归集失败项）。
-- `SetMaxConcurrent(n int)`：限制 `MGet`/`MSet` 内部并发回源 goroutine 数（默认 `0`=不限制，保留历史语义；非 0 时仅该数量请求同时在途，复用 `util.Semaphore`，ctx 取消时立即退出不挂死），防止超大批量一次性拉起成千上万 goroutine 打爆客户端/后端。
+**基础读写**
+- `Get(key)` / `GetCtx(ctx, key)`：`GET /kv/{key}`，返回当前值。
+- `Put(key, val)` / `PutCtx(ctx, key, val)`：`PUT /kv/{key}`。
+- `Append(key, val)` / `AppendCtx(ctx, key, val)`：`POST /kv/{key}/append`。
+- `AppendGet(key, val)`：先追加再读取返回新值（日志追加后确认落库场景）；底层仍是两步，单写者下一致。
+
+**批量与组合**
+- `MGet(keys)` / `MGetCtx(ctx, keys)`：并发批量读，结果 `MGetResult` 含 `Errors` 归集单 key 失败项（互不阻断）。
+- `MSet(pairs)` / `MSetCtx(ctx, pairs)`：并发批量写，同上。
+- `Pipeline(ops []BatchOp)`：并发执行一组混合 `get`/`put`/`append` 操作，按输入顺序返回一一对应的 `[]BatchResult`，适合一次组装多类操作、降低往返编排复杂度。
+- `MDel(keys)`：并发批量删除，结果 `MDelResult` 归集失败项。
+
+**存在性 / 原子类（均为客户端两步「读-改-写」，非服务端原子；单写者 / 低争用场景足够，强一致计数 / CAS 应由 Raft 状态机内 Op 保证）**
+- `Exists(keys []string) map[string]bool`：批量判存。
+- `Del(key)`：`DELETE /kv/{key}`。
+- `Incr(key)`：读取当前整数值（缺省 0，非整数按 0）+1 写回，返回新值；计数器 / 序列号生成。
+- `SetNX(key, val)`：仅当 key 不存在或为空时写入，返回是否写入成功（分布式锁初始化 / 幂等首写）。
+- `Cas(key, expect, newVal)`：当前值等于 `expect` 才写入 `newVal`，返回是否成功（key 不存在视作 `""`）。
+
+**韧性 / 观测（需在发请求前配置）**
+- `SetMaxConcurrent(n)`：`MGet`/`MSet` 内部并发回源上限（默认 `0`=不限制；复用 `util.Semaphore`，`ctx` 取消即退出不挂死），防止超大批量一次性拉起成千上万 goroutine 打爆客户端 / 后端。
+- `SetRetry(max, base)` / `SetRequestTimeout(d)`：有界重试（瞬态 503/504 可重试）+ 单请求超时。
+- `EnableGzip()`：透明解压 `Content-Encoding: gzip` 响应。
+- `EnableSingleFlight()`：相同 key 的并发读合并为一次回源。
+- `EnableCache(ttl, max)` / `CacheStats()`：客户端读缓存（TTL + 上限）与命中统计。
+- `EnableBreaker(threshold, successThresh, cooldown)`：客户端熔断（连续失败达阈值转 Open 快速失败，冷却后试探）。
+- `WarmUp(keys)`：预先建立 / 预热连接，避免首 RPC 建链延迟尖刺。
+- `Ping(ctx)` / `Healthy(ctx)` / `Ready(ctx)`：主动探活（对应 `/healthz` 存活 / `/readyz` 就绪 / 可读写语义）。
+- `Metrics()` / `Close()`：导出客户端指标（`ClientMetrics`）与回收连接。
+- `Bench(ops, workers, op, valueSize)` / `BenchWithTimeout(...)`：与 CLI `bench` 同款压测，返回 `BenchResult`（吞吐 + `p50/p95/p99`）。
 
 ---
 
