@@ -62,9 +62,6 @@ type Client struct {
 	// maxConcurrent 限制 MGet/MSet 批量操作内部并发回源的 goroutine 数，
 	// 防止超大批量一次性拉起成千上万 goroutine 打爆客户端/后端。0=不限制（保留历史语义）。
 	maxConcurrent int
-	// sem 是 maxConcurrent>0 时复用的有界信号量（util.Semaphore，支持 ctx 取消）；
-	// nil 表示不限制并发。构造一次后跨多次批量调用复用，避免每批新建 channel。
-	sem *util.Semaphore
 }
 
 // cacheEntry 是单条缓存值及其绝对过期时刻。
@@ -222,14 +219,10 @@ func (c *Client) Close() {
 // SetMaxConcurrent 限制 MGet/MSet 批量操作内部并发回源的 goroutine 数（R2 隐性健壮性：
 // 默认 MGet/MSet 每 key 起一个 goroutine 且无上限，超大批量会一次性拉起成千上万
 // goroutine 打爆客户端与后端）。0=不限制（保留历史语义）。非 0 时仅该数量请求同时在途。
-// 复用 util.Semaphore 有界信号量（支持 ctx 取消），构造一次缓存复用。
+// 批量调用内部统一经 util.WorkerPool 派发：常驻 worker + 有界任务通道 + SubmitCtx 的
+// ctx 取消/背压语义，替代此前手搓的 goroutine+Semaphore 样板（R5 落地 / R3 去重）。
 func (c *Client) SetMaxConcurrent(n int) {
 	c.maxConcurrent = n
-	if n > 0 {
-		c.sem = util.NewSemaphore(n)
-	} else {
-		c.sem = nil
-	}
 }
 
 // EnableCache 开启读穿缓存：ttl 为条目有效期，max 为容量上限（超出按近似 FIFO
@@ -490,24 +483,18 @@ func (c *Client) MGetCtx(ctx context.Context, keys []string) MGetResult {
 		return res
 	}
 	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := c.sem
+	// 有界并发派发：maxConcurrent>0 时仅 maxConcurrent 个 worker 同时在途；
+	// 否则按 key 数开池（等价于历史「每 key 一 goroutine」的无限制语义）。
+	// 统一经 util.WorkerPool + SubmitCtx：常驻 worker 复用 goroutine、有界通道提供背压、
+	// ctx 取消即退出，替代此前手搓的 goroutine+Semaphore 样板（R5 落地 / R3 去重）。
+	n := c.maxConcurrent
+	if n <= 0 {
+		n = len(keys)
+	}
+	pool := util.NewWorkerPool(n)
 	for _, k := range keys {
-		if sem != nil {
-			// 有界信号量：满则阻塞直至有空位；ctx 取消时及时退出，避免批量挂死。
-			if err := sem.Acquire(ctx); err != nil {
-				mu.Lock()
-				res.Errors[k] = err
-				mu.Unlock()
-				continue
-			}
-		}
-		wg.Add(1)
-		go func(k string) {
-			defer wg.Done()
-			if sem != nil {
-				defer sem.Release()
-			}
+		k := k
+		if err := pool.SubmitCtx(ctx, func() {
 			v, err := c.getCtx(ctx, k)
 			mu.Lock()
 			if err != nil {
@@ -516,9 +503,13 @@ func (c *Client) MGetCtx(ctx context.Context, keys []string) MGetResult {
 				res.Results[k] = v
 			}
 			mu.Unlock()
-		}(k)
+		}); err != nil {
+			mu.Lock()
+			res.Errors[k] = err
+			mu.Unlock()
+		}
 	}
-	wg.Wait()
+	pool.StopAndWait()
 	return res
 }
 
@@ -550,24 +541,14 @@ func (c *Client) MSetCtx(ctx context.Context, pairs map[string]string) MSetResul
 		return res
 	}
 	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := c.sem
+	n := c.maxConcurrent
+	if n <= 0 {
+		n = len(pairs)
+	}
+	pool := util.NewWorkerPool(n)
 	for k, v := range pairs {
-		if sem != nil {
-			if err := sem.Acquire(ctx); err != nil {
-				mu.Lock()
-				res.Results[k] = err
-				res.Errors[k] = err
-				mu.Unlock()
-				continue
-			}
-		}
-		wg.Add(1)
-		go func(k, v string) {
-			defer wg.Done()
-			if sem != nil {
-				defer sem.Release()
-			}
+		k, v := k, v
+		if err := pool.SubmitCtx(ctx, func() {
 			err := c.putCtx(ctx, k, v)
 			mu.Lock()
 			res.Results[k] = err
@@ -575,9 +556,14 @@ func (c *Client) MSetCtx(ctx context.Context, pairs map[string]string) MSetResul
 				res.Errors[k] = err
 			}
 			mu.Unlock()
-		}(k, v)
+		}); err != nil {
+			mu.Lock()
+			res.Results[k] = err
+			res.Errors[k] = err
+			mu.Unlock()
+		}
 	}
-	wg.Wait()
+	pool.StopAndWait()
 	res.Failed = len(res.Errors)
 	return res
 }
