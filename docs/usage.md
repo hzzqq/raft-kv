@@ -101,6 +101,10 @@ go run ./src/gateway :9090           # 自定义地址
 - `X-Response-Size`：响应体「线上」字节数（gzip 开启时为压缩后字节）；直方图指标 `gateway_response_bytes`。
 - `X-Request-Size`：入站请求体声明大小（`Content-Length`）；分块上传（`-1`）跳过以避免无意义负值，便于识别超大请求。
 
+**并发与容量**：`max_concurrent`（YAML，默认 64）限制网关在途请求数，超出返回 `429 too many concurrent requests`（满即拒，不阻塞在途请求）；实时占用见 `gateway_concurrent_in_use` 指标。实现基于 `util.Semaphore`，与 `kvcli` 的并发上限复用同一原语。
+
+**构建信息自报**：`/debug/version`（及 `version.String()`/`Short()`）未注入 `-ldflags` 时，自动从 `runtime/debug.ReadBuildInfo()` 补全 `commit`/`build_time`，便于排障定位构建来源（`version.LoadFromBuildInfo()` 在启动期调用一次）。
+
 ---
 
 ## 4. kvcli（`src/kvcli`，HTTP 客户端 / 压测工具）
