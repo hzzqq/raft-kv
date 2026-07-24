@@ -63,7 +63,7 @@
 | 配置服务 | `src/shardmaster` | 维护 `Config` 序列（Join/Leave/Move/Query），自身跑在 Raft 上 | `ShardMaster` · `Config` |
 | 数据面 | `src/shardkv` | 分片路由、迁移状态机、线性一致读、快照压缩 | `ShardKV` · `MakeShardKV` |
 | 集群工具 | `src/cluster` | 可复用的 in-process labrpc 集群封装（测试 / 演示 / 网关都用它起集群） | `StartCluster` · `Clerk` |
-| HTTP 网关 | `src/gateway` | 把集群暴露成 REST：`/kv/{key}`(GET/PUT/POST-append) · `/healthz`(存活) · `/readyz`(就绪) · `/metrics`(JSON/Prometheus 协商，聚合 shardkv+shardmaster+gateway 三套注册表) · `/status`(集群健康) · `/debug/shards` · `/debug/migrate`(迁移进度) · `/debug/migrate-plan`(POST，配置变更 dry-run) · `/debug/configs` · `/debug/groups` · `/debug/raft`(共识健康汇聚) · `/debug/version`(构建信息) · `/debug/routes`(路由表) · `/debug/accesslog` · `/debug/log`(分级结构化日志) · `/debug/config`(生效配置快照) | `Handler` · `main` |
+| HTTP 网关 | `src/gateway` | 把集群暴露成 REST：`/kv/{key}`(GET/PUT/POST-append) · `/healthz`(存活) · `/readyz`(就绪) · `/metrics`(JSON/Prometheus 协商，聚合 shardkv+shardmaster+gateway 三套注册表) · `/status`(集群健康) · `/debug/shards`(含 #230 `diagnosis` 数据面自检字段) · `/debug/migrate`(迁移进度) · `/debug/migrate-plan`(POST，配置变更 dry-run) · `/debug/configs` · `/debug/groups` · `/debug/raft`(共识健康汇聚) · `/debug/version`(构建信息) · `/debug/routes`(路由表) · `/debug/accesslog` · `/debug/log`(分级结构化日志) · `/debug/config`(生效配置快照) | `Handler` · `main` |
 | 客户端 | `src/kvcli` | HTTP 客户端 + 命令行（get/put/append/bench） | `Client` · `main` |
 | 演示 | `src/demo` | 全栈冒烟：Clerk 路径 + HTTP 网关路径 | `main` |
 | 可观测 | `src/metrics` | 零依赖 Counter + 有界直方图（p50/p95/p99） | `Registry` · `Snapshot` |
@@ -86,9 +86,11 @@ raft-kv/
 │   ├── demo/          # 全栈演示（Clerk 路径 + HTTP 网关路径）
 │   └── metrics/       # 零依赖并发安全指标库
 ├── docs/
-│   ├── architecture.md      # 本文：系统架构地图
-│   ├── lab4-shardkv-design.md  # ShardKV 深层设计笔记
-│   └── usage.md             # 各组件使用指南
+│   ├── architecture.md          # 本文：系统架构地图
+│   ├── lab4-shardkv-design.md  # ShardKV 深层设计笔记（含 §7 冻结根治）
+│   ├── usage.md                 # 各组件使用指南 / 命令表
+│   ├── runbook.md               # 运维排障手册（含观测性告警段）
+│   └── coverage.md              # 测试覆盖与近期迭代清单（时效性说明）
 ├── ITERATION_RULES.md       # 自主迭代（self-driving）规则
 ├── run-tests.sh             # 托管 Go 工具链下跑测试
 ├── Makefile                 # build-binaries / demo / lint / cover
@@ -143,10 +145,10 @@ ShardKV.pollConfig（串行推进，不抢跑）
    └─ 当 pendingIn/pendingOut 全空 → applyNewConfig → config 正式生效
 ```
 
-> **已知风险（务必读 `lab4-shardkv-design.md §7`）**：
-> - 3+ 组**完整 rebalance**（Join/Leave 混合 churn）可能让某个分片卡在 `pendingIn/pendingOut` 无法清除 → 后续读挂起。Move-based churn 安全。
-> - `TestSKVReMigration`（单分片 A→B→A 漂移）**偶发 flaky**（约 40% 概率 `pendingIn=[8]` 冻结），根因同上，只是触发面更广。
-> 二者的服务端根因尚未根治，属于最高优先级待办。
+> **迁移冻结（已根治，详见 `lab4-shardkv-design.md §7`）**：
+> - 早期 3+ 组**完整 rebalance**（Join/Leave 混合 churn）与 `TestSKVReMigration`（单分片 A→B→A 漂移）曾因 `pendingIn/pendingOut` 卡死导致后续读挂起。
+> - 现两条失效路径均已**根因修复**：① fetch 侧卡死由 cycle 48 的「`applyNewConfig` 消费 `incoming` 必清 `pendingIn` + `pollConfig` 仅以 `pendingIn` 门控配置推进 + `migratePump` 保活泵」消除；② orphan incoming 由 `GetShard` **安全回退**（本组 `shards[s]` 缺失时返回 `incoming[s]`，只读、零改写、零新协程）消除。
+> - 因此 `TestSKVThreeGroupChurn` 与 `TestSKVReMigration` 已由「默认 `t.Skip`」转为**常驻且确定性通过**（`-count=3` 串行复跑 3/3），冻结问题从「已知风险」转为「已修复」。`migratePump` 看门狗（卡滞 >3s 周期重拉）作为极端兜底 + 观测信号保留。Move-based churn 一直安全。
 
 ### 4.3 崩溃恢复
 
@@ -214,6 +216,7 @@ Raft 从 Persister 恢复：currentTerm / votedFor / log[] / snapshot
 
 ## 9. 待办（自主迭代 backlog）
 
-1. **【最高优先级】根治 pendingIn/pendingOut 冻结**：3 组 rebalance 与 `TestSKVReMigration` flaky 的服务端根因（旧 owner GC 分片导致 fetchShard 死循环 / orphan incoming 不转发）。需要一次迁移状态机的专项整治，而非客户端打补丁。
+1. ~~**【已根治】pendingIn/pendingOut 冻结**~~：3 组 rebalance 与 `TestSKVReMigration` flaky 的服务端根因已在 cycle 48 + `GetShard` 安全回退彻底消除（详见设计文档 §7），相关用例转为常驻确定性通过。
 2. 提升吞吐量：当前基准约 16.6 ops/sec，瓶颈在 Raft 串行化 + 客户端重试退避；ReadIndex 已缓解读路径，写路径仍有空间。
 3. 真实传输层（gRPC/HTTP）替换 labrpc，使组件可独立部署。
+4. 可观测性收口：补齐各 `/debug/*` 端点的字段说明（如 `/debug/shards` 的 `diagnosis` 自检段、`/debug/raft` 的 `RaftCheck` 不变量）到统一观测性参考文档（见 `docs/runbook.md` / 后续 `docs/observability.md`）。
