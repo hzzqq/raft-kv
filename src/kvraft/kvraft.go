@@ -27,6 +27,11 @@ var (
 // 反序列化时必须知道具体类型，否则重启后日志变空（命令丢失）。
 func init() {
 	gob.Register(Op{})
+	// 进程级瞬时量 HELP：数据规模与去重会话表规模，供 kvraft.Metrics 直接 scrape/JSON 输出。
+	Metrics.GaugeWithHelp("kv_data_keys", "当前 KV 状态机数据键数量(近似,多实例共享注册表时取最后写入者)")
+	Metrics.GaugeWithHelp("kv_sessions", "当前去重会话表大小(已注册 client 数,近似)")
+	Metrics.CounterWithHelp("gc_sweeps_total", "client 会话 GC 扫描累计次数")
+	Metrics.CounterWithHelp("gc_sessions_evicted_total", "GC 累计回收的空闲会话数")
 }
 
 // Op 是提交到 Raft 状态机的操作。ClientId+Seq 用于幂等去重。
@@ -140,6 +145,11 @@ func (kv *KVServer) applier() {
 			// 修复此前 appliedIndex 无锁写的数据竞态与陈旧快照回滚状态机的正确性隐患。
 			if kv.installSnapshot(msg.Snapshot, msg.SnapshotIndex) {
 				Metrics.Counter("snapshots_installed").Inc()
+				// 快照追平后同步刷新规模 gauge（installSnapshot 内部持锁，此处另行加锁读取）。
+				kv.mu.Lock()
+				Metrics.Gauge("kv_data_keys").Set(float64(len(kv.data)))
+				Metrics.Gauge("kv_sessions").Set(float64(len(kv.sessions)))
+				kv.mu.Unlock()
 			}
 			continue
 		}
@@ -185,6 +195,9 @@ func (kv *KVServer) applier() {
 				kv.rf.Snapshot(idx, snap)
 			}
 		}
+		// 每次应用后刷新规模 gauge（仍持 kv.mu，无额外锁开销）。
+		Metrics.Gauge("kv_data_keys").Set(float64(len(kv.data)))
+		Metrics.Gauge("kv_sessions").Set(float64(len(kv.sessions)))
 		kv.mu.Unlock()
 		if ch != nil {
 			ch <- applyResult{op: op, result: res}
@@ -277,6 +290,43 @@ func (kv *KVServer) waitApplied(op Op, index int) OpResult {
 		kv.mu.Unlock()
 		return OpResult{Err: "timeout"}
 	}
+}
+
+// KVStatus 是 KV 状态机的只读健康快照（运维/诊断用），与 raft.RaftStatus 互补：
+// 共识层看角色/任期/leader，数据层看 apply 进度、数据规模、去重会话表与 GC 配置。
+// 此前 KV 状态机对运维完全不透明（只能 dump 内存），与同仓 raft/shardkv 已暴露的
+// 健康快照不对齐；此处补齐数据面一手信号。
+type KVStatus struct {
+	Me            int    `json:"me"`
+	Role          string `json:"role"`
+	Term          int    `json:"term"`
+	LeaderID      int    `json:"leader_id"`
+	AppliedIndex  int    `json:"applied_index"`
+	DataKeys      int    `json:"data_keys"`
+	Sessions      int    `json:"sessions"`
+	GCTTLSec      int64  `json:"gc_ttl_sec"`
+	GCIntervalSec int64  `json:"gc_interval_sec"`
+}
+
+// Status 返回 KV 状态机当前只读快照。所有字段均在 kv.mu 保护下读取，并发安全；
+// rf 为 nil（簇无关测试或部分初始化）时不 panic，仅缺失共识字段。
+func (kv *KVServer) Status() KVStatus {
+	st := KVStatus{
+		Me:            kv.me,
+		AppliedIndex:  kv.appliedIndex,
+		DataKeys:      len(kv.data),
+		Sessions:      len(kv.sessions),
+		GCTTLSec:      int64(kv.gcTTL / time.Second),
+		GCIntervalSec: int64(kv.gcInterval / time.Second),
+	}
+	if kv.rf != nil {
+		rs := kv.rf.Status()
+		st.Me = rs.Me
+		st.Role = rs.Role.String()
+		st.Term = rs.Term
+		st.LeaderID = rs.LeaderID
+	}
+	return st
 }
 
 func (kv *KVServer) startOp(op Op) (int, bool) {
@@ -389,14 +439,24 @@ func (kv *KVServer) gc() {
 }
 
 // gcSweep 在持锁状态下回收所有空闲超时的会话，避免与请求处理产生竞态。
+// 同时累加可观测计数：扫描次数与本次实际回收的会话数，使 GC 行为不再对运维不可见。
 func (kv *KVServer) gcSweep(now time.Time) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	var evicted int
 	for cid, s := range kv.sessions {
 		if now.Sub(s.lastAccess) > kv.gcTTL {
 			delete(kv.sessions, cid)
+			evicted++
 		}
 	}
+	Metrics.Counter("gc_sweeps_total").Inc()
+	if evicted > 0 {
+		Metrics.Counter("gc_sessions_evicted_total").Add(int64(evicted))
+	}
+	// 回收后同步会话规模 gauge（data 不变，一并刷新保持两个规模 gauge 同源更新）。
+	Metrics.Gauge("kv_sessions").Set(float64(len(kv.sessions)))
+	Metrics.Gauge("kv_data_keys").Set(float64(len(kv.data)))
 }
 
 // ============================== 客户端 Clerk ==============================
