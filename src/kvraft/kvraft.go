@@ -278,13 +278,15 @@ func (kv *KVServer) waitApplied(op Op, index int) OpResult {
 	kv.notify[index] = ch
 	kv.mu.Unlock()
 
+	timer := time.NewTimer(1 * time.Second)
+	defer timer.Stop()
 	select {
 	case ar := <-ch:
 		if ar.op.ClientId == op.ClientId && ar.op.Seq == op.Seq {
 			return ar.result
 		}
 		return OpResult{Err: "mismatch"}
-	case <-time.After(1 * time.Second):
+	case <-timer.C:
 		kv.mu.Lock()
 		delete(kv.notify, index)
 		kv.mu.Unlock()

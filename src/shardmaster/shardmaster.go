@@ -399,10 +399,12 @@ func (sm *ShardMaster) propose(op Op) Err {
 		return ErrWrongLeader
 	}
 
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
 	select {
 	case <-ch:
 		return OK
-	case <-time.After(3 * time.Second):
+	case <-timer.C:
 		sm.mu.Lock()
 		delete(sm.notified, nid)
 		sm.mu.Unlock()

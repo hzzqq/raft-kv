@@ -687,10 +687,12 @@ func (kv *ShardKV) propose(op Op) applyResult {
 		return applyResult{ErrWrongLeader, ""}
 	}
 
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
 	select {
 	case r := <-ch:
 		return r
-	case <-time.After(3 * time.Second):
+	case <-timer.C:
 		kv.mu.Lock()
 		delete(kv.notified, nid)
 		kv.mu.Unlock()
@@ -1676,10 +1678,12 @@ func (ck *Clerk) callWithTimeout(end *raft.ClientEnd, method string, args, reply
 	go func() {
 		done <- end.Call(method, args, reply)
 	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case ok := <-done:
 		return ok
-	case <-time.After(timeout):
+	case <-timer.C:
 		return false
 	}
 }

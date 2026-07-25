@@ -89,3 +89,21 @@ func TestRetryCtxCancel(t *testing.T) {
 		t.Fatalf("ctx 取消后应仅调用 1 次，实际 %d", calls)
 	}
 }
+
+// TestRetryCtxAlreadyCancelledNoWait 验证：ctx 已取消时 Retry 立即返回 ctx.Err()，
+// 不等待任何退避（此前 time.After 泄漏的定时器不会拖慢取消路径；且取消优先于 lastErr）。
+func TestRetryCtxAlreadyCancelledNoWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	err := Retry(ctx, 5, 200*time.Millisecond, func() (bool, error) {
+		return true, errors.New("不应被调用")
+	})
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("期望 context.Canceled，实际 %v", err)
+	}
+	if elapsed > 50*time.Millisecond {
+		t.Fatalf("ctx 已取消应立刻返回，却耗时 %v（疑似被退避定时器拖住）", elapsed)
+	}
+}

@@ -18,9 +18,6 @@ func Retry(ctx context.Context, maxAttempts int, base time.Duration, do func() (
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
-			if lastErr != nil {
-				return lastErr
-			}
 			return err
 		}
 		retryable, err := do()
@@ -33,10 +30,14 @@ func Retry(ctx context.Context, maxAttempts int, base time.Duration, do func() (
 		}
 		if attempt < maxAttempts-1 {
 			wait := ExpBackoff(base, 2*time.Second, attempt)
+			// 用 NewTimer+Stop 替代 time.After：ctx 提前取消时 time.After 的
+			// 定时器会被遗弃直到触发（最长 wait，可达 2s），高重试量下累积泄漏。
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(wait):
+			case <-timer.C:
 			}
 		}
 	}
