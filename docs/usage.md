@@ -221,3 +221,37 @@ curl -s localhost:8080/status | go run ./src/statusfmt -json    # JSON 评分报
 
 `migrate` 子命令直接打印 `/debug/migrate` 文本，pendingIn/pendingOut 有残留且 stall>0
 即配置冻结风险信号。
+
+## 7. util 公共组件（`src/util`，可独立复用的并发原语）
+
+`src/util` 沉淀了若干经过单测的并发 / 限流 / 缓存原语，既被本仓库内部使用，也可作为
+独立库被外部项目引用。以下为此前未在文档出现的公共类型（其余如 `CircuitBreaker`、
+`Semaphore`、`WorkerPool`、`SnowID`、`TimedCache`、`JSONError` 等已在对应章节内联说明）：
+
+- **`BufferPool`**：`*bytes.Buffer` 对象池，缓解高频 JSON/IO 序列化场景下的短生命周期
+  buffer 分配压力。`NewBufferPool()` 创建；`Get()` 取一个**已 Reset 的空 buffer**；
+  `Put(buf)` 先 `Reset` 再归还，杜绝把上一次写入的脏数据泄漏到下一次使用方。
+
+- **`Closer`**：「关闭一次 + 等待所有 worker 退出」的组合原语，消除手写
+  `close(ch); wg.Wait()` 时常见的两类 bug——① 重复 `close` 同一 channel 导致 panic；
+  ② `Add/Done` 与 `close` 的时序竞态（goroutine 真正进入 `select` 前就 `close`）。
+  `NewCloser()` 创建；`C()` 返回关闭信号 channel（worker 用 `select { case <-c.C(): ... }`
+  监听）；`Add(n)/Done()` 登记 / 标记 worker；`Close()` **仅生效一次**（重复调用安全）；
+  `Wait()` 阻塞至所有 `Done` 被调用。
+
+- **`CbState`（熔断器状态枚举，`CbState int`）**：`CBClosed`（正常放行）/ `CBOpen`
+  （熔断中，快速失败、不调用下游）/ `CBHalfOpen`（冷却后试探放行一次）。配套
+  `CircuitBreaker`（见 kvcli `EnableBreaker` 与 gateway 限流实现）：半开窗口内最多放行
+  `successThresh` 个并发探针，其余并发请求一律快速失败，避免 `Open→HalfOpen` 后对刚恢复
+  （或仍不稳定）的下游造成探测洪泛（惊群）。
+
+- **`MultiLimiter`**：组合多个限流判据，**AND 语义**——仅当所有子判据 `func() bool` 都允许
+  时才放行（短路：任一拒绝立即返回 `false`）。典型用途：同时满足「全局 QPS 桶」与
+  「单租户桶」、「突发令牌桶」与「滑窗计数」等多策略叠加。`NewMultiLimiter(checks...)`
+  创建（nil 判据自动忽略）；`Allow()` 全部允许才返回 `true`。
+
+- **`TokenBucket`**：令牌桶限流器，以固定速率 `refill` 令牌，桶容量 `capacity` 决定允许的最大
+  突发。与 `SlidingWindowLimiter` 互补——滑窗限制「时间窗内总请求数」，令牌桶限制
+  「瞬时突发 + 平均速率」，更适合允许短时突发、但需平滑长期速率的场景（如后端回源、对外
+  API 调用）。`NewTokenBucket(rate, capacity)` 创建；`Allow()/AllowN(n)` 取 1/n 个令牌
+  （非阻塞、不等待）；`Available()` 观测当前可用令牌数。

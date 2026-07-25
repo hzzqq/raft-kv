@@ -22,6 +22,8 @@ run_docs() {
   python3 scripts/check_docs_endpoints.py
   echo "==> [docs] 校验指标注册名与文档一致性"
   python3 scripts/check_metrics_docs.py
+  echo "==> [docs] 校验 kvcli.Client / util 公共 API 与文档一致性"
+  python3 scripts/check_api_docs.py
 }
 
 run_test() {
