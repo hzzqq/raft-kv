@@ -25,6 +25,7 @@ CHECKS = [
     ("scripts/check_metrics_docs.py", [], "指标注册名与文档一致性"),
     ("scripts/check_api_docs.py", [], "kvcli.Client/util 公共 API 与文档一致性"),
     ("scripts/gen_changelog.py", ["--verify"], "CHANGELOG.md 与迭代日志同步"),
+    ("scripts/check_state_integrity.py", [], "自驱开发日志完整性"),
     ("scripts/check_go_patterns.py", [], "Go 反模式静态扫描"),
 ]
 

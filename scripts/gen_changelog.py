@@ -54,6 +54,22 @@ def main() -> int:
         print("log 为空，跳过。")
         return 0
 
+    # 去重：按 (cycle, task_id) 保留首次出现，避免日志被重复注入后
+    # CHANGELOG 出现重复条目、--verify 失配（CI docs-links 静默失败）。
+    seen = set()
+    deduped = []
+    dup = 0
+    for e in log:
+        key = (e.get("cycle"), e.get("task_id"))
+        if key in seen:
+            dup += 1
+            continue
+        seen.add(key)
+        deduped.append(e)
+    if dup:
+        sys.stderr.write(f"警告：已忽略 {dup} 条重复日志条目（(cycle,task_id) 去重）。\n")
+    log = deduped
+
     groups = {a: [] for a in AREA_ORDER}
     for e in log:
         files = e.get("files", []) or ["?"]

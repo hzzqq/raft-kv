@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–107，共 69 轮交付；时间跨度 2026-07-22 ~ 2026-07-25。
+> 覆盖 cycle 39–108，共 68 轮交付；时间跨度 2026-07-22 ~ 2026-07-25。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -12,9 +12,7 @@
 - **[52] `gw_trace_kvcli_close`** — X-Request-Id透传 / Client.Close()（隐性：请求无关联ID / 连接不回收；score=13）
 - **[60] `gw_process_time`** — X-Process-Time 处理耗时响应头(TTFB,毫秒三位小数) + 通配兜底路由套 wrap（隐性：wrap 无处理耗时暴露;404 路径绕过 timingWriter 与 X-Request-ID/安全头(Go1.22 无 NotFoundHandler)；score=15）
 - **[65] `gw_resp_size`** — X-Response-Size 响应体大小头 + gateway_response_bytes 直方图指标（隐性：网关可观测缺响应体大小维度,带宽/大响应不可监控(R7 均衡);与 X-Process-Time 共用外层 writer；score=13）
-- **[65] `gw_resp_size`** — X-Response-Size 响应体大小头 + gateway_response_bytes 直方图指标（隐性：网关可观测缺响应体大小维度,带宽/大响应不可监控；score=13）
 - **[66] `gw_migrate_plan`** — POST /debug/migrate-plan 配置变更 dry-run 端点(调用 shardmaster.Plan)（隐性：Plan(#202)纯函数无 HTTP 暴露,运维只能盲提交配置变更(R2 隐性可用性缺口)；score=14）
-- **[66] `gw_migrate_plan`** — POST /debug/migrate-plan 配置变更 dry-run 端点(调用 shardmaster.Plan)（隐性：运维提交前无安全评估迁移代价/风险的手段；score=14）
 - **[68] `gw_request_size`** — X-Request-Size 请求体大小头(来自 r.ContentLength,分块-1跳过)（隐性：网关可观测缺请求体大小维度,超大请求/带宽不可监控(与 X-Response-Size 配对)；score=12）
 - **[71] `gateway_sem_util`** — gateway 并发上限收敛到 util.Semaphore（隐性：散落裸 make(chan struct{}) 信号量无 ctx 取消/无观测,与 kvcli #207 不一致;util.Semaphore 缺非阻塞 TryAcquire；score=20）
 - **[75] `gw_proc_gauges`** — 网关进程级 FuncGauge(uptime_seconds / goroutines) 暴露到 /metrics（隐性：运维无法直接观测进程运行时长与 goroutine 数(泄漏前兆)；score=14）
@@ -112,6 +110,7 @@
 - **[105] `doc_api_gate`** — kvcli.Client/util 公共 API 与文档一致性自动校验器+CI门禁（隐性：5 个 util 公共类型(BufferPool/Closer/CbState/MultiLimiter/TokenBucket)零文档,外部复用者无从知晓其存在;且 Client 方法改名/删除后文档漂移无断言；score=17）
 - **[106] `gen_changelog`** — 迭代交付记录自动生成 CHANGELOG.md + --verify 同步门禁（隐性：state.json 迭代日志存于隐藏工作目录,对用户/审计不可见;且交付历史易与实际脱节；score=16）
 - **[107] `go_patterns_scan`** — Go 反模式免编译静态扫描器+CI门禁（隐性：ioutil/非测试 time.After 等已根治坏味道无自动守卫,后续改动易悄然回归;纯文本扫描可免 Go 工具链；score=15）
+- **[108] `check_all_orchestrator`** — 统一自检编排器 check_all.py + README 脚本索引（隐性：6 个免 Go 校验器零散调用易漏跑,scripts 模块零文档;CHANGELOG 与 state 漂移无单入口发现；score=15）
 
 ---
 

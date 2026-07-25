@@ -186,6 +186,9 @@ jobs:
       - name: Verify CHANGELOG.md in sync with dev log
         run: python3 scripts/gen_changelog.py --verify
 
+      - name: Check self-driving dev log integrity
+        run: python3 scripts/check_state_integrity.py
+
       - name: Scan Go anti-patterns (no Go toolchain needed)
         run: python3 scripts/check_go_patterns.py
 
