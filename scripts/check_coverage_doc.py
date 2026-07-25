@@ -28,6 +28,7 @@ GUARDED = [
     "check_doc_inventory.py",
     "check_coverage_doc.py",
     "check_go_patterns.py",
+    "check_godoc.py",
 ]
 
 

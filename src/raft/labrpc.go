@@ -61,7 +61,7 @@ type Network struct {
 	ends    map[int]*ClientEnd
 	enabled map[int]bool // 每个 server 是否可达
 }
-
+// MakeNetwork 创建实验用网络，管理 ClientEnd/Server 与可控延迟、分区。
 func MakeNetwork() *Network {
 	return &Network{
 		servers: make(map[int]*Server),

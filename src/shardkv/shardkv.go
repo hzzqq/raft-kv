@@ -26,7 +26,7 @@ var Metrics = metrics.NewRegistry()
 // ============================== 常量与类型 ==============================
 
 const NShards = shardmaster.NShards
-
+// Err 是分片 KV 的错误码（如 ErrWrongGroup/ErrNoKey）。
 type Err string
 
 const (
@@ -126,11 +126,12 @@ type GetArgs struct {
 	ClientId int64
 	Seq      int64
 }
+// GetReply 是 Get 的响应，含值与错误码。
 type GetReply struct {
 	Err   Err
 	Value string
 }
-
+// PutAppendArgs 是 Put/Append 的跨分片请求入参。
 type PutAppendArgs struct {
 	Key      string
 	Value    string
@@ -138,22 +139,25 @@ type PutAppendArgs struct {
 	ClientId int64
 	Seq      int64
 }
+// PutAppendReply 是 Put/Append 的跨分片响应。
 type PutAppendReply struct {
 	Err Err
 }
-
+// SendShardArgs 是分片迁移的入参（携带分片数据与版本号）。
 type SendShardArgs struct {
 	Shard     int
 	Data      *ShardData
 	ConfigNum int
 }
+// SendShardReply 是分片迁移的响应。
 type SendShardReply struct {
 	Err Err
 }
-
+// GetShardArgs 是拉取指定分片的入参。
 type GetShardArgs struct {
 	Shard int
 }
+// GetShardReply 是拉取分片的响应（含分片数据与配置号）。
 type GetShardReply struct {
 	Err    Err
 	Data   *ShardData
@@ -234,7 +238,7 @@ func MakeShardKV(gid int, masters []string, make_end func(string) *raft.ClientEn
 	go kv.applier()
 	return kv
 }
-
+// Kill 关闭节点并停止后台迁移/GC 协程，仅测试使用。
 func (kv *ShardKV) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
@@ -525,7 +529,7 @@ func (kv *ShardKV) waitApplied(idx int, timeout time.Duration) bool {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
-
+// PutAppend 处理 Put/Append，越界分片返回 ErrWrongGroup 并触发迁移。
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	shard := key2shard(args.Key)
@@ -1384,7 +1388,7 @@ type Clerk struct {
 	seq      int64
 	leaderOf map[int]string // gid -> 最近一次返回 OK 的 server（leader 缓存，减少误路由）
 }
-
+// MakeClerk 创建并启动一个 ShardKV 的 Clerk。
 func MakeClerk(masters []string, make_end func(string) *raft.ClientEnd) *Clerk {
 	return &Clerk{
 		mck:      shardmaster.MakeClerk(masters, make_end),
@@ -1451,7 +1455,7 @@ func clerkSleepBackoff(backoff *time.Duration) {
 		*backoff *= 2
 	}
 }
-
+// Get 读取 key，按当前配置路由到归属副本组。
 func (ck *Clerk) Get(key string) string {
 	ck.mu.Lock()
 	ck.seq++
@@ -1499,7 +1503,7 @@ func (ck *Clerk) Get(key string) string {
 		clerkSleepBackoff(&backoff)
 	}
 }
-
+// PutAppend 提交 Put/Append，按 key 所属分片路由。
 func (ck *Clerk) PutAppend(key, value, opType string) {
 	ck.mu.Lock()
 	ck.seq++
@@ -1547,8 +1551,9 @@ func (ck *Clerk) PutAppend(key, value, opType string) {
 		clerkSleepBackoff(&backoff)
 	}
 }
-
+// Put 设值，等价于 PutAppend 的 Put 语义。
 func (ck *Clerk) Put(key, value string)    { ck.PutAppend(key, value, "Put") }
+// Append 追加，等价于 PutAppend 的 Append 语义。
 func (ck *Clerk) Append(key, value string) { ck.PutAppend(key, value, "Append") }
 
 // clerkBoundedRetries 是有界重试窗口：GetE/PutE/AppendE 在此窗口内重试，超时即
@@ -1742,7 +1747,7 @@ type ShardDebug struct {
 	PendingOutSince map[int]string `json:",omitempty"`
 	StallSeconds    float64        `json:",omitempty"`
 }
-
+// ShardDebug 返回各分片归属与迁移状态的调试快照。
 func (kv *ShardKV) ShardDebug() ShardDebug {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()

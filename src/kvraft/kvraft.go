@@ -70,7 +70,7 @@ type KVPersistState struct {
 	Data     map[string]string
 	Sessions map[int64]*clientSession
 }
-
+// KVServer 是基于 Raft 的线性一致 KV 服务节点，承载 Get/Put/Append 请求。
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -94,7 +94,7 @@ type KVServer struct {
 
 	maxraftstate int // >0 时超过该字节数触发快照（本层可选）
 }
-
+// Kill 关闭节点并停止其 Raft 与后台协程，仅测试使用。
 func (kv *KVServer) Kill() {
 	kv.killOnce.Do(func() { close(kv.killCh) })
 	atomic.StoreInt32(&kv.dead, 1)
@@ -113,18 +113,18 @@ type PutAppendArgs struct {
 	ClientId int64
 	Seq      int64
 }
-
+// PutAppendReply 是 Put/Append 的响应，携带错误码。
 type PutAppendReply struct {
 	WrongLeader bool
 	Err        string
 }
-
+// GetArgs 是 Get 请求的入参。
 type GetArgs struct {
 	Key      string
 	ClientId int64
 	Seq      int64
 }
-
+// GetReply 是 Get 的响应，含值与错误码。
 type GetReply struct {
 	WrongLeader bool
 	Err        string
@@ -382,7 +382,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	Metrics.Counter("ops_total").Inc()
 	Metrics.Histogram("op_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
 }
-
+// PutAppend 处理 Put/Append 请求，经 Raft 复制后应用到状态机。
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	start := time.Now()
 	op := Op{Key: args.Key, Value: args.Value, OpType: args.Op, ClientId: args.ClientId, Seq: args.Seq}
@@ -464,14 +464,14 @@ func (kv *KVServer) gcSweep(now time.Time) {
 // ============================== 客户端 Clerk ==============================
 
 var clientSeq int64 // 全局原子计数器，保证每个 Clerk 的 clientId 全局唯一
-
+// Clerk 是 KV 服务的客户端，携带 clientId+seq 实现幂等去重。
 type Clerk struct {
 	servers   []*raft.ClientEnd
 	clientId  int64
 	seq       int64
 	leaderHint int
 }
-
+// MakeClerk 创建并启动一个 KV 服务的 Clerk。
 func MakeClerk(servers []*raft.ClientEnd) *Clerk {
 	return &Clerk{
 		servers:  servers,
@@ -479,7 +479,7 @@ func MakeClerk(servers []*raft.ClientEnd) *Clerk {
 		seq:     0,
 	}
 }
-
+// Get 读取 key 的当前值，经 Raft 读取保证线性一致。
 func (ck *Clerk) Get(key string) string {
 	ck.seq++
 	op := GetArgs{Key: key, ClientId: ck.clientId, Seq: ck.seq}
@@ -499,7 +499,7 @@ func (ck *Clerk) Get(key string) string {
 		}
 	}
 }
-
+// PutAppend 提交一次 Put/Append，按 seq 去重重试直至成功。
 func (ck *Clerk) PutAppend(key, value, op string) {
 	ck.seq++
 	args := PutAppendArgs{Key: key, Value: value, Op: op, ClientId: ck.clientId, Seq: ck.seq}
@@ -518,11 +518,11 @@ func (ck *Clerk) PutAppend(key, value, op string) {
 		}
 	}
 }
-
+// Put 设值，等价于 PutAppend 的 Put 语义。
 func (ck *Clerk) Put(key, value string) {
 	ck.PutAppend(key, value, "Put")
 }
-
+// Append 追加，等价于 PutAppend 的 Append 语义。
 func (ck *Clerk) Append(key, value string) {
 	ck.PutAppend(key, value, "Append")
 }

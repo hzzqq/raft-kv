@@ -299,7 +299,7 @@ func (c *Client) ctxForRequest(ctx context.Context) (context.Context, context.Ca
 	}
 	return context.WithTimeout(ctx, time.Duration(ns))
 }
-
+// SetRetry 设置失败重试策略（最大次数与退避），作用于 Put/Get 等调用。
 func (c *Client) SetRetry(max int, base time.Duration) {
 	c.maxRetries = max
 	if base <= 0 {

@@ -1255,6 +1255,7 @@ func (s *Server) handleDebugRoutes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
+// SetHTTPServer 替换底层 *http.Server，便于测试注入自定义监听器与超时。
 func (s *Server) SetHTTPServer(srv *http.Server) {
 	s.mu.Lock()
 	s.srv = srv

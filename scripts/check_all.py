@@ -29,6 +29,7 @@ CHECKS = [
     ("scripts/check_doc_inventory.py", [], "校验器套件接线一致性"),
     ("scripts/check_coverage_doc.py", [], "coverage.md 与校验器清单一致"),
     ("scripts/check_go_patterns.py", [], "Go 反模式静态扫描"),
+    ("scripts/check_godoc.py", [], "godoc 导出标识符文档覆盖率"),
 ]
 
 

@@ -198,6 +198,9 @@ jobs:
       - name: Scan Go anti-patterns (no Go toolchain needed)
         run: python3 scripts/check_go_patterns.py
 
+      - name: Check godoc coverage of exported identifiers
+        run: python3 scripts/check_godoc.py
+
   # 覆盖率：跑全量测试，生成 cover.out 并上传为 artifact。
   coverage:
     runs-on: ubuntu-latest

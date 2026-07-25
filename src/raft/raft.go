@@ -25,7 +25,7 @@ const (
 	ElectionTimeoutMax = 480 * time.Millisecond
 	HeartbeatInterval  = 110 * time.Millisecond
 )
-
+// Role 表示节点在共识中的角色（Follower/Candidate/Leader）。
 type Role int
 
 const (
@@ -33,7 +33,7 @@ const (
 	Candidate
 	Leader
 )
-
+// String 返回 Role 的可读名称。
 func (r Role) String() string {
 	switch r {
 	case Follower:
@@ -72,7 +72,7 @@ type RequestVoteArgs struct {
 	LastLogIndex int
 	LastLogTerm  int
 }
-
+// RequestVoteReply 是 RequestVote 的响应。
 type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
@@ -87,7 +87,7 @@ type RequestPreVoteArgs struct {
 	LastLogIndex int
 	LastLogTerm  int
 }
-
+// RequestPreVoteReply 是预投票（PreVote）的响应。
 type RequestPreVoteReply struct {
 	Term        int
 	VoteGranted bool
@@ -99,11 +99,11 @@ type RequestPreVoteReply struct {
 type TimeoutNowArgs struct {
 	Term int
 }
-
+// TimeoutNowReply 是 TimeoutNow 的响应（用于领导权转移）。
 type TimeoutNowReply struct {
 	Term int
 }
-
+// AppendEntriesArgs 是日志复制/心跳的入参。
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
@@ -114,7 +114,7 @@ type AppendEntriesArgs struct {
 
 	LeaderCommit int
 }
-
+// AppendEntriesReply 是日志复制/心跳的响应。
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
@@ -133,7 +133,7 @@ type InstallSnapshotArgs struct {
 	LastIncludedTerm  int
 	Data              []byte
 }
-
+// InstallSnapshotReply 是安装快照的响应。
 type InstallSnapshotReply struct {
 	Term int
 }
@@ -378,7 +378,7 @@ func (rf *Raft) RaftStateSize() int {
 	defer rf.mu.Unlock()
 	return len(rf.persister.ReadRaftState())
 }
-
+// Kill 关闭节点，停止选举/心跳/应用等后台协程，仅测试使用。
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	rf.mu.Lock()
@@ -642,7 +642,7 @@ func (rf *Raft) stepDown(term int) {
 	rf.leaderId = -1 // 退位后失去对 leader 的认知，待下次合法 AppendEntries 重新确认
 	rf.resetElectionTimer()
 }
-
+// RequestVote 处理投票请求，按任期与日志完整性决定是否授权。
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -845,7 +845,7 @@ func (rf *Raft) firstIndexWithTerm(term int) int {
 	}
 	return -1
 }
-
+// AppendEntries 处理日志追加与心跳，维护提交索引与冲突回退。
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -974,7 +974,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	rf.persist()
 	return true
 }
-
+// InstallSnapshot 接收并安装领导者推送的快照。
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
