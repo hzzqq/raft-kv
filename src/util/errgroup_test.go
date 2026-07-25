@@ -67,3 +67,17 @@ func TestErrGroupParentCancel(t *testing.T) {
 		t.Fatal("父取消后任务未退出")
 	}
 }
+
+// TestErrGroupPanicRecovered 验证：单个任务 panic 被 recover 并归一为首个错误，
+// 不再击穿 goroutine 拖垮进程（R2 健壮性），其余任务被取消。
+func TestErrGroupPanicRecovered(t *testing.T) {
+	g := WithErrGroup(context.Background())
+	g.Go(func(ctx context.Context) error { panic("kaboom from task") })
+	g.Go(func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	if err := g.Wait(); err == nil {
+		t.Fatal("panic 应被捕获为 error，却返回 nil")
+	}
+}

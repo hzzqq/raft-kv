@@ -6,6 +6,7 @@ package util
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
@@ -24,12 +25,26 @@ func WithErrGroup(ctx context.Context) *ErrGroup {
 	return &ErrGroup{ctx: ctx, cancel: cancel}
 }
 
-// Go 启动一个任务；fn 接收可被取消的组内 ctx。首个非 nil 错误被记录，
-// 并触发全组取消（其余任务应监听 ctx.Done() 及时退出）。
+// Go 启动一个任务；fn 接收可被取消的组内 ctx。首个非 nil 错误或被 recover 的 panic
+// 被记录，并触发全组取消（其余任务应监听 ctx.Done() 及时退出）。
+//
+// 健壮性（R2 隐性）：此前 fn 若 panic 会直接击穿 goroutine、拖垮整个进程；与
+// transport.safeCall 一致，此处 recover 将 panic 归一为首个错误，保证「批量拉多分片 /
+// 并行健康探测」等场景中单个任务崩溃不会级联炸掉服务。
 func (g *ErrGroup) Go(fn func(ctx context.Context) error) {
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				g.mu.Lock()
+				if g.firstErr == nil {
+					g.firstErr = fmt.Errorf("errgroup: task panic recovered: %v", r)
+				}
+				g.mu.Unlock()
+				g.cancel()
+			}
+		}()
 		if err := fn(g.ctx); err != nil {
 			g.mu.Lock()
 			if g.firstErr == nil {
