@@ -517,6 +517,11 @@ func (cc *ClientConn) Close() error {
 
 // Invoke 发起一次 RPC：method 为完整方法名（如 "/Kv/Get"），reqData 为请求体字节，
 // 返回响应体字节。ctx 取消或连接失败时返回错误。连接经池化复用。
+//
+// 取消安全（R2 隐性健壮性修复）：此前取消协程在 ctx.Done() 时直接 pc.conn.Close()，
+// 而成功路径会 putConn(pc) 复用连接——若「响应帧恰好到达」与「ctx 取消」竞态（尤其
+// 无 deadline 的纯取消 ctx），关连接与放回池会同时发生，把已关闭连接放回池中，导致
+// 后续复用失败（连接池中毒）。现用 connGuard 互斥保证「关闭丢弃」与「放回复用」二选一。
 func (cc *ClientConn) Invoke(ctx context.Context, method string, reqData []byte) (respData []byte, err error) {
 	if err := ctx.Err(); err != nil {
 		cc.errs.Add(1)
@@ -528,12 +533,26 @@ func (cc *ClientConn) Invoke(ctx context.Context, method string, reqData []byte)
 		cc.errs.Add(1)
 		return nil, gerr
 	}
-	defer func() {
-		if err != nil {
-			cc.errs.Add(1)
-			pc.conn.Close() // 出错的连接不再复用，避免半写状态污染池
-		} else {
-			cc.putConn(pc)
+	// connGuard 协调「取消关闭」与「成功复用」：同一连接只能二选一，由锁串行化，
+	// 避免被既关闭又放回池（连接池中毒）。
+	var guard struct {
+		sync.Mutex
+		decided bool
+		closed  bool
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			guard.Lock()
+			if !guard.decided {
+				guard.decided = true
+				guard.closed = true
+				_ = pc.conn.Close()
+			}
+			guard.Unlock()
+		case <-done:
 		}
 	}()
 	// ctx 截止时间传播到 TCP 连接：超时即中断在途读写，且不污染复用连接。
@@ -544,34 +563,51 @@ func (cc *ClientConn) Invoke(ctx context.Context, method string, reqData []byte)
 	} else {
 		pc.conn.SetDeadline(time.Time{}) // 清除既往 deadline
 	}
-	// ctx 被主动取消（无 deadline）时关闭连接在途读写，尽快让 readFrame 返回。
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = pc.conn.Close()
-		case <-done:
-		}
-	}()
 	r, w := pc.r, pc.w
 	cc.bytesSent.Add(int64(len(method) + len(reqData)))
 	if err = writeFrame(w, frameData, []byte(method)); err != nil {
+		cc.errs.Add(1)
 		return nil, err
 	}
 	if err = writeFrame(w, frameData, reqData); err != nil {
+		cc.errs.Add(1)
 		return nil, err
 	}
 	var typ byte
 	var resp []byte
 	typ, resp, err = readFrame(r)
 	if err != nil {
+		cc.errs.Add(1)
+		// 读失败：连接已不可用，直接关闭丢弃，不再放回池中。
+		guard.Lock()
+		if !guard.decided {
+			guard.decided = true
+			guard.closed = true
+			_ = pc.conn.Close()
+		}
+		guard.Unlock()
 		return nil, err
 	}
+	// 读帧成功：先独占标记连接归属，阻止取消协程并发关闭后我们又放回池中。
+	guard.Lock()
+	if guard.decided {
+		// ctx 在响应到达瞬间被取消，取消协程已关闭连接；丢弃，不污染池。
+		guard.Unlock()
+		cc.errs.Add(1)
+		return nil, errors.New("transport: connection cancelled concurrently after response")
+	}
+	guard.decided = true
+	guard.Unlock()
+
 	if typ == frameError {
+		cc.bytesRecv.Add(int64(len(resp)))
+		cc.errs.Add(1)
+		// 服务端显式错误帧：请求/响应完整交换，连接仍健康，放回池复用。
+		cc.putConn(pc)
 		return nil, errors.New(string(resp))
 	}
 	cc.bytesRecv.Add(int64(len(resp)))
+	cc.putConn(pc)
 	return resp, nil
 }
 
