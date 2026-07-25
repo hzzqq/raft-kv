@@ -8,11 +8,17 @@
 #   ./scripts/ci-local.sh raft       # 仅 raft 用例（含 commitIndex 持久化回归测试，对应 CI raft-race job 的 -race 本地等价）
 #   ./scripts/ci-local.sh chaos      # 仅混沌用例（I16/I18）
 #   ./scripts/ci-local.sh build      # 仅构建 + demo 全栈冒烟
+#   ./scripts/ci-local.sh docs       # 仅校验仓库内 Markdown 文档内部链接一致性
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 RUN="${1:-all}"
+
+run_docs() {
+  echo "==> [docs] 校验 Markdown 内部链接一致性（不依赖 Go 工具链）"
+  python3 scripts/check_md_links.py .
+}
 
 run_test() {
   echo "==> [vet]"
@@ -48,12 +54,14 @@ case "$RUN" in
   raft)  run_raft ;;
   chaos) run_chaos ;;
   build) run_build ;;
+  docs)  run_docs ;;
   all)
     run_test
     run_raft
     run_chaos
     run_build
+    run_docs
     ;;
-  *) echo "unknown target: $RUN (want test|raft|chaos|build|all)"; exit 2 ;;
+  *) echo "unknown target: $RUN (want test|raft|chaos|build|docs|all)"; exit 2 ;;
 esac
 echo "OK"

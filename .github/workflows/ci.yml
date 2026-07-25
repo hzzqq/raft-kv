@@ -158,6 +158,22 @@ jobs:
           version: latest
           args: --timeout 5m
 
+  # 文档一致性：纯 Python 静态检查，不依赖 Go 工具链（本机无 go 时也能跑）。
+  # 校验仓库内所有 Markdown 的内部相对链接与锚点是否可解析，防止文档漂移。
+  docs-links:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Check Markdown internal links
+        run: python3 scripts/check_md_links.py .
+
   # 覆盖率：跑全量测试，生成 cover.out 并上传为 artifact。
   coverage:
     runs-on: ubuntu-latest
