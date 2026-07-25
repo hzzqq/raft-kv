@@ -48,3 +48,14 @@ func BenchmarkGaugeVecWithLabelValues(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkCounterVecWithLabelValues 同上的 counter 向量版本（cycle #117 新增原语）。
+func BenchmarkCounterVecWithLabelValues(b *testing.B) {
+	v := NewCounterVec("method", "code")
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			v.WithLabelValues("GET", "200").Inc()
+		}
+	})
+}

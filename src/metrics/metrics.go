@@ -170,24 +170,26 @@ func percentile(s []float64, q float64) float64 {
 
 // Registry 聚合一组命名计数器与直方图，对应一个组件的可观测性指标。
 type Registry struct {
-	mu         *sync.Mutex
-	counters   map[string]*Counter
-	histograms map[string]*Histogram
-	gauges     map[string]*Gauge
-	funcGauges map[string]*FuncGauge // 函数式瞬时指标（延迟取值）
-	descs      map[string]string     // 指标 HELP 描述（Prometheus 规范推荐）
-	prefix     string                // 非空表示该表是某父表的子系统，所有名字加此前缀
+	mu          *sync.Mutex
+	counters    map[string]*Counter
+	counterVecs map[string]*CounterVec // 带标签维度的 counter 向量（cycle #117）
+	histograms  map[string]*Histogram
+	gauges      map[string]*Gauge
+	funcGauges  map[string]*FuncGauge // 函数式瞬时指标（延迟取值）
+	descs       map[string]string      // 指标 HELP 描述（Prometheus 规范推荐）
+	prefix      string                // 非空表示该表是某父表的子系统，所有名字加此前缀
 }
 
 // NewRegistry 创建一个空的指标注册表。
 func NewRegistry() *Registry {
 	return &Registry{
-		mu:         &sync.Mutex{},
-		counters:   map[string]*Counter{},
-		histograms: map[string]*Histogram{},
-		gauges:     map[string]*Gauge{},
-		funcGauges: map[string]*FuncGauge{},
-		descs:      map[string]string{},
+		mu:          &sync.Mutex{},
+		counters:    map[string]*Counter{},
+		counterVecs: map[string]*CounterVec{},
+		histograms:  map[string]*Histogram{},
+		gauges:      map[string]*Gauge{},
+		funcGauges:  map[string]*FuncGauge{},
+		descs:       map[string]string{},
 	}
 }
 
@@ -198,13 +200,14 @@ func NewRegistry() *Registry {
 // 注意：子表与父表共享同一组 map，Reset() 对子表仅清除其前缀下的指标，不影响父表其余指标。
 func (r *Registry) Subsystem(name string) *Registry {
 	return &Registry{
-		mu:         r.mu,
-		counters:   r.counters,
-		histograms: r.histograms,
-		gauges:     r.gauges,
-		funcGauges: r.funcGauges,
-		descs:      r.descs,
-		prefix:     r.prefix + name + "_",
+		mu:          r.mu,
+		counters:    r.counters,
+		counterVecs: r.counterVecs,
+		histograms:  r.histograms,
+		gauges:      r.gauges,
+		funcGauges:  r.funcGauges,
+		descs:       r.descs,
+		prefix:      r.prefix + name + "_",
 	}
 }
 
@@ -257,6 +260,28 @@ func (r *Registry) CounterWithHelp(name, help string) *Counter {
 	c := r.Counter(name)
 	r.setDesc(name, help)
 	return c
+}
+
+// CounterVec 取得（不存在则创建）命名 counter 向量（带标签维度，cycle #117）。
+// labelNames 为标签维度名（如 "code","method"），首次创建时确定；适合「同一指标按
+// 状态码/方法等维度切片」的场景，如 http_responses_total{code,method}。
+func (r *Registry) CounterVec(name string, labelNames ...string) *CounterVec {
+	name = r.name(name)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if v, ok := r.counterVecs[name]; ok {
+		return v
+	}
+	v := NewCounterVec(labelNames...)
+	r.counterVecs[name] = v
+	return v
+}
+
+// CounterVecWithHelp 取得命名 counter 向量并登记 HELP 描述。
+func (r *Registry) CounterVecWithHelp(name, help string, labelNames ...string) *CounterVec {
+	v := r.CounterVec(name, labelNames...)
+	r.setDesc(name, help)
+	return v
 }
 
 // GaugeWithHelp 取得命名瞬时值并登记 HELP 描述。
@@ -373,6 +398,12 @@ func (r *Registry) Snapshot() map[string]interface{} {
 			hists[k] = v.Snapshot()
 		}
 	}
+	cvecs := make(map[string]map[string]int64, len(r.counterVecs))
+	for k, v := range r.counterVecs {
+		if r.prefix == "" || strings.HasPrefix(k, r.prefix) {
+			cvecs[k] = v.Snapshot()
+		}
+	}
 	gauges := make(map[string]float64, len(r.gauges))
 	for k, v := range r.gauges {
 		if r.prefix == "" || strings.HasPrefix(k, r.prefix) {
@@ -385,9 +416,10 @@ func (r *Registry) Snapshot() map[string]interface{} {
 		}
 	}
 	return map[string]interface{}{
-		"counters":   counters,
-		"histograms": hists,
-		"gauges":     gauges,
+		"counters":    counters,
+		"counterVecs": cvecs,
+		"histograms":  hists,
+		"gauges":      gauges,
 	}
 }
 
@@ -398,6 +430,7 @@ func (r *Registry) Reset() {
 	defer r.mu.Unlock()
 	if r.prefix == "" {
 		r.counters = map[string]*Counter{}
+		r.counterVecs = map[string]*CounterVec{}
 		r.histograms = map[string]*Histogram{}
 		r.gauges = map[string]*Gauge{}
 		r.funcGauges = map[string]*FuncGauge{}
@@ -524,7 +557,25 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 				"# TYPE %s_p50 gauge\n%s_p50 %g\n"+
 				"# TYPE %s_p95 gauge\n%s_p95 %g\n"+
 				"# TYPE %s_p99 gauge\n%s_p99 %g\n",
-			sn, sn, h.Count, sn, sn, h.Sum, sn, sn, h.P50, sn, sn, h.P95, sn, sn, h.P99); err != nil {
+			sn, sn, h.Count, sn, sn, h.Sum, 			sn, sn, h.P50, sn, sn, h.P95, sn, sn, h.P99); err != nil {
+			return err
+		}
+	}
+
+	// 带标签维度的 counter 向量（cycle #117）：每个向量按 label 组合输出多条序列。
+	r.mu.Lock()
+	cvecNames := make([]string, 0, len(r.counterVecs))
+	for k := range r.counterVecs {
+		cvecNames = append(cvecNames, k)
+	}
+	r.mu.Unlock()
+	sort.Strings(cvecNames)
+	for _, name := range cvecNames {
+		sn := sanitizeMetricName(name)
+		if _, err := io.WriteString(w, r.helpLine(name, sn)); err != nil {
+			return err
+		}
+		if err := r.counterVecs[name].WritePrometheus(w, name, ""); err != nil {
 			return err
 		}
 	}
