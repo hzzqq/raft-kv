@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–105，共 67 轮交付；时间跨度 2026-07-22 ~ 2026-07-25。
+> 覆盖 cycle 39–107，共 69 轮交付；时间跨度 2026-07-22 ~ 2026-07-25。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -110,6 +110,8 @@
 - **[103] `docs_endpoint_checker`** — 网关端点/CLI 与文档一致性自动校验器 + CI 门禁（隐性：端点新增/改名后文档是否同步只能靠人工通读,无自动化断言(与 #241 同属 no-go 文档工程化缺口)；score=13）
 - **[104] `docs_metrics_checker`** — 指标注册名与文档一致性自动校验器+CI门禁（隐性：指标新增/改名后文档是否同步只能靠人工,无自动化断言(no-go 下更易劣化)；score=15）
 - **[105] `doc_api_gate`** — kvcli.Client/util 公共 API 与文档一致性自动校验器+CI门禁（隐性：5 个 util 公共类型(BufferPool/Closer/CbState/MultiLimiter/TokenBucket)零文档,外部复用者无从知晓其存在;且 Client 方法改名/删除后文档漂移无断言；score=17）
+- **[106] `gen_changelog`** — 迭代交付记录自动生成 CHANGELOG.md + --verify 同步门禁（隐性：state.json 迭代日志存于隐藏工作目录,对用户/审计不可见;且交付历史易与实际脱节；score=16）
+- **[107] `go_patterns_scan`** — Go 反模式免编译静态扫描器+CI门禁（隐性：ioutil/非测试 time.After 等已根治坏味道无自动守卫,后续改动易悄然回归;纯文本扫描可免 Go 工具链；score=15）
 
 ---
 

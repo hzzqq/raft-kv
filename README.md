@@ -218,6 +218,22 @@ export GO111MODULE=on
 - **`labrpc` 关闭 server 时排空在途 RPC**：`Server.loop` 在 `done` 关闭后排空 `ch` 并关闭每条 pending 的 `m.done`；`Send` 通过 `select` 在 server 被关停时直接返回 `false`（按"不可达"重试），消除节点重启竞态导致的死锁。
 - **`AppendEntries` 仅在日志真正变化时才持久化**：心跳（无新条目）不再重写整个状态，避免每 110ms 一次的全量 gob 序列化。
 
+## 工程化自检脚本（`scripts/`，免 Go 工具链）
+
+自驱迭代沉淀了一批纯 Python 静态校验器，可在无 `go` 环境复跑，统一由
+[`scripts/check_all.py`](scripts/check_all.py) 编排（一条命令跑完全部，给出 PASS/FAIL 汇总，
+任一失败即返回非 0，可直接作 pre-commit / CI 门禁）。亦可经 `./scripts/ci-local.sh docs`
+在本机复现 CI 的文档门禁。
+
+| 脚本 | 校验内容 | 门禁强度 |
+|------|----------|----------|
+| `check_md_links.py` | 全仓 Markdown 内部链接 / 锚点可解析性 | 硬阻断 |
+| `check_docs_endpoints.py` | 网关 18 端点 + kvcli 4 CLI 子命令 与文档一致 | 硬阻断 |
+| `check_metrics_docs.py` | 指标注册名（51 个）与文档一致 | 硬阻断（臆造仅提示） |
+| `check_api_docs.py` | `kvcli.Client` 32 方法 + `util` 16 类型 与文档一致 | 硬阻断（前向缺失/反向漂移）+ 提示 |
+| `gen_changelog.py --verify` | [`CHANGELOG.md`](CHANGELOG.md) 与迭代日志同步 | 硬阻断 |
+| `check_go_patterns.py` | `ioutil.` / 非测试 `time.After` 反模式 | 硬阻断 + 提示 |
+
 ## 验证状态说明
 - 自驱开发的逐轮交付记录自动汇总于 [`CHANGELOG.md`](CHANGELOG.md)（由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 生成，CI 以 `--verify` 保证其与迭代日志同步）。
 - Labs 2–3、`shardmaster`、`shardkv` 均已在本地 Go 1.22.5 下通过 `go vet` + `go test`（含 `-count=1`）验证，并纳入 GitHub Actions CI（`vet` + `test` + `race` + 非阻断 `lint` + `coverage` 上传）。
