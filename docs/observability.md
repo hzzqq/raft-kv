@@ -83,6 +83,7 @@
 |------|------|------|
 | `gw_uptime_seconds` / `gw_goroutines` | FuncGauge | 进程运行时长 / 当前 goroutine 数（goroutine 暴涨 = 泄漏前兆） |
 | `http_requests_total` / `http_request_latency_ms` | Counter / Histogram | HTTP 请求数 / 处理延迟 |
+| `http_responses_304` | Counter | 304 Not Modified 响应数（客户端缓存命中，零字节体；与 `http_requests_total` 互补） |
 | `gateway_concurrent_in_use` | Gauge | 当前在途请求数（对照 `max_concurrent=64`；持续打满 = 后端变慢或上游并发过高） |
 | `gateway_ratelimit_concurrent_total` | Counter | 全局并发限流触发次数（429） |
 | `gateway_ratelimit_client_total` | Counter | 单客户端令牌桶限流触发（429） |

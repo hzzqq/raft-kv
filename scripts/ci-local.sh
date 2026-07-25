@@ -20,6 +20,8 @@ run_docs() {
   python3 scripts/check_md_links.py .
   echo "==> [docs] 校验网关端点/CLI 与文档一致性"
   python3 scripts/check_docs_endpoints.py
+  echo "==> [docs] 校验指标注册名与文档一致性"
+  python3 scripts/check_metrics_docs.py
 }
 
 run_test() {
