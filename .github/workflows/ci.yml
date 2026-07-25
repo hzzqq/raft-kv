@@ -186,6 +186,9 @@ jobs:
       - name: Verify CHANGELOG.md in sync with dev log
         run: python3 scripts/gen_changelog.py --verify
 
+      - name: Scan Go anti-patterns (no Go toolchain needed)
+        run: python3 scripts/check_go_patterns.py
+
   # 覆盖率：跑全量测试，生成 cover.out 并上传为 artifact。
   coverage:
     runs-on: ubuntu-latest

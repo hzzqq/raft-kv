@@ -26,6 +26,8 @@ run_docs() {
   python3 scripts/check_api_docs.py
   echo "==> [docs] 校验 CHANGELOG.md 与 state.json 迭代日志同步"
   python3 scripts/gen_changelog.py --verify
+  echo "==> [static] 校验 Go 反模式(免编译): ioutil/非测试 time.After 硬阻断, fmt.Print/panic/TODO 提示"
+  python3 scripts/check_go_patterns.py
 }
 
 run_test() {
