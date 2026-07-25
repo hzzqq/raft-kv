@@ -192,6 +192,9 @@ jobs:
       - name: Check checker-suite wiring consistency (meta)
         run: python3 scripts/check_doc_inventory.py
 
+      - name: Check coverage.md vs checker inventory (meta)
+        run: python3 scripts/check_coverage_doc.py
+
       - name: Scan Go anti-patterns (no Go toolchain needed)
         run: python3 scripts/check_go_patterns.py
 

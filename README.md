@@ -236,6 +236,7 @@ export GO111MODULE=on
 | `check_go_patterns.py` | `ioutil.` / 非测试 `time.After` 反模式 | 硬阻断 + 提示 |
 | `pre-commit.sh` | 提交前门禁：串起上述全部校验，任一失败即阻断 `git commit` | 安装：`make hooks` |
 | `check_doc_inventory.py` | 校验器套件自身接线一致性：每个 `check_*.py` 须同时接入 `check_all` / `ci.yml` / `README`，防 harness 自身漂移 | 硬阻断 |
+| `check_coverage_doc.py` | 校验 [`docs/coverage.md`](docs/coverage.md) 已列全 `scripts/` 下全部校验器，防工程化收口文档漂移 | 硬阻断 |
 
 > 本机复跑入口：`make docs`（等价于 CI `docs-links` job，免 Go）；`make hooks` 安装提交前门禁，从根上阻止文档漂移 / CHANGELOG 失配 / 日志污染被提交进树。
 

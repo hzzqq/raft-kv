@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–112，共 70 轮交付；时间跨度 2026-07-22 ~ 2026-07-25。
+> 覆盖 cycle 39–113，共 71 轮交付；时间跨度 2026-07-22 ~ 2026-07-25。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -113,6 +113,7 @@
 - **[108] `check_all_orchestrator`** — 统一自检编排器 check_all.py + README 脚本索引（隐性：6 个免 Go 校验器零散调用易漏跑,scripts 模块零文档;CHANGELOG 与 state 漂移无单入口发现；score=15）
 - **[110] `state_integrity_gate`** — 自驱开发日志完整性校验器 + gen_changelog 去重韧性（隐性：state.json log 已被注入 cycle65/66 重复条目,静默击穿 gen_changelog --verify,CI docs-links 实际已失败却无人察觉(审计链污染)；score=17）
 - **[112] `checker_inventory_meta`** — 校验器套件接线一致性 meta 门禁（隐性：新增 8 个免 Go 校验器后,任一漏接 check_all/ci.yml/README 即产生门禁盲区且无人察觉(harness 自身漂移风险)；score=15）
+- **[113] `coverage_doc_meta`** — coverage.md 与校验器清单一致性 meta 门禁 + 刷新过时覆盖率文档（隐性：coverage.md 仍停在 #235 时代未列 8 校验器,误导审计以为工程化收口维度缺失(harness 已覆盖却文档不体现)；score=15）
 
 ---
 

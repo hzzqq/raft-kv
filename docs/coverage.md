@@ -33,6 +33,30 @@ total:  (statements)  74.2%
 > 以及文档同步(#231–#234，含新增 `docs/observability.md` 统一指标总览）。故当前真实覆盖率应高于上表。
 > 重新生成请用 `make cover`。
 
+## 免 Go 自检门禁（scripts/）
+
+仓库在自驱迭代（cycle 68 起）沉淀了一套**不依赖 Go 工具链**的纯 Python 静态校验器，
+统一由 [`scripts/check_all.py`](../scripts/check_all.py) 编排、CI `docs-links` job 与 `make docs`
+复跑，并由 `scripts/pre-commit.sh`（`make hooks` 安装）在提交前阻断漂移。它本身就是
+本覆盖率快照**之外**的工程化收口，由 3 个 meta 校验器守护自身一致性：
+
+| 校验器 | 守护维度 |
+|---------|----------|
+| `check_md_links.py` | 全仓 Markdown 内部链接 / 锚点可解析 |
+| `check_docs_endpoints.py` | 网关 18 端点 + kvcli 4 CLI 子命令 与文档一致 |
+| `check_metrics_docs.py` | 指标注册名（51 个）与文档一致 |
+| `check_api_docs.py` | `kvcli.Client` 32 方法 + `util` 16 类型 与文档一致 |
+| `gen_changelog.py --verify` | `CHANGELOG.md` 与迭代日志同步 |
+| `check_state_integrity.py` | 自驱开发日志（state.json）完整性 |
+| `check_doc_inventory.py` | 校验器套件自身接线一致性（meta） |
+| `check_coverage_doc.py` | 本文件（coverage.md）与校验器清单一致（meta） |
+| `check_go_patterns.py` | `ioutil.` / 非测试 `time.After` 反模式 |
+
+> 数值覆盖率快照仅为「信息性」参考；上述门禁才是本仓**持续保证**代码/文档不漂移的机制。
+> 本机交互 shell 默认无 `go`（且托管 Go 无 gcc，故 `go test -race` 仅能在 CI 侧跑），
+> 故这类免 Go 检查器是本地验证的主力；Go 侧 `vet/test/race/cover` 见 CI 各 job。
+
+
 ## 近期新增 cluster-free 单测（#212 起，不触发进程内 Raft 选举，规避 Windows `time.Now()` 分辨率 flaky）
 
 | 测试文件 | 覆盖的增量能力 |
