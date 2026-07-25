@@ -70,6 +70,9 @@ demo result: inproc Put/Get="world" Append/Get="world!" after-move Get="world!" 
 - **全栈 HTTP 路径**：以本进程集群的 `Clerk` 起一个真正的 HTTP 网关，客户端经
   HTTP 做 Put/Get/Append，并拉取 `/metrics`，证明 `cluster → HTTP → client` 全栈打通。
 
+> 启动诊断（环境自检 / `RAFT_KV_DEMO_QUIET` / HTTP 端点与验证结论）的逐条说明见
+> [端到端演示深读](demo.md)。
+
 ---
 
 ## 3. gateway（`src/gateway`，HTTP REST 网关）

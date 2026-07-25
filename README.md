@@ -52,7 +52,8 @@ raft-kv/
 > [`docs/architecture.md`](docs/architecture.md)；测试覆盖率快照见
 > [`docs/coverage.md`](docs/coverage.md)；ShardKV 数据面深层设计笔记见
 > [`docs/lab4-shardkv-design.md`](docs/lab4-shardkv-design.md)；线上排障与可观测性手册见
-> [`docs/runbook.md`](docs/runbook.md)。
+> [`docs/runbook.md`](docs/runbook.md)；端到端演示（进程内集群 + 全栈 HTTP）说明见
+> [`docs/demo.md`](docs/demo.md)。
 
 ## 快速启动
 
