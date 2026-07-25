@@ -18,6 +18,8 @@ RUN="${1:-all}"
 run_docs() {
   echo "==> [docs] 校验 Markdown 内部链接一致性（不依赖 Go 工具链）"
   python3 scripts/check_md_links.py .
+  echo "==> [docs] 校验网关端点/CLI 与文档一致性"
+  python3 scripts/check_docs_endpoints.py
 }
 
 run_test() {
