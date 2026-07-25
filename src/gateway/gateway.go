@@ -702,9 +702,7 @@ func (s *Server) replayCache(w http.ResponseWriter, cv *cacheVal, start time.Tim
 	w.Write(cv.Body)
 	reqID := w.Header().Get("X-Request-ID")
 	s.recordAccess(r.Method, r.URL.Path, cv.Status, time.Since(start), reqID)
-	Metrics.Counter("http_requests_total").Inc()
-	Metrics.Counter(fmt.Sprintf("http_responses_%d", cv.Status)).Inc()
-	Metrics.Histogram("http_request_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
+	s.recordRequestMetrics(r.Method, cv.Status, float64(time.Since(start).Microseconds())/1000.0)
 }
 
 // SetETag 开启 ETag / 条件 GET（生产可用）。对 GET 200 响应计算 ETag 并回写，
@@ -743,6 +741,9 @@ func (s *Server) SetTestDelay(d time.Duration) { s.testDelay = d }
 // c 为 nil 时构造一个不依赖内存集群的实例（仅用于暴露 gRPC 等独立服务）。
 func NewServer(c *cluster.Cluster) *Server {
 	s := &Server{sem: util.NewSemaphore(maxConcurrent), accessCap: 256, logCap: 256, requestTimeout: 30 * time.Second, clientLimiters: make(map[string]*tokenBucket), clientRate: 200, clientBurst: 40, maxBodySize: 1 << 20, compress: true, secHeaders: true, startedAt: time.Now(), version: "dev", breakerCooldown: 10 * time.Second, breakerThreshold: 5}
+	// 登记请求指标 HELP 描述（cycle #118，Prometheus 规范），便于 /metrics 输出可读说明。
+	Metrics.CounterVecWithHelp("http_requests_total", "Total HTTP requests served, labeled by method.", "method")
+	Metrics.CounterVecWithHelp("http_responses_total", "Total HTTP responses served, labeled by code and method.", "code", "method")
 	if c != nil {
 		s.c = c
 		s.clerk = c.Clerk()
@@ -970,8 +971,7 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			if inm := r.Header.Get("If-None-Match"); inm != "" && s.etagMatches(s.cacheKey(r), inm) {
 				w.WriteHeader(http.StatusNotModified)
 				s.recordAccess(r.Method, r.URL.Path, http.StatusNotModified, time.Since(start), reqID)
-				Metrics.Counter("http_requests_total").Inc()
-				Metrics.Counter("http_responses_304").Inc()
+				s.recordRequestMetrics(r.Method, http.StatusNotModified, float64(time.Since(start).Microseconds())/1000.0)
 				return
 			}
 		}
@@ -1063,11 +1063,9 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			s.logf(levelInfo, "request", fields)
 		}
 		record(st, time.Since(start))
-		// 网关自身指标埋点（与 KV 层 shardkv.Metrics 分离）：请求总数、按状态码分桶计数、
-		// 以及请求延迟直方图。纯原子操作，零行为影响；供 /metrics 统一暴露。
-		Metrics.Counter("http_requests_total").Inc()
-		Metrics.Counter(fmt.Sprintf("http_responses_%d", st)).Inc()
-		Metrics.Histogram("http_request_latency_ms").Record(float64(time.Since(start).Microseconds()) / 1000.0)
+		// 网关自身指标埋点（与 KV 层 shardkv.Metrics 分离）：请求总数（按 method）、
+		// 响应总数（按 code,method）、以及请求延迟直方图。纯观测，零行为影响；供 /metrics 统一暴露。
+		s.recordRequestMetrics(r.Method, st, float64(time.Since(start).Microseconds())/1000.0)
 		// #205：响应体大小直方图（线上字节，gzip 开启时为压缩后字节），与延迟直方图
 		// 并列，供 /metrics 观测带宽与大响应分布。纯观测，零行为影响。
 		Metrics.Histogram("gateway_response_bytes").Record(float64(mw.respBytes))
@@ -1096,6 +1094,17 @@ func (s *Server) recordAccess(method, path string, status int, d time.Duration, 
 		s.accessLog = s.accessLog[len(s.accessLog)-s.accessCap:]
 	}
 	s.accessMu.Unlock()
+}
+
+// recordRequestMetrics 更新网关请求级聚合指标：请求总数（按 method 切片）、
+// 响应总数（按 code,method 切片）、以及请求延迟直方图。采用带标签 CounterVec
+// （cycle #118），使运维可在单指标内按方法/状态码切片，直接算错误率与分方法 QPS，
+// 取代此前「http_responses_<code>」式独立指标名（缺 method 维度、无法聚合）。
+// 纯观测，零行为影响。
+func (s *Server) recordRequestMetrics(method string, status int, latencyMs float64) {
+	Metrics.CounterVec("http_requests_total", "method").WithLabelValues(method).Inc()
+	Metrics.CounterVec("http_responses_total", "code", "method").WithLabelValues(strconv.Itoa(status), method).Inc()
+	Metrics.Histogram("http_request_latency_ms").Record(latencyMs)
 }
 
 // handleDebugAccessLog 返回进程内访问日志的最近 N 条（默认 50，可用 ?limit= 覆盖），

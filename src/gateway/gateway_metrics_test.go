@@ -29,21 +29,28 @@ func TestGatewayRequestMetrics(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(h))
 	defer ts.Close()
 
-	// 发两次请求 -> 应记录 2 次请求总数、2 次 200 响应。
+	// 发两次 GET 请求 -> 应记录 2 次请求总数、2 次 200 响应。
 	http.Get(ts.URL + "/x")
 	http.Get(ts.URL + "/x")
-
-	if got := Metrics.Counter("http_requests_total").Value(); got < 2 {
-		t.Fatalf("http_requests_total = %d, want >= 2", got)
+	// 再发一次 POST -> 验证 method 维度（cycle #118 新增能力）独立成序列。
+	if _, err := http.Post(ts.URL+"/x", "text/plain", nil); err != nil {
+		t.Fatalf("POST /x: %v", err)
 	}
-	if got := Metrics.Counter("http_responses_200").Value(); got < 2 {
-		t.Fatalf("http_responses_200 = %d, want >= 2", got)
+	if got := Metrics.CounterVec("http_requests_total", "method").WithLabelValues("POST").Value(); got < 1 {
+		t.Fatalf("http_requests_total{method=POST} = %d, want >= 1 (method dimension missing)", got)
+	}
+
+	if got := Metrics.CounterVec("http_requests_total", "method").WithLabelValues("GET").Value(); got < 2 {
+		t.Fatalf("http_requests_total{method=GET} = %d, want >= 2", got)
+	}
+	if got := Metrics.CounterVec("http_responses_total", "code", "method").WithLabelValues("200", "GET").Value(); got < 2 {
+		t.Fatalf("http_responses_total{code=200,method=GET} = %d, want >= 2", got)
 	}
 	if got := Metrics.Histogram("http_request_latency_ms").Snapshot().Count; got < 2 {
 		t.Fatalf("http_request_latency_ms count = %d, want >= 2", got)
 	}
 
-	// Prometheus 分支：应含网关指标序列名。
+	// Prometheus 分支：应含网关指标序列名（带标签维度）。
 	prec := httptest.NewRecorder()
 	preq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	preq.Header.Set("Accept", "text/plain; version=0.0.4")
@@ -52,8 +59,11 @@ func TestGatewayRequestMetrics(t *testing.T) {
 		t.Fatalf("handleMetrics(prom) status = %d, want 200", prec.Code)
 	}
 	pbody := prec.Body.String()
-	if !strings.Contains(pbody, "http_requests_total") {
-		t.Fatalf("prometheus output missing gateway metric http_requests_total:\n%s", pbody)
+	if !strings.Contains(pbody, `http_requests_total{method="GET"}`) {
+		t.Fatalf("prometheus output missing labeled http_requests_total:\n%s", pbody)
+	}
+	if !strings.Contains(pbody, `http_responses_total{code="200",method="GET"}`) {
+		t.Fatalf("prometheus output missing labeled http_responses_total:\n%s", pbody)
 	}
 
 	// JSON 分支：顶层仍含 counters/histograms（KV 层），并新增 gateway 子键。
