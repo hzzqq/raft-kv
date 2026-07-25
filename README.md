@@ -232,7 +232,11 @@ export GO111MODULE=on
 | `check_metrics_docs.py` | 指标注册名（51 个）与文档一致 | 硬阻断（臆造仅提示） |
 | `check_api_docs.py` | `kvcli.Client` 32 方法 + `util` 16 类型 与文档一致 | 硬阻断（前向缺失/反向漂移）+ 提示 |
 | `gen_changelog.py --verify` | [`CHANGELOG.md`](CHANGELOG.md) 与迭代日志同步 | 硬阻断 |
+| `check_state_integrity.py` | 自驱开发日志（`state.json`）完整性：重复 `(task_id,cycle)` 对 / `cycle` 越界 / `score` 越界 / 必填缺失 / 非单调 | 硬阻断 |
 | `check_go_patterns.py` | `ioutil.` / 非测试 `time.After` 反模式 | 硬阻断 + 提示 |
+| `pre-commit.sh` | 提交前门禁：串起上述全部校验，任一失败即阻断 `git commit` | 安装：`make hooks` |
+
+> 本机复跑入口：`make docs`（等价于 CI `docs-links` job，免 Go）；`make hooks` 安装提交前门禁，从根上阻止文档漂移 / CHANGELOG 失配 / 日志污染被提交进树。
 
 ## 验证状态说明
 - 自驱开发的逐轮交付记录自动汇总于 [`CHANGELOG.md`](CHANGELOG.md)（由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 生成，CI 以 `--verify` 保证其与迭代日志同步）。

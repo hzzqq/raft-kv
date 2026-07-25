@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–108，共 68 轮交付；时间跨度 2026-07-22 ~ 2026-07-25。
+> 覆盖 cycle 39–110，共 69 轮交付；时间跨度 2026-07-22 ~ 2026-07-25。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -111,6 +111,7 @@
 - **[106] `gen_changelog`** — 迭代交付记录自动生成 CHANGELOG.md + --verify 同步门禁（隐性：state.json 迭代日志存于隐藏工作目录,对用户/审计不可见;且交付历史易与实际脱节；score=16）
 - **[107] `go_patterns_scan`** — Go 反模式免编译静态扫描器+CI门禁（隐性：ioutil/非测试 time.After 等已根治坏味道无自动守卫,后续改动易悄然回归;纯文本扫描可免 Go 工具链；score=15）
 - **[108] `check_all_orchestrator`** — 统一自检编排器 check_all.py + README 脚本索引（隐性：6 个免 Go 校验器零散调用易漏跑,scripts 模块零文档;CHANGELOG 与 state 漂移无单入口发现；score=15）
+- **[110] `state_integrity_gate`** — 自驱开发日志完整性校验器 + gen_changelog 去重韧性（隐性：state.json log 已被注入 cycle65/66 重复条目,静默击穿 gen_changelog --verify,CI docs-links 实际已失败却无人察觉(审计链污染)；score=17）
 
 ---
 

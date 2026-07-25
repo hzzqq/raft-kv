@@ -2,7 +2,7 @@
 GO ?= go
 export PATH := $(PATH):/c/Users/Administrator/.workbuddy/binaries/go/go/bin
 
-.PHONY: build vet test test-shardkv test-all test-race fmt bench clean lint cover test-cover build-binaries demo serve serve-bg stop cli smoke
+.PHONY: build vet test test-shardkv test-all test-race fmt bench clean lint cover test-cover build-binaries demo serve serve-bg stop cli smoke hooks docs
 
 build:
 	$(GO) build ./...
@@ -75,6 +75,20 @@ cover:
 
 # 与 cover 同义，方便记忆。
 test-cover: cover
+
+# 安装提交前门禁：把 scripts/pre-commit.sh 装入 .git/hooks/pre-commit，
+# 使每次 git commit 自动跑全部免 Go 静态自检（CHANGELOG 同步 / 文档一致性 /
+# 日志完整性），任一失败即阻断提交——避免漂移类缺陷被静默落库。
+hooks:
+	@mkdir -p .git/hooks
+	cp scripts/pre-commit.sh .git/hooks/pre-commit
+	@chmod +x .git/hooks/pre-commit 2>/dev/null || true
+	@echo "已安装 pre-commit 钩子（运行 make hooks 可续装 / 重装）。"
+
+# 仅跑免 Go 文档/日志门禁（等价于 CI docs-links job 的本地入口，
+# 不依赖 go/gcc，可在任意环境复跑）。
+docs:
+	$(PYTHON3) scripts/check_all.py
 
 # 格式检查：列出 ./src 下未通过 gofmt 的文件。默认不自动 -w，避免波及上游 6.824
 # 起始代码；如需就地重写本轮回改动文件，可手动：gofmt -w ./src/<pkg>。
