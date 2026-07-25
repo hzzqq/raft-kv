@@ -27,6 +27,10 @@ type CircuitBreaker struct {
 	cooldown      time.Duration
 	openedAt      time.Time
 	now           func() time.Time
+	// probesInFlight 是半开窗口内已放行、尚未出结论的探针数。用于把并发探测限制在
+	// successThresh 以内，避免 Open→HalfOpen 后对刚恢复（或仍不稳定）的下游造成
+	// 探测洪泛（惊群）；其余并发请求在探针结果回来前一律快速失败。
+	probesInFlight int
 }
 
 // NewCircuitBreaker 创建熔断器；threshold/successThresh/cooldown 非正时取安全默认值。
@@ -50,11 +54,25 @@ func NewCircuitBreaker(threshold, successThresh int, cooldown time.Duration) *Ci
 }
 
 // Allow 返回当前是否允许放行请求（Open 且冷却未到返回 false）。
+// 半开窗口内最多放行 successThresh 个并发探针，其余并发请求一律快速失败，
+// 避免对恢复中的下游造成探测洪泛。调用方须对放行的探针调用 RecordSuccess/RecordFailure
+// 给出结论，释放在途名额。
 func (cb *CircuitBreaker) Allow() bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.maybeHalfOpen()
-	return cb.state != CBOpen
+	switch cb.state {
+	case CBOpen:
+		return false
+	case CBHalfOpen:
+		if cb.probesInFlight >= cb.successThresh {
+			return false // 在途探针已达上限，其余快速失败
+		}
+		cb.probesInFlight++
+		return true
+	default: // CBClosed
+		return true
+	}
 }
 
 // maybeHalfOpen 内部：Open 且冷却超时则转 HalfOpen（重置试探计数）。调用方须持锁。
@@ -63,6 +81,7 @@ func (cb *CircuitBreaker) maybeHalfOpen() {
 		cb.state = CBHalfOpen
 		cb.successes = 0
 		cb.failures = 0
+		cb.probesInFlight = 0 // 进入半开，允许最多 successThresh 个探针
 	}
 }
 
@@ -75,11 +94,15 @@ func (cb *CircuitBreaker) RecordSuccess() {
 	case CBClosed:
 		cb.failures = 0
 	case CBHalfOpen:
+		if cb.probesInFlight > 0 {
+			cb.probesInFlight-- // 该探针已出结论，释放在途名额
+		}
 		cb.successes++
 		if cb.successes >= cb.successThresh {
 			cb.state = CBClosed
 			cb.failures = 0
 			cb.successes = 0
+			cb.probesInFlight = 0
 		}
 	}
 }
@@ -95,11 +118,13 @@ func (cb *CircuitBreaker) RecordFailure() {
 		if cb.failures >= cb.threshold {
 			cb.state = CBOpen
 			cb.openedAt = cb.now()
+			cb.probesInFlight = 0
 		}
 	case CBHalfOpen:
 		cb.state = CBOpen
 		cb.openedAt = cb.now()
 		cb.successes = 0
+		cb.probesInFlight = 0
 	}
 }
 
