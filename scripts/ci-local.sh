@@ -24,6 +24,8 @@ run_docs() {
   python3 scripts/check_metrics_docs.py
   echo "==> [docs] 校验 kvcli.Client / util 公共 API 与文档一致性"
   python3 scripts/check_api_docs.py
+  echo "==> [docs] 校验 CHANGELOG.md 与 state.json 迭代日志同步"
+  python3 scripts/gen_changelog.py --verify
 }
 
 run_test() {

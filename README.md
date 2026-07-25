@@ -219,6 +219,7 @@ export GO111MODULE=on
 - **`AppendEntries` 仅在日志真正变化时才持久化**：心跳（无新条目）不再重写整个状态，避免每 110ms 一次的全量 gob 序列化。
 
 ## 验证状态说明
+- 自驱开发的逐轮交付记录自动汇总于 [`CHANGELOG.md`](CHANGELOG.md)（由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 生成，CI 以 `--verify` 保证其与迭代日志同步）。
 - Labs 2–3、`shardmaster`、`shardkv` 均已在本地 Go 1.22.5 下通过 `go vet` + `go test`（含 `-count=1`）验证，并纳入 GitHub Actions CI（`vet` + `test` + `race` + 非阻断 `lint` + `coverage` 上传）。
 - 本机交互 shell 默认无 `go`，但仓库随附的托管 Go 工具链（`C:/Users/Administrator/.workbuddy/binaries/go/go/bin/go.exe`）可用于本地验证；该环境**无 gcc**，故 `go test -race` 仅能在 CI（GitHub ubuntu + gcc）侧运行，`shardkv` 的并发/冻结类回归以「高频 churn + 多轮循环」测试替代 race detector 来暴露。
 - 自动化纪律：每次改动本地提交、验收不过绝不提交；**前多轮自主迭代（cycle 1–28、cycle 29–38、cycle 39–48、cycle 49–57、cycle 58–67）已按用户授权执行 `git push origin master`（仅普通推送、不 --force、不 `rm -rf`）**（见 `docs/lab4-shardkv-design.md` 与 `.workbuddy/self-driving/state.json`）。**本轮迭代（cycle 68–87，「照刚刚的迭代20次」：raft leader lease + ShardKV ReadIndex 快读复活 / 配置号幂等 `installedCfgNum` + ReMigration 冻结修复 / shardmaster 最小搬动 + 输入校验 `ErrInvalid` / 网关并发限流 429 + 优雅退出 `Shutdown` + `/debug/groups` / kvraft 客户端会话 GC / metrics 新增 Gauge 与多项指标 / 混沌测试 I16/I18 + CI 竞态与长时 job）同样获得用户授权，将在全量 `build+vet+test` 通过后执行 `git push origin master`（仅 fast-forward）**。

@@ -183,6 +183,9 @@ jobs:
       - name: Check kvcli.Client / util public API vs docs consistency
         run: python3 scripts/check_api_docs.py
 
+      - name: Verify CHANGELOG.md in sync with dev log
+        run: python3 scripts/gen_changelog.py --verify
+
   # 覆盖率：跑全量测试，生成 cover.out 并上传为 artifact。
   coverage:
     runs-on: ubuntu-latest
