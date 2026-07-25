@@ -82,8 +82,8 @@
 | 指标 | 类型 | 含义 |
 |------|------|------|
 | `gw_uptime_seconds` / `gw_goroutines` | FuncGauge | 进程运行时长 / 当前 goroutine 数（goroutine 暴涨 = 泄漏前兆） |
-| `http_requests_total` / `http_request_latency_ms` | Counter / Histogram | HTTP 请求数 / 处理延迟 |
-| `http_responses_304` | Counter | 304 Not Modified 响应数（客户端缓存命中，零字节体；与 `http_requests_total` 互补） |
+| `http_requests_total{method}` / `http_request_latency_ms` | CounterVec / Histogram | HTTP 请求数（按 `method` 切片，可算分方法 QPS）/ 处理延迟 |
+| `http_responses_total{code,method}` | CounterVec | HTTP 响应数，按 `code`+`method` 切片（取代旧 `http_responses_<code>` 式独立指标名）。**错误率** = `sum(http_responses_total{code=~"5.."}) / sum(http_requests_total)`；304 等亦纳入此指标（`code="304"`，不再单独计数） |
 | `gateway_concurrent_in_use` | Gauge | 当前在途请求数（对照 `max_concurrent=64`；持续打满 = 后端变慢或上游并发过高） |
 | `gateway_ratelimit_concurrent_total` | Counter | 全局并发限流触发次数（429） |
 | `gateway_ratelimit_client_total` | Counter | 单客户端令牌桶限流触发（429） |
@@ -91,6 +91,11 @@
 | `gateway_breaker_trips_total` / `gateway_breaker_open` / `gateway_breaker_rejects_total` | Counter / Gauge / Counter | 熔断跳闸次数 / 当前是否打开 / 熔断拒绝请求数 |
 | `gateway_response_bytes` | Histogram | 响应体传输字节分布 |
 | `raft_min_health_score` | Gauge | 共识健康 **min** 评分（#223）：任一副本 `RaftCheck` 不变量被破坏即拉低，供阈值告警 |
+
+> **指标库原语**：除普通 `Counter`/`Gauge`/`Histogram` 外，指标库还提供带标签的
+> `CounterVec` / `GaugeVec`（见 `src/metrics`），适合「同一指标按 `code`/`method` 等维度切片」
+> 的场景（如 `http_responses_total{code,method}`）。`WithLabelValues` 读路径走 `atomic.Value`
+> 只读快照，**免锁、免分配**（#119 优化），高并发每请求取标签序列不再成为瓶颈。
 
 ---
 

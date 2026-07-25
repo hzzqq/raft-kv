@@ -16,7 +16,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SRC_METRIC_RE = re.compile(
-    r'Metrics\.(?:Counter|Gauge|Histogram|Hist|Summary|FuncGauge)(?:WithHelp)?\(\s*"([^"]+)"'
+    r'Metrics\.(?:Counter|Gauge|Histogram|Hist|Summary|FuncGauge|CounterVec|GaugeVec)(?:WithHelp)?\(\s*"([^"]+)"'
 )
 # 文档里"像指标名"的 token:小写字母+下划线,至少两段
 DOC_METRIC_RE = re.compile(r"\b[a-z]+(?:_[a-z]+){1,}\b")

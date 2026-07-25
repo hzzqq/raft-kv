@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–115，共 73 轮交付；时间跨度 2026-07-22 ~ 2026-07-25。
+> 覆盖 cycle 39–119，共 77 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -18,6 +18,7 @@
 - **[75] `gw_proc_gauges`** — 网关进程级 FuncGauge(uptime_seconds / goroutines) 暴露到 /metrics（隐性：运维无法直接观测进程运行时长与 goroutine 数(泄漏前兆)；score=14）
 - **[82] `gw_debug_raft`** — GET /debug/raft 汇聚端点(各副本 RaftStatus + RaftCheck 自检)（隐性：运维需登录各节点才能看共识健康,脑裂/任期翻滚/apply落后无统一视图；score=16）
 - **[83] `gw_raft_health_metric`** — /metrics 暴露 raft_min_health_score gauge（隐性：raft 健康此前不可被 Prometheus scrape/告警(仅 JSON 端点)；score=15）
+- **[118] `gw_labeled_req_metrics`** — 网关请求指标升级为带标签 CounterVec：http_requests_total{method} + http_responses_total{code,method}（隐性：旧实现用『http_responses_<code>』式独立指标名，缺 method 维度且无法在单指标内切片算错误率/分方法 QPS(R2 隐性可观测缺口)；score=18）
 
 ## kvcli
 
@@ -76,6 +77,12 @@
 
 - **[51] `diag_selfcheck`** — SelfCheck配置链自检（隐性：整链损坏难定位；score=14）
 - **[91] `diagnostics_shardcheck`** — ShardCheck 数据面不变量自检 + 接入 /debug/shards（隐性：诊断包此前只覆盖共识层(RaftCheck)与配置链(SelfCheck),数据面迁移健康(pendingIn/pendingOut 自相矛盾/卡滞)无任何量化信号;且 updateRaftHealthGauge 在 s.c==nil 时 panic(/metrics 早于集群就绪即崩)；score=18）
+
+## metrics
+
+- **[116] `bench_hotpaths`** — 热点路径基准测试(metrics/util/transport 共 9 个 Benchmark)（隐性：经 115 轮后性能维度从未被量化，后续任何优化都无基线可对比(且 GaugeVec.WithLabelValues 91ns/1alloc 的锁+Join 热路径此前不可见)；score=14）
+- **[117] `metrics_countervec`** — metrics.CounterVec 带标签计数器原语 + Registry.CounterVec 访问器(WritePrometheus/Snapshot 导出)（隐性：此前按状态/方法维度计数只能手搓『http_responses_<code>』式独立指标名(见 gateway)，缺 method 维度且无法在单指标内切片算错误率(R2)；score=18）
+- **[119] `metrics_labelvec_lockfree`** — 标签向量读路径免锁化（共享 labelVec 存储：读快照 atomic.Value，写才加锁重建）（隐性：GaugeVec/CounterVec.WithLabelValues 每次取独占锁+分配拼接 key，网关每请求两次调用成多核热点（锁竞争+分配）（R2 隐性性能悬崖）；score=17）
 
 ## version
 
