@@ -223,7 +223,8 @@ export GO111MODULE=on
 自驱迭代沉淀了一批纯 Python 静态校验器，可在无 `go` 环境复跑，统一由
 [`scripts/check_all.py`](scripts/check_all.py) 编排（一条命令跑完全部，给出 PASS/FAIL 汇总，
 任一失败即返回非 0，可直接作 pre-commit / CI 门禁）。亦可经 `./scripts/ci-local.sh docs`
-在本机复现 CI 的文档门禁。
+在本机复现 CI 的文档门禁。开发者本地验证全流程、提交前钩子与自驱迭代约定见
+[`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
 | 脚本 | 校验内容 | 门禁强度 |
 |------|----------|----------|
