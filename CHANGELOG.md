@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–119，共 77 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
+> 覆盖 cycle 39–120，共 78 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -108,6 +108,7 @@
 - **[93] `docs_kvcli_api`** — 补全 kvcli 客户端完整 API 文档(usage.md §4 仅记载 get/put/append/bench/MGet/MSet/SetMaxConcurrent)（隐性：大量库方法(Del/MDel/Exists/Incr/SetNX/Cas/AppendGet/Pipeline/Ping/Healthy/Ready/EnableCache/EnableBreaker/EnableGzip/EnableSingleFlight/WarmUp/Metrics/Close 等) 在文档中完全缺失,用户/开发者无从知晓这些能力存在；score=16）
 - **[94] `docs_migrate_gauges`** — 收口迁移可观测文档(#229 gauge / #230 diagnosis 此前零文档记载)（隐性：shardkv_pending_in/out/owned/total 四个 Prometheus 告警主指标(#229) 与 /debug/shards 的 diagnosis 自检字段(#230) 在 runbook/usage/architecture/coverage 全未记载,运维无法基于其做阈值告警；score=16）
 - **[96] `docs_crosslink_integrity`** — 文档时效收口——coverage.md 仍称 kvraft_status_test.go『尚未提交』(实际 #228 已提交) 且快照框定停于 #212-#226（隐性：coverage.md 与迭代实际进度脱节(迭代已推进至 #234):既误称某单测文件未提交,又未反映 #227-#234 新增 cluster-free 单测与 docs/observability.md;全仓内部 markdown 链接此前从未系统性校验；score=15）
+- **[120] `docs_ci_sync_120`** — 文档/CI 收口：可观测性文档同步新增标签指标 + CounterVec 原语 + 指标校验器识别 CounterVec/GaugeVec（隐性：新增 http_responses_total{code,method}/CounterVec 原语零文档记载；check_metrics_docs 不识别 CounterVec/GaugeVec，未来标签指标漂移无门禁拦截（R2 隐性）；score=14）
 
 ## scripts
 
