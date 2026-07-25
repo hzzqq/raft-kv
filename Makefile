@@ -2,7 +2,7 @@
 GO ?= go
 export PATH := $(PATH):/c/Users/Administrator/.workbuddy/binaries/go/go/bin
 
-.PHONY: build vet test test-shardkv test-all test-race fmt bench clean lint cover test-cover build-binaries demo serve serve-bg stop cli
+.PHONY: build vet test test-shardkv test-all test-race fmt bench clean lint cover test-cover build-binaries demo serve serve-bg stop cli smoke
 
 build:
 	$(GO) build ./...
@@ -80,6 +80,12 @@ test-cover: cover
 # 起始代码；如需就地重写本轮回改动文件，可手动：gofmt -w ./src/<pkg>。
 fmt:
 	gofmt -l ./src
+
+# 快速冒烟门禁（秒级反馈，沙箱安全）：编译 + vet + 各包 cluster-free 单测，
+# 不拉起重型 Raft 集群 churn 用例。深测请用 test-all。脚本自管 Go 工具链路径，
+# 在缺 gcc 的 Windows 环境下零配置可跑（与 run-tests.sh 同源）。
+smoke:
+	./scripts/smoke.sh
 
 # 基准：跑 raft 提交路径基准（BenchmarkRaftAgree 等）各一次，量化提交吞吐。
 # 需要连后端压测时也可用：make cli args="bench mixed 2000 8"（连已启动网关）。
