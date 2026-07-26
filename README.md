@@ -6,6 +6,8 @@
 - **Lab 3**：基于 Raft 的线性一致 KV 服务。
 - **Lab 4**：分片容错 KV（ShardMaster 配置服务 + ShardKV 分片存储，分片随配置在 replica group 间迁移）。
 
+> **自驱迭代已收官（cycle 140, 2026-07-26）**：本项目由 AI 自主循环完成 140 轮迭代（311 commits），核心扎实、传输层自研、测试硬核；后期陷入"给自驱循环自己造工具"的价值塌陷，故主动停止自驱（`drive-all`/`unstick` 自动化已删），方法论沉淀于 [`docs/SELF_DRIVING_RETRO.md`](docs/SELF_DRIVING_RETRO.md)。后续核心深啃 / 真部署化由人工主导，不再由 AI 自驱续跑。
+
 ## 模块结构
 
 ```
@@ -349,6 +351,14 @@ R3 #54–#82 全部本地提交；#54–#72 已按授权 fast-forward 推送，�
 - **网关共识健康汇聚端点（#221）**：`GET /debug/raft` 汇聚各副本 `RaftStatus` + `RaftCheck` 自检，运维无需逐节点登录即可一眼看清脑裂/任期翻滚/apply 落后。
 - **网关共识健康可告警（#222）**：`/metrics` 暴露 `raft_min_health_score` gauge（按需计算各副本 `RaftCheck` 最低分，min 语义，任一副本异常即拉低），使共识健康可经 Prometheus scrape 与阈值告警（此前仅在 `/debug/raft` JSON 里不可告警）。
 - **kvraft 状态机可观测（#223）**：`KVServer.Status()` 只读健康快照（角色/任期/leader/apply 进度/数据键数/会话表大小/GC 配置）+ `kv_data_keys`/`kv_sessions` 规模 gauge + `gc_sweeps_total`/`gc_sessions_evicted_total` GC 计数；此前 KV 状态机对运维完全不透明，与 raft/shardkv 已暴露的健康快照不对齐。
+
+## 自驱迭代状态（已收官）
+
+本项目经历 **140 轮 AI 自主迭代（cycle 1–140，2026-07-19 → 2026-07-26，311 commits）**，覆盖共识核心、自研 TCP 传输层、gRPC 网关、可观测性、门禁工具链等。
+
+自驱循环于 cycle 140 **主动收官**——后期迭代（尤其 #213 起的可观测性/健康快照收口，以及 #134–140 的门禁/护栏/自测运行器）边际价值递减，陷入"给自驱循环自身造工具"的价值塌陷。相关自动化（`drive-all`/`unstick`）已删除，后续核心深啃 / 真部署化转人工主导。
+
+**方法论沉淀**：[`docs/SELF_DRIVING_RETRO.md`](docs/SELF_DRIVING_RETRO.md) —— 140 轮的交付盘点、有效纪律、踩坑、门禁工具链、价值塌陷教训与给未来自驱项目的 5 条建议。
 
 ## 说明
 - 这是面向学习的实验性实现，重点在正确性与可读性，非生产级部署。

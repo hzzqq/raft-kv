@@ -52,10 +52,13 @@ def _run_one(rel, args, desc, warn_only, quiet, capture):
         return {"name": rel, "desc": desc, "status": "fail",
                 "rc": 1, "warn_only": warn_only}
     ok = proc.returncode == 0
-    if not quiet and not ok and proc.stdout:
-        # 仅打印失败摘要的最后若干行，避免刷屏
-        tail = proc.stdout.strip().splitlines()[-8:]
-        print("    " + "\n    ".join(tail))
+    if not quiet and not ok:
+        if proc.stdout:
+            tail = proc.stdout.strip().splitlines()[-8:]
+            print("    " + "\n    ".join(tail))
+        if proc.stderr:
+            tail = proc.stderr.strip().splitlines()[-8:]
+            print("    [stderr] " + "\n    [stderr] ".join(tail))
     if ok:
         status = "pass"
     elif warn_only:

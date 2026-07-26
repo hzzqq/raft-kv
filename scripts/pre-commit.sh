@@ -18,6 +18,14 @@ if [ -z "$ROOT" ]; then
 fi
 cd "$ROOT"
 
+# 优先使用 WorkBuddy 管理的 Python：Git 钩子子进程（sh）的 PATH 可能未包含它，
+# 导致 python 解析到错误版本，使 gen_test_coverage 等门禁误报虚假失败（cycle 收官复盘确认）。
+WB_PY_BIN="/c/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12"
+case ":$PATH:" in
+  *":$WB_PY_BIN:"*) ;;
+  *) export PATH="$WB_PY_BIN:$PATH" ;;
+esac
+
 PY="${PYTHON:-python3}"
 command -v "$PY" >/dev/null 2>&1 || PY=python
 

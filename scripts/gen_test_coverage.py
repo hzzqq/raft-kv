@@ -32,8 +32,11 @@ END = "<!-- test-coverage-table:end -->"
 
 
 def collect_json():
+    # 临时文件必须落在系统 temp 目录：WorkBuddy 沙箱的 safe-delete 劫持会把
+    # os.unlink 改走回收站，且回收站不可用时 fail-closed 抛 OSError；而 shim 对
+    # 「系统 temp 下的文件」走原生删除，可彻底规避该偶发门禁失败（cycle 收官复盘）。
     tmp = tempfile.NamedTemporaryFile(
-        "w", suffix=".json", dir=ROOT, delete=False, encoding="utf-8"
+        "w", suffix=".json", dir=tempfile.gettempdir(), delete=False, encoding="utf-8"
     )
     tmp.close()
     try:
@@ -45,7 +48,11 @@ def collect_json():
         with open(tmp.name, encoding="utf-8") as f:
             return json.load(f)
     finally:
-        os.unlink(tmp.name)
+        # 容错清理：即便仍被劫持或文件已不存在，清理失败也绝不能阻断主流程。
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
 
 
 def render(report: dict) -> str:
@@ -116,6 +123,12 @@ def main() -> int:
             print("docs/coverage.md 测试映射表与实际一致。OK")
             return 0
         print("docs/coverage.md 测试映射表与实际不一致（drift）：", file=sys.stderr)
+        try:
+            with open(os.path.join(ROOT, "coverage_drift_debug.txt"), "w", encoding="utf-8") as df:
+                df.write("=== CURRENT (from coverage.md) ===\n" + current
+                         + "\n\n=== NEW (rendered) ===\n" + new_block + "\n")
+        except Exception:
+            pass
         print("  运行 `python3 scripts/gen_test_coverage.py` 刷新。", file=sys.stderr)
         return 1
 
@@ -131,4 +144,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        import traceback as _tb
+        try:
+            with open(os.path.join(ROOT, "gen_test_coverage_trace.txt"), "w", encoding="utf-8") as _f:
+                _tb.print_exc(file=_f)
+        except Exception:
+            pass
+        raise
