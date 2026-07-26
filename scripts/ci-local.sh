@@ -51,6 +51,7 @@ run_docs() {
   python3 scripts/tests/test_check_doc_inventory.py
   python3 scripts/tests/test_check_coverage_doc.py
   python3 scripts/tests/test_check_hooks_installed.py
+  python3 scripts/tests/test_check_go_coverage.py
 }
 
 run_test() {

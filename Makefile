@@ -71,6 +71,7 @@ lint:
 cover:
 	$(GO) test ./... -count=1 -timeout 900s -coverprofile=cover.out -covermode=atomic
 	$(GO) tool cover -func=cover.out | tail -1
+	python3 scripts/check_go_coverage.py --profile cover.out
 	@echo "HTML 报告：go tool cover -html=cover.out"
 
 # 与 cover 同义，方便记忆。
@@ -112,6 +113,7 @@ selftest:
 	python3 scripts/tests/test_check_doc_inventory.py
 	python3 scripts/tests/test_check_coverage_doc.py
 	python3 scripts/tests/test_check_hooks_installed.py
+	python3 scripts/tests/test_check_go_coverage.py
 
 # 本地等效 CI 门禁（免 Go）：跑统一自检编排器 + 校验器自身回归，
 # 等价于 CI `gate` job。不依赖 go/gcc，可在任意环境秒级复跑整条门禁链。

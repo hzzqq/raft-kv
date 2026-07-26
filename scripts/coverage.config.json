@@ -1,0 +1,6 @@
+{
+  "min_total": 70.0,
+  "min_package": 0.0,
+  "packages": {},
+  "note": "由 scripts/check_go_coverage.py 强制：CI coverage job 与 make cover 后运行。min_total 为整体覆盖率下限（低于即阻断）；min_package 默认 0 表示单包仅提示不阻断。阈值基于仓库历史 cover.out 实测 74%+ 设定，留 4pt 缓冲吸收 Go 版本噪声。"
+}

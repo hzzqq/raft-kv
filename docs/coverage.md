@@ -61,6 +61,22 @@ total:  (statements)  74.2%
 > 本机交互 shell 默认无 `go`（且托管 Go 无 gcc，故 `go test -race` 仅能在 CI 侧跑），
 > 故这类免 Go 检查器是本地验证的主力；Go 侧 `vet/test/race/cover` 见 CI 各 job。
 
+## 覆盖率门槛门禁（Go 侧，CI `coverage` job + `make cover`）
+
+免 Go 门禁只守护「文档/工程化」维度，**不守护 Go 代码本身的行为**。CI 的 `coverage` job
+会跑 `go test -coverprofile=cover.out`，随后由
+[`scripts/check_go_coverage.py`](../scripts/check_go_coverage.py) 解析该 profile 并强制
+**整体覆盖率不低于 [`scripts/coverage.config.json`](../scripts/coverage.config.json) 的
+`min_total`**（当前 70.0%，基于历史 `cover.out` 实测 74%+ 设定，留 4pt 缓冲吸收 Go 版本噪声）。
+
+- 跌破 `min_total` → 该 job 失败（非零退出），拦截覆盖率静默回退。
+- 单包覆盖率低于 `min_package`（默认 0 = 仅提示不阻断）会一并告警。
+- 该门禁**不接入** `check_all` / `docs-links` 这类免 Go 常驻门禁：它依赖「已生成的
+  `cover.out`」这一 Go 产物，无 `go` 环境下不应误 FAIL。
+- 阈值刷新：`python3 scripts/check_go_coverage.py --profile cover.out --update-baseline`。
+
+
+
 
 ## 近期新增 cluster-free 单测（#212 起，不触发进程内 Raft 选举，规避 Windows `time.Now()` 分辨率 flaky）
 
@@ -86,9 +102,12 @@ go tool cover -func=cover.out | tail -1
 
 # HTML 报告（按函数级着色，定位未覆盖行）：
 go tool cover -html=cover.out
+
+# 强制覆盖率门槛（解析 cover.out，低于 scripts/coverage.config.json 的 min_total 即 FAIL）：
+python3 scripts/check_go_coverage.py --profile cover.out
 ```
 
-CI 的 `coverage` job 也会跑同样的命令并把 `cover.out` 作为 artifact 上传，可在 Actions 页面下载查看。
+CI 的 `coverage` job 也会跑同样的命令（含覆盖率门槛门禁）并把 `cover.out` 作为 artifact 上传，可在 Actions 页面下载查看。
 
 ## 提升方向（供后续迭代）
 
