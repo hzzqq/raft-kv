@@ -247,7 +247,7 @@ export GO111MODULE=on
 | `check_hooks_installed.py` | 提交门禁钩子安装状态：`.git/hooks/pre-commit` 须存在、可执行且与 `scripts/pre-commit.sh` 一致，否则门禁静默失效 | 软提示（WARN） |
 | `check_secrets.py` | 密钥/凭证泄露扫描：PEM 私钥 / AWS AKIA / AWS SK 字面量（HARD）；明文口令/Slack/GitHub token（WARN） | 硬阻断（凭证泄露） |
 | `gen_test_coverage.py --verify` | 校验 [`docs/coverage.md`](docs/coverage.md) 自动生成的「模块↔测试」映射表与实际代码一致（防文档漂移） | 硬阻断 |
-| `scripts/tests/` (单元测试) | 校验器自身回归测试（`make selftest`），守护「门禁自身」不静默退化 | 硬阻断（CI） |
+| `scripts/tests/` (单元测试) | 校验器自身回归测试（`make selftest`，覆盖全部 `check_*` 门禁），守护「门禁自身」不静默退化 | 硬阻断（CI） |
 
 > 本机复跑入口：`make docs`（等价于 CI `docs-links` job，免 Go）；`make ci`（等价于 CI `gate` job，跑统一编排器 `check_all.py` + 校验器自身回归，免 Go）；`make hooks` 安装提交前门禁，从根上阻止文档漂移 / CHANGELOG 失配 / 日志污染被提交进树。
 

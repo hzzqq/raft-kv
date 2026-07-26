@@ -102,12 +102,17 @@ test-cov-verify:
 selftest:
 	python3 scripts/tests/test_check_test_coverage.py
 	python3 scripts/tests/test_check_secrets.py
+	python3 scripts/tests/test_check_godoc.py
+	python3 scripts/tests/test_check_md_links.py
 
 # 本地等效 CI 门禁（免 Go）：跑统一自检编排器 + 校验器自身回归，
 # 等价于 CI `gate` job。不依赖 go/gcc，可在任意环境秒级复跑整条门禁链。
 ci:
 	python3 scripts/check_all.py
 	python3 scripts/tests/test_check_test_coverage.py
+	python3 scripts/tests/test_check_secrets.py
+	python3 scripts/tests/test_check_godoc.py
+	python3 scripts/tests/test_check_md_links.py
 
 # 格式检查：列出 ./src 下未通过 gofmt 的文件。默认不自动 -w，避免波及上游 6.824
 # 起始代码；如需就地重写本轮回改动文件，可手动：gofmt -w ./src/<pkg>。
