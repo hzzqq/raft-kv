@@ -34,6 +34,8 @@ run_docs() {
   python3 scripts/check_test_coverage.py
   echo "==> [hooks] 提交门禁钩子安装状态(免编译, 软提示): 缺失不阻断, 提示 make hooks"
   python3 scripts/check_hooks_installed.py || true
+  echo "==> [secrets] 密钥/凭证泄露扫描(免编译, 硬阻断): PEM私钥/AWS AKIA/SK"
+  python3 scripts/check_secrets.py
   echo "==> [coverage] 校验 docs/coverage.md 模块↔测试表与实际一致(免编译)"
   python3 scripts/gen_test_coverage.py --verify
 }
