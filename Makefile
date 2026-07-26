@@ -99,38 +99,16 @@ test-cov:
 test-cov-verify:
 	python3 scripts/gen_test_coverage.py --verify
 
-# 校验器自检：跑 scripts/tests 下的单元测试，守护「门禁自身」不退化（免 Go）。
+# 校验器自检：自动发现并运行 scripts/tests/test_*.py（免 Go，守护门禁自身不退化）。
+# 用 run_selftests.py 替代硬编码清单，新增自测即自动纳入，无清单漂移。
 selftest:
-	python3 scripts/tests/test_check_test_coverage.py
-	python3 scripts/tests/test_check_secrets.py
-	python3 scripts/tests/test_check_godoc.py
-	python3 scripts/tests/test_check_md_links.py
-	python3 scripts/tests/test_check_api_docs.py
-	python3 scripts/tests/test_check_metrics_docs.py
-	python3 scripts/tests/test_check_docs_endpoints.py
-	python3 scripts/tests/test_check_go_patterns.py
-	python3 scripts/tests/test_check_state_integrity.py
-	python3 scripts/tests/test_check_doc_inventory.py
-	python3 scripts/tests/test_check_coverage_doc.py
-	python3 scripts/tests/test_check_hooks_installed.py
-	python3 scripts/tests/test_check_go_coverage.py
+	python3 scripts/run_selftests.py
 
 # 本地等效 CI 门禁（免 Go）：跑统一自检编排器 + 校验器自身回归，
 # 等价于 CI `gate` job。不依赖 go/gcc，可在任意环境秒级复跑整条门禁链。
 ci:
 	python3 scripts/check_all.py
-	python3 scripts/tests/test_check_test_coverage.py
-	python3 scripts/tests/test_check_secrets.py
-	python3 scripts/tests/test_check_godoc.py
-	python3 scripts/tests/test_check_md_links.py
-	python3 scripts/tests/test_check_api_docs.py
-	python3 scripts/tests/test_check_metrics_docs.py
-	python3 scripts/tests/test_check_docs_endpoints.py
-	python3 scripts/tests/test_check_go_patterns.py
-	python3 scripts/tests/test_check_state_integrity.py
-	python3 scripts/tests/test_check_doc_inventory.py
-	python3 scripts/tests/test_check_coverage_doc.py
-	python3 scripts/tests/test_check_hooks_installed.py
+	python3 scripts/run_selftests.py
 
 # 格式检查：列出 ./src 下未通过 gofmt 的文件。默认不自动 -w，避免波及上游 6.824
 # 起始代码；如需就地重写本轮回改动文件，可手动：gofmt -w ./src/<pkg>。

@@ -247,8 +247,9 @@ export GO111MODULE=on
 | `check_hooks_installed.py` | 提交门禁钩子安装状态：`.git/hooks/pre-commit` 须存在、可执行且与 `scripts/pre-commit.sh` 一致，否则门禁静默失效 | 软提示（WARN） |
 | `check_secrets.py` | 密钥/凭证泄露扫描：PEM 私钥 / AWS AKIA / AWS SK 字面量（HARD）；明文口令/Slack/GitHub token（WARN） | 硬阻断（凭证泄露） |
 | `check_go_coverage.py` | Go 测试覆盖率门槛：解析 `cover.out`，整体覆盖率低于 [`scripts/coverage.config.json`](scripts/coverage.config.json) 的 `min_total` 即阻断（CI `coverage` job 与 `make cover` 后运行；**不**接入 go-free 常驻门禁，因其依赖 Go 产物） | 硬阻断（覆盖率回退） |
+| `run_selftests.py` | 自动发现并运行全部 `scripts/tests/test_*.py` 校验器自测，消除 3 处硬编码清单漂移（Makefile / ci-local / CI 统一调用） | 硬阻断（CI） |
 | `gen_test_coverage.py --verify` | 校验 [`docs/coverage.md`](docs/coverage.md) 自动生成的「模块↔测试」映射表与实际代码一致（防文档漂移） | 硬阻断 |
-| `scripts/tests/` (单元测试) | 校验器自身回归测试（`make selftest`，覆盖全部 `check_*` 门禁），守护「门禁自身」不静默退化 | 硬阻断（CI） |
+| `scripts/tests/` (单元测试) | 校验器自身回归测试（由 `run_selftests.py` 自动发现全部 `scripts/tests/test_*.py` 运行，`make selftest`），守护「门禁自身」不静默退化 | 硬阻断（CI） |
 
 > 本机复跑入口：`make docs`（等价于 CI `docs-links` job，免 Go）；`make ci`（等价于 CI `gate` job，跑统一编排器 `check_all.py` + 校验器自身回归，免 Go）；`make hooks` 安装提交前门禁，从根上阻止文档漂移 / CHANGELOG 失配 / 日志污染被提交进树。
 

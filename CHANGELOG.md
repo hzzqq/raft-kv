@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–134，共 92 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
+> 覆盖 cycle 39–135，共 93 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -133,6 +133,7 @@
 - **[132] `checker_selftest_api_metrics_endpoints`** — api/metrics/endpoints 三文档一致性门禁的回归自测（隐性：文档一致性门禁此前无自测,任一改动令其在干净仓库误报/崩潰时 CI 静默失败(cycle110 同类在门禁自身的变种);审计发现 check_api_docs 的 CLIENT_RE 硬编码接收者名 c|s|kc|cl,改为 [a-z]+ 更鲁棒且仍排除 GRPCClient；score=17）
 - **[133] `checker_selftest_sweep_final`** — 剩余 5 个门禁(go_patterns/state_integrity/doc_inventory/coverage_doc/hooks_installed)回归自测,完成全 12 门禁自测覆盖（隐性：自驱迭代沉淀 13 个免 Go 校验门禁,此前仅 2 个有自测,门禁自身退化(cycle110 同类)长期无人察觉;本弧(131-133)补齐全部自测；score=18）
 - **[134] `coverage_gate`** — Go 测试覆盖率门槛门禁(check_go_coverage.py + min_total 70% 入 scripts/coverage.config.json)（隐性：CI coverage job 只打印 summary 从不强制下限,覆盖率静默回退无人察觉(R2 隐性可观测缺口:有数据无护栏)；score=17）
+- **[135] `selftest_runner`** — 校验器自测自动发现运行器(run_selftests.py)（隐性：自测清单硬编码在 Makefile/ci-local/CI 三处,新增校验器自测可静默跳过(cycle110 同类门禁自身漂移,R2 隐性)；score=16）
 
 ## other
 
