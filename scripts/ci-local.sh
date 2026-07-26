@@ -32,6 +32,8 @@ run_docs() {
   python3 scripts/check_go_patterns.py
   echo "==> [coverage] 测试覆盖率缺口探测(免编译, 软提示): 包无测试/导出符号未引用"
   python3 scripts/check_test_coverage.py
+  echo "==> [coverage] 校验 docs/coverage.md 模块↔测试表与实际一致(免编译)"
+  python3 scripts/gen_test_coverage.py --verify
 }
 
 run_test() {

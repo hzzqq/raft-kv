@@ -53,6 +53,7 @@ total:  (statements)  74.2%
 | `check_go_patterns.py` | `ioutil.` / 非测试 `time.After` 反模式 |
 | `check_godoc.py` | 导出 `type` / 包级 `func` / 对外可见 `method` 必须具备 `//` 文档注释（go doc 可见性） |
 | `check_test_coverage.py` | 免 Go 测试纪律护栏：包级测试缺口 + 导出符号未引用提示（软提示） |
+| `gen_test_coverage.py --verify` | 校验本文件「模块↔测试」自动生成表与实际一致（防 drift） |
 
 > 数值覆盖率快照仅为「信息性」参考；上述门禁才是本仓**持续保证**代码/文档不漂移的机制。
 > 本机交互 shell 默认无 `go`（且托管 Go 无 gcc，故 `go test -race` 仅能在 CI 侧跑），
@@ -97,3 +98,30 @@ CI 的 `coverage` job 也会跑同样的命令并把 `cover.out` 作为 artifact
 
 - [`docs/observability.md`](observability.md) —— 指标目录与各子系统单测的对应关系（含 `raft_*` / `kv_*` / `shardkv_*` / `sm_*` / `gateway_*` 指标来源），提交覆盖前后均可据此核对可观测性是否随单测同步增长。
 - [`docs/architecture.md`](architecture.md) · [`docs/usage.md`](usage.md) · [`docs/runbook.md`](runbook.md) —— 架构 / 使用 / 运维排障。
+
+## 模块 ↔ 测试映射（自动生成）
+
+<!-- test-coverage-table:start -->
+
+_本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），成对标记之间的内容请勿手工编辑，改代码后运行 `make test-cov` 刷新。_
+
+| 模块 (包) | 源码文件 | 测试文件 | 有测试 | 高信号未覆盖导出符号 |
+|-----------|---------:|--------:|:------:|---------------------:|
+| `cluster` | 1 | 1 | ✅ | ConfigNum |
+| `demo` | 1 | 4 | ✅ | — |
+| `diagnostics` | 2 | 3 | ✅ | — |
+| `gateway` | 6 | 18 | ✅ | Flush, LoadGatewayConfig, SetCORS, SetHTTPServer, GroupStatus, GroupView, RaftStatusView |
+| `kvcli` | 16 | 25 | ✅ | MSetCtx, BatchResult, BenchResult, MDelResult, MSetResult |
+| `kvraft` | 1 | 4 | ✅ | OpResult |
+| `metrics` | 4 | 8 | ✅ | Desc, SetDesc |
+| `raft` | 3 | 9 | ✅ | Call, CondInstallSnapshot, RaftStateSize, Send, String, RpcMsg |
+| `shardkv` | 15 | 23 | ✅ | GetE, PutE, MigrationPlan, MigrationStep |
+| `shardmaster` | 14 | 17 | ✅ | String, ConfigDelta, PlanResult |
+| `statusfmt` | 1 | 4 | ✅ | — |
+| `transport` | 2 | 13 | ✅ | Target, ClientConn, ClientStats, JSONCodec, ErrClosed, ErrMethodNotFound |
+| `util` | 24 | 28 | ✅ | ExpBackoff, MarshalJSON, CbState |
+| `version` | 1 | 1 | ✅ | — |
+
+> 汇总：14 个包，0 个无测试；未引用导出符号 func=19 / type=17 / var=2 / const=0。「未覆盖符号」为软提示，可能含被间接覆盖的结果/视图类型。
+
+<!-- test-coverage-table:end -->

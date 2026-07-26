@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–120，共 78 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
+> 覆盖 cycle 39–121，共 79 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -123,6 +123,7 @@
 - **[112] `checker_inventory_meta`** — 校验器套件接线一致性 meta 门禁（隐性：新增 8 个免 Go 校验器后,任一漏接 check_all/ci.yml/README 即产生门禁盲区且无人察觉(harness 自身漂移风险)；score=15）
 - **[113] `coverage_doc_meta`** — coverage.md 与校验器清单一致性 meta 门禁 + 刷新过时覆盖率文档（隐性：coverage.md 仍停在 #235 时代未列 8 校验器,误导审计以为工程化收口维度缺失(harness 已覆盖却文档不体现)；score=15）
 - **[115] `godoc_gate`** — godoc 导出标识符文档覆盖率门禁（隐性：导出 API 无 doc 注释则 go doc 空白,外部用户无法发现能力(此前无门禁)；score=17）
+- **[121] `check_test_coverage_121`** — 免 Go 测试纪律护栏: 包级测试缺口 + 导出符号未引用提示(check_test_coverage.py)（隐性：120+ 轮功能迭代缺测试纪律护栏,新源码/导出 API 若无测试则覆盖率静默下降无人察觉(R2);且 meta 校验器 GUARDED 硬编码漏管新校验器(harness 自身漂移)；score=16）
 
 ## other
 
