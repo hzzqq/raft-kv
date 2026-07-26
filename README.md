@@ -55,7 +55,8 @@ raft-kv/
 > [`docs/runbook.md`](docs/runbook.md)；端到端演示（进程内集群 + 全栈 HTTP）说明见
 > [`docs/demo.md`](docs/demo.md)。新贡献者零基础 5 分钟上手见
 > [`QUICKSTART.md`](QUICKSTART.md)。本仓库以
-> [`LICENSE`](LICENSE)（MIT）开源。
+> [`LICENSE`](LICENSE)（MIT）开源，安全漏洞请按
+> [`SECURITY.md`](SECURITY.md) 流程私下披露。
 
 ## 快速启动
 

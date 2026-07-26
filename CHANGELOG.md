@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–129，共 87 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
+> 覆盖 cycle 39–130，共 88 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -136,6 +136,7 @@
 - **[126] `quickstart_doc_126`** — QUICKSTART.md 零基础上手指南(构建/全栈运行/客户端/免Go自检/测试/下一步)（隐性：新贡献者无任何单一入口从零把系统跑起来:运行方式散落 README 快速启动/demo.md/CONTRIBUTING,缺一份串联 prereq->build->run->client->dev-loop 的 5 分钟上手(R2 隐性 onboarding 缺口)；score=15）
 - **[127] `ci_gate_target_127`** — make ci 本地等效 CI 门禁 + CI gate job 跑统一编排器check_all.py(防御纵深)（隐性：CI 仅逐条跑各脚本,统一编排器check_all.py本身的聚合/退出码/warn_only逻辑从未在CI被验证;且本地无单一入口秒级复跑整条门禁链(只有make docs跑check_all,但缺校验器自测)；score=14）
 - **[129] `license_mit`** — MIT 开源许可证(治理合规)（隐性：公开发布仓库无 OSI 许可证,默认保留所有权利,阻塞复用/贡献；score=14）
+- **[130] `security_policy`** — SECURITY.md 漏洞披露政策(安全治理)（隐性：已落地密钥扫描门禁(check_secrets)但外部研究者无漏洞上报渠道,安全门禁缺人工闭环；score=15）
 
 ---
 
