@@ -17,7 +17,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-CLIENT_RE = re.compile(r'func \((?:c \*?|s \*?|kc \*?|cl \*?)Client\) ([A-Z]\w*)\(')
+CLIENT_RE = re.compile(r'func \([a-z]+ \*?Client\) ([A-Z]\w*)\(')
 UTIL_TYPE_RE = re.compile(r'^type ([A-Z]\w*) ', re.M)
 DOC_CLIENT_REF_RE = re.compile(r'Client\.([A-Z]\w*)')
 
