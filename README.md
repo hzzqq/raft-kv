@@ -242,6 +242,7 @@ export GO111MODULE=on
 | `check_godoc.py` | 扫描 `src/**/*.go`，所有导出 `type` / 包级 `func` / 对外可见 `method` 必须具备 `//` 文档注释（`go doc` 可见性），防 API 自描述缺失 | 硬阻断 |
 | `check_test_coverage.py` | 免 Go 测试纪律护栏：扫描 `src/**` 各 Go 包，标记「无 `_test.go`」硬缺口，并提示「定义但未在包测试中被引用」的导出函数/类型（软提示，可能含间接覆盖的结果类型） | 软提示（WARN） |
 | `gen_test_coverage.py --verify` | 校验 [`docs/coverage.md`](docs/coverage.md) 自动生成的「模块↔测试」映射表与实际代码一致（防文档漂移） | 硬阻断 |
+| `scripts/tests/` (单元测试) | 校验器自身回归测试（`make selftest`），守护「门禁自身」不静默退化 | 硬阻断（CI） |
 
 > 本机复跑入口：`make docs`（等价于 CI `docs-links` job，免 Go）；`make hooks` 安装提交前门禁，从根上阻止文档漂移 / CHANGELOG 失配 / 日志污染被提交进树。
 

@@ -47,14 +47,14 @@ def _read(p: str) -> str:
         return f.read()
 
 
-def package_dirs():
+def package_dirs(root=SRC):
     found = []
-    for root, dirs, files in os.walk(SRC):
+    for r, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d != ".git"]
         go = [f for f in files if f.endswith(".go") and not f.endswith("_test.go")]
         te = [f for f in files if f.endswith("_test.go")]
         if go:  # 仅统计有源码的目录（即一个 Go 包）
-            found.append((root, go, te))
+            found.append((r, go, te))
     return found
 
 
@@ -80,15 +80,19 @@ def exported_symbols(src_blob: str):
     return funcs, types, vars_, consts
 
 
-def analyze(strict: bool):
-    pkgs = package_dirs()
+def analyze(strict: bool = False, root=SRC):
+    pkgs = package_dirs(root)
     report = {"packages": [], "summary": {}}
     hard_gaps = 0
     warn_syms = 0
-    for root, go, te in sorted(pkgs):
-        rel = os.path.relpath(root, ROOT).replace(os.sep, "/")
-        src_blob = "\n".join(_read(os.path.join(root, f)) for f in go)
-        test_blob = "\n".join(_read(os.path.join(root, f)) for f in te) if te else ""
+    for pkgdir, go, te in sorted(pkgs):
+        try:
+            rel = os.path.relpath(pkgdir, ROOT).replace(os.sep, "/")
+        except ValueError:
+            # 扫描根与仓库根不在同一挂载点（如 fixture 测试目录）时回退到扫描根相对路径
+            rel = os.path.relpath(pkgdir, root).replace(os.sep, "/")
+        src_blob = "\n".join(_read(os.path.join(pkgdir, f)) for f in go)
+        test_blob = "\n".join(_read(os.path.join(pkgdir, f)) for f in te) if te else ""
         funcs, types, vars_, consts = exported_symbols(src_blob)
         all_syms = funcs | types | vars_ | consts
 
@@ -131,14 +135,16 @@ def analyze(strict: bool):
     return report, hard_gaps
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--json", metavar="FILE", help="写出机器可读统计到 JSON")
     ap.add_argument("--strict", action="store_true",
                     help="把『包无测试』硬缺口升级为非零退出(未来 CI 门禁)")
-    args = ap.parse_args()
+    ap.add_argument("--root", default=SRC,
+                    help="扫描根目录(默认仓库 src，测试可重定向到 fixture)")
+    args = ap.parse_args(argv)
 
-    report, hard_gaps = analyze(args.strict)
+    report, hard_gaps = analyze(args.strict, args.root)
 
     # 打印人类可读报告
     print(f"==> [test-coverage] 扫描 src 下 {report['summary']['packages']} 个包")

@@ -2,7 +2,7 @@
 GO ?= go
 export PATH := $(PATH):/c/Users/Administrator/.workbuddy/binaries/go/go/bin
 
-.PHONY: build vet test test-shardkv test-all test-race fmt bench clean lint cover test-cover build-binaries demo serve serve-bg stop cli smoke hooks docs test-cov test-cov-verify
+.PHONY: build vet test test-shardkv test-all test-race fmt bench clean lint cover test-cover build-binaries demo serve serve-bg stop cli smoke hooks docs test-cov test-cov-verify selftest
 
 build:
 	$(GO) build ./...
@@ -97,6 +97,10 @@ test-cov:
 # 仅校验映射表与实际代码一致（不写文件），可供 CI / pre-commit 使用。
 test-cov-verify:
 	python3 scripts/gen_test_coverage.py --verify
+
+# 校验器自检：跑 scripts/tests 下的单元测试，守护「门禁自身」不退化（免 Go）。
+selftest:
+	python3 scripts/tests/test_check_test_coverage.py
 
 # 格式检查：列出 ./src 下未通过 gofmt 的文件。默认不自动 -w，避免波及上游 6.824
 # 起始代码；如需就地重写本轮回改动文件，可手动：gofmt -w ./src/<pkg>。
