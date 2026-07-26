@@ -12,6 +12,10 @@
 *.out
 coverage.txt
 
+# Coverage/tool scratch dirs written by `go test -coverprofile` (covtest_xxx/)
+covtest_*/
+covtest_*/**
+
 # Dependency directories
 vendor/
 

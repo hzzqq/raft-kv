@@ -35,6 +35,7 @@ CHECKS = [
     ("scripts/check_hooks_installed.py", [], "提交门禁钩子安装状态(软提示)", True),
     ("scripts/check_secrets.py", [], "密钥/凭证泄露扫描(硬阻断)", False),
     ("scripts/gen_test_coverage.py", ["--verify"], "coverage.md 模块↔测试表与实际一致", False),
+    ("scripts/check_leaked_artifacts.py", [], "构建/覆盖率临时产物泄漏护栏", False),
 ]
 
 

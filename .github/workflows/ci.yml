@@ -215,6 +215,9 @@ jobs:
       - name: Scan for secret/credential leaks (HARD)
         run: python3 scripts/check_secrets.py
 
+      - name: Check for leaked build/coverage artifacts
+        run: python3 scripts/check_leaked_artifacts.py
+
       - name: Scan Go anti-patterns (no Go toolchain needed)
         run: python3 scripts/check_go_patterns.py
 

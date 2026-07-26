@@ -33,6 +33,7 @@ GUARDED = [
     "check_hooks_installed.py",
     "check_secrets.py",
     "gen_test_coverage.py",
+    "check_leaked_artifacts.py",
 ]
 
 
