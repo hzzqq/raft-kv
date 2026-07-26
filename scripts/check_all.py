@@ -12,6 +12,7 @@
 任一校验硬失败即整体返回非 0，可直接作为 pre-commit / CI 门禁。
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -39,54 +40,83 @@ CHECKS = [
 ]
 
 
-def main() -> int:
-    quiet = _args().quiet
-    results = []
-    for rel, args, desc, warn_only in CHECKS:
-        path = os.path.join(ROOT, rel)
-        cmd = [sys.executable, path] + args
-        if not quiet:
-            print(f"==> [{desc}] {rel} {' '.join(args)}")
-        try:
-            proc = subprocess.run(cmd, cwd=ROOT, capture_output=not quiet, text=True)
-        except FileNotFoundError as e:
-            print(f"    缺失: {e}", file=sys.stderr)
-            results.append((rel, desc, False, "文件缺失", warn_only))
-            continue
-        ok = proc.returncode == 0
-        if not quiet and not ok and proc.stdout:
-            # 仅打印失败摘要的最后若干行，避免刷屏
-            tail = proc.stdout.strip().splitlines()[-8:]
-            print("    " + "\n    ".join(tail))
-        results.append((rel, desc, ok, f"exit={proc.returncode}", warn_only))
+def _run_one(rel, args, desc, warn_only, quiet, capture):
+    path = os.path.join(ROOT, rel)
+    cmd = [sys.executable, path] + args
+    if not quiet:
+        print(f"==> [{desc}] {rel} {' '.join(args)}")
+    try:
+        proc = subprocess.run(cmd, cwd=ROOT, capture_output=capture, text=True)
+    except FileNotFoundError as e:
+        print(f"    缺失: {e}", file=sys.stderr)
+        return {"name": rel, "desc": desc, "status": "fail",
+                "rc": 1, "warn_only": warn_only}
+    ok = proc.returncode == 0
+    if not quiet and not ok and proc.stdout:
+        # 仅打印失败摘要的最后若干行，避免刷屏
+        tail = proc.stdout.strip().splitlines()[-8:]
+        print("    " + "\n    ".join(tail))
+    if ok:
+        status = "pass"
+    elif warn_only:
+        status = "warn"
+    else:
+        status = "fail"
+    return {"name": rel, "desc": desc, "status": status,
+            "rc": proc.returncode, "warn_only": warn_only}
 
+
+def _collect(quiet, capture):
+    return [_run_one(rel, args, desc, warn_only, quiet, capture)
+            for (rel, args, desc, warn_only) in CHECKS]
+
+
+def _summarize(results):
+    passed = sum(1 for r in results if r["status"] == "pass")
+    warned = sum(1 for r in results if r["status"] == "warn")
+    failed = sum(1 for r in results if r["status"] == "fail")
+    return {"total": len(results), "passed": passed,
+            "warned": warned, "failed": failed, "ok": failed == 0}
+
+
+def _render_text(results, quiet):
     print("\n" + "=" * 56)
     print("自检汇总：")
-    failed = 0
-    warned = 0
-    for rel, desc, ok, info, warn_only in results:
-        if ok:
-            mark = "PASS"
-        elif warn_only:
-            mark, warned = "WARN", warned + 1
-        else:
-            mark, failed = "FAIL", failed + 1
-        print(f"  [{mark}] {desc}  ({rel}, {info})")
+    for r in results:
+        mark = r["status"].upper()
+        print(f"  [{mark}] {r['desc']}  ({r['name']}, exit={r['rc']})")
     print("=" * 56)
-    if failed:
-        print(f"整体失败：{failed}/{len(results)} 项未通过。")
+    s = _summarize(results)
+    if s["failed"]:
+        print(f"整体失败：{s['failed']}/{s['total']} 项未通过。")
         return 1
-    if warned:
-        print(f"通过（含 {warned} 项 WARN 软提示）：{len(results) - warned}/{len(results)} 硬门禁通过。")
+    if s["warned"]:
+        print(f"通过（含 {s['warned']} 项 WARN 软提示）："
+              f"{s['total'] - s['warned']}/{s['total']} 硬门禁通过。")
         return 0
-    print(f"全部通过：{len(results)}/{len(results)} 项。OK")
+    print(f"全部通过：{s['total']}/{s['total']} 项。OK")
     return 0
 
 
-def _args():
+def _render_json(results):
+    out = {"summary": _summarize(results), "checks": results}
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0 if out["summary"]["ok"] else 1
+
+
+def main() -> int:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--quiet", action="store_true")
-    return ap.parse_args()
+    ap.add_argument("--json", action="store_true",
+                    help="输出机器可读 JSON 报告（供 CI / 看板消费）")
+    args = ap.parse_args()
+    # JSON 模式下不打印逐条进度，且强制捕获子进程 stdout，保持 stdout 为纯 JSON
+    quiet = args.quiet or args.json
+    capture = (not args.quiet) or args.json
+    results = _collect(quiet, capture)
+    if args.json:
+        return _render_json(results)
+    return _render_text(results, args.quiet)
 
 
 if __name__ == "__main__":

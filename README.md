@@ -252,7 +252,7 @@ export GO111MODULE=on
 | `gen_test_coverage.py --verify` | 校验 [`docs/coverage.md`](docs/coverage.md) 自动生成的「模块↔测试」映射表与实际代码一致（防文档漂移） | 硬阻断 |
 | `scripts/tests/` (单元测试) | 校验器自身回归测试（由 `run_selftests.py` 自动发现全部 `scripts/tests/test_*.py` 运行，`make selftest`），守护「门禁自身」不静默退化 | 硬阻断（CI） |
 
-> 本机复跑入口：`make docs`（等价于 CI `docs-links` job，免 Go）；`make ci`（等价于 CI `gate` job，跑统一编排器 `check_all.py` + 校验器自身回归，免 Go）；`make hooks` 安装提交前门禁，从根上阻止文档漂移 / CHANGELOG 失配 / 日志污染被提交进树。
+> 本机复跑入口：`make docs`（等价于 CI `docs-links` job，免 Go）；`make ci`（等价于 CI `gate` job，跑统一编排器 `check_all.py` + 校验器自身回归，免 Go）；`make hooks` 安装提交前门禁，从根上阻止文档漂移 / CHANGELOG 失配 / 日志污染被提交进树。需要机器可读结果（CI / 看板消费）时可用 `python3 scripts/check_all.py --json`，输出含 `summary` 与逐条 `checks` 的 JSON 报告。
 
 ## 验证状态说明
 - 自驱开发的逐轮交付记录自动汇总于 [`CHANGELOG.md`](CHANGELOG.md)（由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 生成，CI 以 `--verify` 保证其与迭代日志同步）。
