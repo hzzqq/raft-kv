@@ -2,7 +2,7 @@
 GO ?= go
 export PATH := $(PATH):/c/Users/Administrator/.workbuddy/binaries/go/go/bin
 
-.PHONY: build vet test test-shardkv test-all test-race fmt bench clean lint cover test-cover build-binaries demo serve serve-bg stop cli smoke hooks docs test-cov test-cov-verify selftest
+.PHONY: build vet test test-shardkv test-all test-race fmt bench clean lint cover test-cover build-binaries demo serve serve-bg stop cli smoke hooks docs test-cov test-cov-verify selftest ci
 
 build:
 	$(GO) build ./...
@@ -100,6 +100,12 @@ test-cov-verify:
 
 # 校验器自检：跑 scripts/tests 下的单元测试，守护「门禁自身」不退化（免 Go）。
 selftest:
+	python3 scripts/tests/test_check_test_coverage.py
+
+# 本地等效 CI 门禁（免 Go）：跑统一自检编排器 + 校验器自身回归，
+# 等价于 CI `gate` job。不依赖 go/gcc，可在任意环境秒级复跑整条门禁链。
+ci:
+	python3 scripts/check_all.py
 	python3 scripts/tests/test_check_test_coverage.py
 
 # 格式检查：列出 ./src 下未通过 gofmt 的文件。默认不自动 -w，避免波及上游 6.824

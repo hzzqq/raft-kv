@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–126，共 84 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
+> 覆盖 cycle 39–127，共 85 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -133,6 +133,7 @@
 
 - **[114] `contributing_doc`** — CONTRIBUTING.md 开发者本地验证全流程 + 自驱迭代约定收口（隐性：9 校验器 + pre-commit 钩子 + state.json/CHANGELOG 约定仅散落 Makefile/CI/README,无单一 onboarding 入口,新贡献者无法安全续跑迭代；score=14）
 - **[126] `quickstart_doc_126`** — QUICKSTART.md 零基础上手指南(构建/全栈运行/客户端/免Go自检/测试/下一步)（隐性：新贡献者无任何单一入口从零把系统跑起来:运行方式散落 README 快速启动/demo.md/CONTRIBUTING,缺一份串联 prereq->build->run->client->dev-loop 的 5 分钟上手(R2 隐性 onboarding 缺口)；score=15）
+- **[127] `ci_gate_target_127`** — make ci 本地等效 CI 门禁 + CI gate job 跑统一编排器check_all.py(防御纵深)（隐性：CI 仅逐条跑各脚本,统一编排器check_all.py本身的聚合/退出码/warn_only逻辑从未在CI被验证;且本地无单一入口秒级复跑整条门禁链(只有make docs跑check_all,但缺校验器自测)；score=14）
 
 ---
 

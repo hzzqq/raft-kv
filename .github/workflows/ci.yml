@@ -158,6 +158,23 @@ jobs:
           version: latest
           args: --timeout 5m
 
+  # 统一门禁（defense-in-depth）：直接跑 check_all.py 编排器本身，
+  # 而非逐条脚本——这样编排器的「聚合 / 退出码 / warn_only」逻辑也在 CI 被验证，
+  # 避免某条脚本在聚合层被静默吞掉。与 docs-links 互补、纯 Python 免 Go。
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run unified self-check gate (check_all.py)
+        run: python3 scripts/check_all.py
+
   # 文档一致性：纯 Python 静态检查，不依赖 Go 工具链（本机无 go 时也能跑）。
   # 校验仓库内所有 Markdown 的内部相对链接与锚点是否可解析，防止文档漂移。
   docs-links:
