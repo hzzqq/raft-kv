@@ -38,7 +38,7 @@ run_docs() {
   python3 scripts/check_secrets.py
   echo "==> [coverage] 校验 docs/coverage.md 模块↔测试表与实际一致(免编译)"
   python3 scripts/gen_test_coverage.py --verify
-  echo "==> [selftest] 校验器自身回归(守护门禁不退化): coverage + secrets + godoc + md_links + api/metrics/endpoints"
+  echo "==> [selftest] 校验器自身回归(守护门禁不退化): 全部 12 个 check_* 门禁"
   python3 scripts/tests/test_check_test_coverage.py
   python3 scripts/tests/test_check_secrets.py
   python3 scripts/tests/test_check_godoc.py
@@ -46,6 +46,11 @@ run_docs() {
   python3 scripts/tests/test_check_api_docs.py
   python3 scripts/tests/test_check_metrics_docs.py
   python3 scripts/tests/test_check_docs_endpoints.py
+  python3 scripts/tests/test_check_go_patterns.py
+  python3 scripts/tests/test_check_state_integrity.py
+  python3 scripts/tests/test_check_doc_inventory.py
+  python3 scripts/tests/test_check_coverage_doc.py
+  python3 scripts/tests/test_check_hooks_installed.py
 }
 
 run_test() {

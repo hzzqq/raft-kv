@@ -231,7 +231,7 @@ jobs:
         run: python3 scripts/gen_test_coverage.py --verify
 
       - name: Run checker self-tests (guard the gates themselves)
-        run: python3 scripts/tests/test_check_test_coverage.py && python3 scripts/tests/test_check_secrets.py && python3 scripts/tests/test_check_godoc.py && python3 scripts/tests/test_check_md_links.py && python3 scripts/tests/test_check_api_docs.py && python3 scripts/tests/test_check_metrics_docs.py && python3 scripts/tests/test_check_docs_endpoints.py
+        run: python3 scripts/tests/test_check_test_coverage.py && python3 scripts/tests/test_check_secrets.py && python3 scripts/tests/test_check_godoc.py && python3 scripts/tests/test_check_md_links.py && python3 scripts/tests/test_check_api_docs.py && python3 scripts/tests/test_check_metrics_docs.py && python3 scripts/tests/test_check_docs_endpoints.py && python3 scripts/tests/test_check_go_patterns.py && python3 scripts/tests/test_check_state_integrity.py && python3 scripts/tests/test_check_doc_inventory.py && python3 scripts/tests/test_check_coverage_doc.py && python3 scripts/tests/test_check_hooks_installed.py
 
   # 覆盖率：跑全量测试，生成 cover.out 并上传为 artifact。
   coverage:
