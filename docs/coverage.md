@@ -52,6 +52,7 @@ total:  (statements)  74.2%
 | `check_coverage_doc.py` | 本文件（coverage.md）与校验器清单一致（meta） |
 | `check_go_patterns.py` | `ioutil.` / 非测试 `time.After` 反模式 |
 | `check_godoc.py` | 导出 `type` / 包级 `func` / 对外可见 `method` 必须具备 `//` 文档注释（go doc 可见性） |
+| `check_test_coverage.py` | 免 Go 测试纪律护栏：包级测试缺口 + 导出符号未引用提示（软提示） |
 
 > 数值覆盖率快照仅为「信息性」参考；上述门禁才是本仓**持续保证**代码/文档不漂移的机制。
 > 本机交互 shell 默认无 `go`（且托管 Go 无 gcc，故 `go test -race` 仅能在 CI 侧跑），

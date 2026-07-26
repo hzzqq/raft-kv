@@ -29,6 +29,7 @@ GUARDED = [
     "check_coverage_doc.py",
     "check_go_patterns.py",
     "check_godoc.py",
+    "check_test_coverage.py",
 ]
 
 

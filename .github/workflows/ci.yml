@@ -201,6 +201,9 @@ jobs:
       - name: Check godoc coverage of exported identifiers
         run: python3 scripts/check_godoc.py
 
+      - name: Detect test-coverage gaps (no Go toolchain needed, soft hints)
+        run: python3 scripts/check_test_coverage.py
+
   # 覆盖率：跑全量测试，生成 cover.out 并上传为 artifact。
   coverage:
     runs-on: ubuntu-latest

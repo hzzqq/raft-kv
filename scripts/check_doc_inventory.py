@@ -40,6 +40,7 @@ GUARDED = [
     "check_doc_inventory.py",
     "check_coverage_doc.py",
     "check_godoc.py",
+    "check_test_coverage.py",
 ]
 
 
