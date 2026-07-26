@@ -101,6 +101,7 @@ test-cov-verify:
 # 校验器自检：跑 scripts/tests 下的单元测试，守护「门禁自身」不退化（免 Go）。
 selftest:
 	python3 scripts/tests/test_check_test_coverage.py
+	python3 scripts/tests/test_check_secrets.py
 
 # 本地等效 CI 门禁（免 Go）：跑统一自检编排器 + 校验器自身回归，
 # 等价于 CI `gate` job。不依赖 go/gcc，可在任意环境秒级复跑整条门禁链。

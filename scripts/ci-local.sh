@@ -38,6 +38,9 @@ run_docs() {
   python3 scripts/check_secrets.py
   echo "==> [coverage] 校验 docs/coverage.md 模块↔测试表与实际一致(免编译)"
   python3 scripts/gen_test_coverage.py --verify
+  echo "==> [selftest] 校验器自身回归(守护门禁不退化): coverage + secrets"
+  python3 scripts/tests/test_check_test_coverage.py
+  python3 scripts/tests/test_check_secrets.py
 }
 
 run_test() {

@@ -33,7 +33,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DEFAULT_DIRS = ("src", "scripts", ".github")
-SKIP_DIRS = {".git", "bin", "vendor", "__pycache__"}
+SKIP_DIRS = {".git", "bin", "vendor", "__pycache__", "tests"}
 SKIP_EXT = {".exe", ".out", ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".test"}
 # 扫描器自身的源文件含「模式定义字面量」，会命中自己的正则，需自排除
 SELF_PATH = os.path.join(ROOT, "scripts", "check_secrets.py")
@@ -74,6 +74,23 @@ def _candidate_files(root: str, extra_paths):
     return files
 
 
+def scan_text(text: str, rel: str = "<text>") -> "tuple[list, list]":
+    """对一段文本扫描凭证模式，返回 (hard_hits, warn_hits)。
+
+    每条命中为 (rel, line, label, snippet)。抽离为纯函数以便单元测试 fixture 驱动。
+    """
+    hard_hits, warn_hits = [], []
+    for label, rx in HARD_PATTERNS:
+        for m in rx.finditer(text):
+            line = text[:m.start()].count("\n") + 1
+            hard_hits.append((rel, line, label, m.group(0)[:40]))
+    for label, rx in WARN_PATTERNS:
+        for m in rx.finditer(text):
+            line = text[:m.start()].count("\n") + 1
+            warn_hits.append((rel, line, label, m.group(0)[:40]))
+    return hard_hits, warn_hits
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=ROOT, help="仓库根目录")
@@ -91,14 +108,9 @@ def main() -> int:
         except OSError:
             continue
         rel = os.path.relpath(fp, args.root)
-        for label, rx in HARD_PATTERNS:
-            for m in rx.finditer(text):
-                line = text[:m.start()].count("\n") + 1
-                hard_hits.append((rel, line, label, m.group(0)[:40]))
-        for label, rx in WARN_PATTERNS:
-            for m in rx.finditer(text):
-                line = text[:m.start()].count("\n") + 1
-                warn_hits.append((rel, line, label, m.group(0)[:40]))
+        h, w = scan_text(text, rel)
+        hard_hits.extend(h)
+        warn_hits.extend(w)
 
     if args.json_out:
         json.dump({"hard": hard_hits, "warn": warn_hits},

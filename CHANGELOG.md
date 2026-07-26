@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–127，共 85 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
+> 覆盖 cycle 39–128，共 86 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -128,6 +128,7 @@
 - **[123] `checker_selftest_123`** — 校验器自身回归测试(make selftest / CI): fixture 驱动 check_test_coverage 纯函数（隐性：免 Go 自检门禁自身零测试,任一改动令其在干净仓库误报/崩溃时 CI 静默失败(cycle110 同类问题在门禁自身的变种, R2 隐性)；score=15）
 - **[124] `hook_install_guard_124`** — 提交门禁钩子安装状态护栏 + 真正安装 hook(此前本环境静默失效)（隐性：.git/hooks/pre-commit 从未安装,文档承诺的 make hooks 门禁在此工作副本根本不触发,漂移缺陷可静默落库;且 .gitignore 漏 __pycache__ 致 Python 缓存进未跟踪；score=17）
 - **[125] `secret_scan_guard_125`** — 密钥/凭证泄露静态扫描门禁(此前零安全维度)（隐性：仓库无任何密钥泄露防护:误提交私钥/AWS AK-SK/token 会直接落库并被推送远端,造成不可逆凭证暴露(不报错但危害极大,R2 隐性安全缺口)；score=18）
+- **[128] `secret_scanner_selftest_128`** — 密钥扫描门禁的回归自测(7 例 fixture: PEM/AKIA/AWS-SK/WARN明文/Slack/GitHub/干净代码)（隐性：check_secrets.py 作为安全门禁此前自身零测试,任一改动令其漏报凭证时 CI 静默通过(cycle110 同类问题在「安全门禁自身」的变种,R2 隐性);且其扫描 scripts/ 会命中自带 fixture 文件导致误报 HARD(需自排除)；score=16）
 
 ## other
 
