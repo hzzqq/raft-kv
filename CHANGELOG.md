@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–123，共 81 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
+> 覆盖 cycle 39–124，共 82 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -126,6 +126,7 @@
 - **[121] `check_test_coverage_121`** — 免 Go 测试纪律护栏: 包级测试缺口 + 导出符号未引用提示(check_test_coverage.py)（隐性：120+ 轮功能迭代缺测试纪律护栏,新源码/导出 API 若无测试则覆盖率静默下降无人察觉(R2);且 meta 校验器 GUARDED 硬编码漏管新校验器(harness 自身漂移)；score=16）
 - **[122] `gen_test_coverage_122`** — coverage.md 自动生成「模块↔测试」映射表 + --verify 漂移门禁(gen_test_coverage.py)（隐性：coverage.md 的测试覆盖章节为人工快照,与真实代码脱节(此前已多次 drift);无自动护栏,新源码/测试增减后表格静默失准(R2 隐性)；score=15）
 - **[123] `checker_selftest_123`** — 校验器自身回归测试(make selftest / CI): fixture 驱动 check_test_coverage 纯函数（隐性：免 Go 自检门禁自身零测试,任一改动令其在干净仓库误报/崩溃时 CI 静默失败(cycle110 同类问题在门禁自身的变种, R2 隐性)；score=15）
+- **[124] `hook_install_guard_124`** — 提交门禁钩子安装状态护栏 + 真正安装 hook(此前本环境静默失效)（隐性：.git/hooks/pre-commit 从未安装,文档承诺的 make hooks 门禁在此工作副本根本不触发,漂移缺陷可静默落库;且 .gitignore 漏 __pycache__ 致 Python 缓存进未跟踪；score=17）
 
 ## other
 

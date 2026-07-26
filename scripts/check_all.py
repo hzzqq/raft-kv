@@ -32,6 +32,7 @@ CHECKS = [
     ("scripts/check_go_patterns.py", [], "Go 反模式静态扫描", False),
     ("scripts/check_godoc.py", [], "godoc 导出标识符文档覆盖率", False),
     ("scripts/check_test_coverage.py", [], "测试覆盖率缺口探测(软提示)", True),
+    ("scripts/check_hooks_installed.py", [], "提交门禁钩子安装状态(软提示)", True),
     ("scripts/gen_test_coverage.py", ["--verify"], "coverage.md 模块↔测试表与实际一致", False),
 ]
 

@@ -7,8 +7,15 @@
 # 临时绕过：git commit --no-verify
 set -uo pipefail
 
-# 定位仓库根（脚本放在 scripts/ 下）
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# 定位仓库根：用 git 权威解析，兼容两种调用位置——
+#   * 源脚本 scripts/pre-commit.sh（dirname=$ROOT/scripts）
+#   * 安装后 .git/hooks/pre-commit（dirname=$ROOT/.git/hooks，/.. 会错归到 .git）
+# 此前用 `cd dirname/$0/..` 在「已安装」状态下把 ROOT 错算成 .git，
+# 导致每次提交都以错误路径运行 check_all.py 被误阻断（门禁自身缺陷）。
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$ROOT" ]; then
+  ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+fi
 cd "$ROOT"
 
 PY="${PYTHON:-python3}"

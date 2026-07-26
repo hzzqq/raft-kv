@@ -24,6 +24,11 @@ go.work.sum
 .vscode/
 .DS_Store
 
+# Python cache (scripts/ 下免 Go 校验器的 __pycache__)
+__pycache__/
+*.pyc
+*.pyo
+
 # WorkBuddy agent internal state (not part of the project)
 .workbuddy/
 

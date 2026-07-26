@@ -204,6 +204,9 @@ jobs:
       - name: Detect test-coverage gaps (no Go toolchain needed, soft hints)
         run: python3 scripts/check_test_coverage.py
 
+      - name: Check pre-commit hook installation (soft, informational in CI)
+        run: python3 scripts/check_hooks_installed.py || true
+
       - name: Verify docs/coverage.md module↔test table in sync
         run: python3 scripts/gen_test_coverage.py --verify
 

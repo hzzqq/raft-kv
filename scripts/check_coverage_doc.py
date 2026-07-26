@@ -30,6 +30,7 @@ GUARDED = [
     "check_go_patterns.py",
     "check_godoc.py",
     "check_test_coverage.py",
+    "check_hooks_installed.py",
     "gen_test_coverage.py",
 ]
 
