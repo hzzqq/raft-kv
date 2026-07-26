@@ -238,7 +238,7 @@ export GO111MODULE=on
 | `check_api_docs.py` | `kvcli.Client` 32 方法 + `util` 16 类型 与文档一致 | 硬阻断（前向缺失/反向漂移）+ 提示 |
 | `gen_changelog.py --verify` | [`CHANGELOG.md`](CHANGELOG.md) 与迭代日志同步 | 硬阻断 |
 | `check_state_integrity.py` | 自驱开发日志（`state.json`）完整性：重复 `(task_id,cycle)` 对 / `cycle` 越界 / `score` 越界 / 必填缺失 / 非单调 | 硬阻断 |
-| `check_go_patterns.py` | `ioutil.` / 非测试 `time.After` 反模式 | 硬阻断 + 提示 |
+| `check_go_patterns.py` | Go 反模式：`ioutil.`（硬阻断）/ 非测试 `time.After`（硬阻断）/ 库代码 `fmt.Print*`·`log.Fatal`·`os.Exit`·`panic`·`TODO`/`FIXME`/`HACK`/`XXX`（提示） | 硬阻断 + 提示 |
 | `pre-commit.sh` | 提交前门禁：串起上述全部校验，任一失败即阻断 `git commit` | 安装：`make hooks` |
 | `check_doc_inventory.py` | 校验器套件自身接线一致性：每个 `check_*.py` 须同时接入 `check_all` / `ci.yml` / `README`，防 harness 自身漂移 | 硬阻断 |
 | `check_coverage_doc.py` | 校验 [`docs/coverage.md`](docs/coverage.md) 已列全 `scripts/` 下全部校验器，防工程化收口文档漂移 | 硬阻断 |

@@ -13,6 +13,7 @@
 
 提示项（不阻断，仅罗列引导清理）：
   - 非 main / 非测试库代码中的 `fmt.Print*` / `println(`（应走结构化日志）。
+  - 非 main / 非测试库代码中的 `log.Fatal` / `os.Exit`（库内不应直接中止进程，应返回 error）。
   - 非测试库代码中的 `panic(`（允许 `Result.Must` 等显式 .unwrap 语义，须人工确认）。
   - `TODO`/`FIXME`/`HACK`/`XXX` 技术债标记。
 
@@ -28,7 +29,8 @@ SRC = os.path.join(ROOT, "src")
 
 CRIT_IOUTIL = re.compile(r'\bioutil\.')
 CRIT_TIME_AFTER = re.compile(r'\btime\.After\(')
-WARN_FMT = re.compile(r'\bfmt\.(Print|Println|Printf|Fprint|Fprintf|Fprintln|Println)\b|\bprintln\(')
+WARN_FMT = re.compile(r'\bfmt\.(Print|Println|Printf|Fprint|Fprintf|Fprintln)\b|\bprintln\(')
+WARN_FATAL = re.compile(r'\b(log\.(Fatal|Fatalf|Fatalln)|os\.Exit)\b')
 WARN_PANIC = re.compile(r'\bpanic\(')
 WARN_TODO = re.compile(r'(?://|/\*)\s*(TODO|FIXME|HACK|XXX)\b')
 
@@ -63,7 +65,7 @@ def iter_go():
 
 def main() -> int:
     critical = []   # (file, line_no, kind, text)
-    warn_fmt, warn_panic, warn_todo = [], [], []
+    warn_fmt, warn_fatal, warn_panic, warn_todo = [], [], [], []
 
     for path in iter_go():
         is_test = path.endswith('_test.go')
@@ -81,6 +83,8 @@ def main() -> int:
                 # 提示
                 if not is_test and not is_main and WARN_FMT.search(code):
                     warn_fmt.append((rel, n, raw.strip()))
+                if not is_test and not is_main and WARN_FATAL.search(code):
+                    warn_fatal.append((rel, n, raw.strip()))
                 if not is_test and WARN_PANIC.search(code):
                     warn_panic.append((rel, n, raw.strip()))
                 if WARN_TODO.search(code):
@@ -90,6 +94,10 @@ def main() -> int:
     if warn_fmt:
         print(f"\n[提示] 库代码中的 fmt.Print*（应走结构化日志，{len(warn_fmt)} 处）:")
         for rel, n, t in warn_fmt:
+            print(f"  - {rel}:{n}  {t}")
+    if warn_fatal:
+        print(f"\n[提示] 库代码中的 log.Fatal/os.Exit（库内不应直接中止进程，{len(warn_fatal)} 处）:")
+        for rel, n, t in warn_fatal:
             print(f"  - {rel}:{n}  {t}")
     if warn_panic:
         print(f"\n[提示] 库代码中的 panic（含 .unwrap 语义须人工确认，{len(warn_panic)} 处）:")

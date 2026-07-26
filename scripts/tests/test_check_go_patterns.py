@@ -25,6 +25,14 @@ def test_todo_warn():
     assert gp.WARN_TODO.search("// TODO: clean up")
 
 
+def test_fatal_warn():
+    assert gp.WARN_FATAL.search("log.Fatalf(\"boom %v\", err)")
+    assert gp.WARN_FATAL.search("os.Exit(1)")
+    # 不应误伤普通日志
+    assert not gp.WARN_FATAL.search("log.Printf(\"ok\")")
+    assert not gp.WARN_FATAL.search("log.Fatalv(x)")
+
+
 def test_strip_comment_basic():
     assert gp.strip_comment("a := 1 // comment") == "a := 1 "
 
