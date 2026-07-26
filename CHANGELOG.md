@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–137，共 95 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
+> 覆盖 cycle 39–138，共 96 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -144,6 +144,7 @@
 - **[127] `ci_gate_target_127`** — make ci 本地等效 CI 门禁 + CI gate job 跑统一编排器check_all.py(防御纵深)（隐性：CI 仅逐条跑各脚本,统一编排器check_all.py本身的聚合/退出码/warn_only逻辑从未在CI被验证;且本地无单一入口秒级复跑整条门禁链(只有make docs跑check_all,但缺校验器自测)；score=14）
 - **[129] `license_mit`** — MIT 开源许可证(治理合规)（隐性：公开发布仓库无 OSI 许可证,默认保留所有权利,阻塞复用/贡献；score=14）
 - **[130] `security_policy`** — SECURITY.md 漏洞披露政策(安全治理)（隐性：已落地密钥扫描门禁(check_secrets)但外部研究者无漏洞上报渠道,安全门禁缺人工闭环；score=15）
+- **[138] `bench_guard_wired`** — 接通休眠的性能回归护栏(check_bench_regression 此前从未被调用)（隐性：check_bench_regression.py 自 cycle116 存在却未被 make/CI 调用,且 bench-baseline.json 为空 {},护栏实际失效(R2 harness 漂移,cycle110/133 同类)；score=16）
 
 ---
 

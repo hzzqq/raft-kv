@@ -121,7 +121,16 @@ fmt:
 smoke:
 	./scripts/smoke.sh
 
-# 基准：跑 raft 提交路径基准（BenchmarkRaftAgree 等）各一次，量化提交吞吐。
-# 需要连后端压测时也可用：make cli args="bench mixed 2000 8"（连已启动网关）。
+# 基准 + 回归门禁：跑全包热点路径基准（metrics/util/transport/raft 共 9 个），
+# 产出 bench.out 并经 scripts/check_bench_regression.py 与 scripts/bench-baseline.json
+# 比对，回退超 10% 即失败（守护 #116 建立的性能基线不被静默拉回）。
+# bench.out 已被 .gitignore 的 *.out 忽略。
 bench:
-	$(GO) test -run='^$$' -bench=. -benchtime=1x ./src/raft
+	$(GO) test -run='^$$' -bench=. -benchtime=1x ./src/... > bench.out 2>&1 || true
+	python3 scripts/check_bench_regression.py --bench bench.out --baseline scripts/bench-baseline.json
+
+# 刷新基线：用当前实测值重写 scripts/bench-baseline.json（合并，保留未比对项）。
+# 仅在「确认本次性能变化是有意为之」时运行；日常应让 make bench 守护基线。
+bench-update:
+	$(GO) test -run='^$$' -bench=. -benchtime=3x ./src/... > bench.out 2>&1 || true
+	python3 scripts/check_bench_regression.py --bench bench.out --baseline scripts/bench-baseline.json --update-baseline
