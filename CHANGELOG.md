@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–139，共 97 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
+> 覆盖 cycle 39–140，共 98 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -137,6 +137,7 @@
 - **[136] `leaked_artifacts`** — 构建/覆盖率临时产物泄漏护栏(check_leaked_artifacts)（隐性：go test -coverprofile 写出的 covtest_* 临时目录未被 .gitignore 覆盖(根目录 cfg.json 可误提交),工作树污染无人察觉(R2)；score=17）
 - **[137] `check_all_json`** — check_all.py --json 机器可读门禁报告（隐性：统一门禁结果仅文本输出,CI/看板无法程序化消费聚合结果(R2 可观测缺口);且 --json 初版未捕获子进程 stdout 致 JSON 被污染；score=15）
 - **[139] `go_patterns_fatal`** — check_go_patterns 新增 log.Fatal/os.Exit 库代码 WARN 模式（隐性：库代码(main/测试除外)中 log.Fatal/os.Exit 会直接中止进程,此前未被任何门禁覆盖(R2 隐性错误面)；score=14）
+- **[140] `godoc_pkg_doc`** — godoc 包级文档注释(// Package X)覆盖的软提示（隐性：14 个导出包全部缺 // Package 包级文档,go doc 包概览为空却无人察觉;设为硬失败会打挂 CI 故仅软提示(R2 可观测盲区)；score=14）
 
 ## other
 

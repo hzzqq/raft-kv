@@ -7,7 +7,11 @@
   - 方法 `func (r *T) M(` / `func (r T) M(`：仅当 T 与 M 均为大写（对外可见）→ 必须有文档注释。
   - 排除 `_test.go`、`func main`、`func init`、`//go:build` / `// Code generated` 等代码生成指令。
 
-退出码：发现缺失 → 1；全部具备 → 0。纯静态文本扫描，免 Go 工具链。
+此外，对「导出包」（含导出标识符的包）额外给出 **包级文档注释**（`// Package <名>`）
+覆盖的**软提示**（不计入失败）：包级 doc 缺失时 `go doc <pkg>` 包概览为空，但补全是
+批量文档工作，故仅提示、不阻断门禁。
+
+退出码：发现导出标识符缺失 → 1；全部具备 → 0。纯静态文本扫描，免 Go 工具链。
 """
 import os
 import re
@@ -21,6 +25,7 @@ DOC_DIRECTIVES = ("//go:", "// Code generated", "// +build")
 type_re = re.compile(r"^type\s+([A-Z]\w*)\b")
 func_re = re.compile(r"^func\s+")
 main_re = re.compile(r"^func\s+(main|init)\s*\(")
+package_re = re.compile(r"^package\s+(\w+)")
 
 
 def exported_method(m):
@@ -101,17 +106,59 @@ def scan_file(path):
     return findings
 
 
+def file_has_exports(path):
+    """该文件是否声明了任何导出标识符（用于判断包是否「导出包」）。"""
+    try:
+        lines = open(path, "r", encoding="utf-8", errors="replace").read().split("\n")
+    except OSError:
+        return False
+    for line in lines:
+        if type_re.match(line):
+            return True
+        if func_re.match(line) and not main_re.match(line):
+            if re.match(r"^func\s*\(([^)]*)\)\s+([A-Z]\w*)\s*\(", line):
+                return True
+            if re.match(r"^func\s+([A-Z]\w*)\s*\(", line):
+                return True
+    return False
+
+
+def package_has_doc(path):
+    """该文件是否在 `package` 子句上方带有 `// Package <名>` 包级文档注释。"""
+    try:
+        lines = open(path, "r", encoding="utf-8", errors="replace").read().split("\n")
+    except OSError:
+        return False
+    for idx, line in enumerate(lines):
+        if package_re.match(line):
+            i = idx - 1
+            while i >= 0 and lines[i].strip() == "":
+                i -= 1
+            if i >= 0 and lines[i].strip().startswith("// Package"):
+                return True
+            return False
+    return False
+
+
 def main():
     target = sys.argv[1] if len(sys.argv) > 1 else SRC
     total = 0
     files_with = 0
+    pkg_dirs = {}   # dir -> 是否导出包
+    pkg_doc = {}    # dir -> 是否含包级文档
     for dirpath, dirs, files in os.walk(target):
         # 跳过 vendored / 生成目录
         if any(seg in dirpath for seg in ("/vendor/", "\\vendor\\")):
             continue
-        for fn in files:
-            if not fn.endswith(".go") or fn.endswith("_test.go"):
-                continue
+        gos = [f for f in files
+               if f.endswith(".go") and not f.endswith("_test.go")]
+        if not gos:
+            continue
+        pkg_dirs[dirpath] = any(
+            file_has_exports(os.path.join(dirpath, f)) for f in gos)
+        pkg_doc[dirpath] = any(
+            package_has_doc(os.path.join(dirpath, f)) for f in gos)
+        for fn in gos:
             fpath = os.path.join(dirpath, fn)
             rel = os.path.relpath(fpath, ROOT)
             f = scan_file(fpath)
@@ -121,6 +168,15 @@ def main():
                 print("::godoc-gap:: %s" % rel)
                 for ln, kind, name in f:
                     print("    L%-4d %-7s %s" % (ln, kind, name))
+    # 包级文档覆盖：仅作软提示，不计入失败总数（避免批量文档工作阻断门禁）
+    pkg_missing = sorted(
+        os.path.relpath(d, ROOT) for d, has in pkg_dirs.items()
+        if has and not pkg_doc[d])
+    if pkg_missing:
+        print("\n[提示] %d 个导出包缺少 '// Package <名>' 包级文档注释"
+              "（go doc 包概览为空；仅提示，不阻断）：" % len(pkg_missing))
+        for d in pkg_missing:
+            print("    - %s" % d)
     if total:
         print("\n发现 %d 处导出标识符缺少 godoc 文档注释（%d 个文件）。" % (total, files_with))
         print("建议：在对应声明上方补 '// <说明>'。")

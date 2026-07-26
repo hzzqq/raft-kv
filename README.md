@@ -242,7 +242,7 @@ export GO111MODULE=on
 | `pre-commit.sh` | 提交前门禁：串起上述全部校验，任一失败即阻断 `git commit` | 安装：`make hooks` |
 | `check_doc_inventory.py` | 校验器套件自身接线一致性：每个 `check_*.py` 须同时接入 `check_all` / `ci.yml` / `README`，防 harness 自身漂移 | 硬阻断 |
 | `check_coverage_doc.py` | 校验 [`docs/coverage.md`](docs/coverage.md) 已列全 `scripts/` 下全部校验器，防工程化收口文档漂移 | 硬阻断 |
-| `check_godoc.py` | 扫描 `src/**/*.go`，所有导出 `type` / 包级 `func` / 对外可见 `method` 必须具备 `//` 文档注释（`go doc` 可见性），防 API 自描述缺失 | 硬阻断 |
+| `check_godoc.py` | 扫描 `src/**/*.go`，所有导出 `type` / 包级 `func` / 对外可见 `method` 必须具备 `//` 文档注释（`go doc` 可见性）；另对导出包缺 `// Package <名>` 包级文档给出软提示（不阻断） | 硬阻断（标识符）/ 软提示（包级文档） |
 | `check_test_coverage.py` | 免 Go 测试纪律护栏：扫描 `src/**` 各 Go 包，标记「无 `_test.go`」硬缺口，并提示「定义但未在包测试中被引用」的导出函数/类型（软提示，可能含间接覆盖的结果类型） | 软提示（WARN） |
 | `check_hooks_installed.py` | 提交门禁钩子安装状态：`.git/hooks/pre-commit` 须存在、可执行且与 `scripts/pre-commit.sh` 一致，否则门禁静默失效 | 软提示（WARN） |
 | `check_secrets.py` | 密钥/凭证泄露扫描：PEM 私钥 / AWS AKIA / AWS SK 字面量（HARD）；明文口令/Slack/GitHub token（WARN） | 硬阻断（凭证泄露） |

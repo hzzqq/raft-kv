@@ -67,6 +67,31 @@ def test_exported_method_parse():
     assert cg.exported_method("func (r *Foo) bar() {}") == ((True, False), "bar")
 
 
+def _pkg_fixture(pkgdoc: bool) -> str:
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "sample.go")
+    header = "// Package fixture is a sample.\n" if pkgdoc else ""
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(header + "package fixture\n\n" + "type Foo struct{}\n")
+    return p
+
+
+def test_package_has_doc_true():
+    assert cg.package_has_doc(_pkg_fixture(True)) is True
+
+
+def test_package_has_doc_false():
+    assert cg.package_has_doc(_pkg_fixture(False)) is False
+
+
+def test_file_has_exports_true():
+    assert cg.file_has_exports(_fixture("type Foo struct{}\n")) is True
+
+
+def test_file_has_exports_false():
+    assert cg.file_has_exports(_fixture("type foo struct{}\nfunc (f *foo) bar(){}\n")) is False
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
