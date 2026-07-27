@@ -36,9 +36,22 @@ type Cluster struct {
 	maxraftstate int
 }
 
-// StartCluster 启动一个含 nSM 个 ShardMaster 副本、nGroups 个 replica group
-// （每组 nReplicas 副本）的内存集群。maxraftstate>0 时开启日志压缩。
-func StartCluster(nGroups, nReplicas, nSM, maxraftstate int) *Cluster {
+// PersisterFactory 为集群中每个节点构造持久化器。kind 为 "sm"(ShardMaster) 或 "kv"(ShardKV)，
+// g/r 为 group 下标 / 副本下标（ShardMaster 的 g 传 -1）。内存部署用 MakeEmptyPersister；
+// 真部署化可返回 raft.NewFilePersister(dir) 以获得崩溃恢复能力。
+type PersisterFactory func(kind string, g, r int) raft.Persister
+
+// FilePersisterFactory 返回把每个节点状态落盘到 baseDir/node-<kind>-<g>-<r> 的工厂，
+// 供真部署化（崩溃恢复）使用：进程重启复用同一 baseDir 即可恢复状态。
+func FilePersisterFactory(baseDir string) PersisterFactory {
+	return func(kind string, g, r int) raft.Persister {
+		dir := fmt.Sprintf("%s/node-%s-%d-%d", baseDir, kind, g, r)
+		return raft.NewFilePersister(dir)
+	}
+}
+
+// StartClusterWithPersister 同 StartCluster，但允许注入持久化器工厂（真部署化：落盘 FilePersister）。
+func StartClusterWithPersister(nGroups, nReplicas, nSM, maxraftstate int, pf PersisterFactory) *Cluster {
 	net := raft.MakeNetwork()
 	c := &Cluster{
 		Net:          net,
@@ -79,7 +92,7 @@ func StartCluster(nGroups, nReplicas, nSM, maxraftstate int) *Cluster {
 			net.Connect(j*nSM+k, k)
 			peers[k] = e
 		}
-		p := raft.MakeEmptyPersister()
+		p := pf("sm", -1, j)
 		sm := shardmaster.Make(peers, j, p)
 		c.SM = append(c.SM, sm)
 		jj := j
@@ -116,7 +129,7 @@ func StartCluster(nGroups, nReplicas, nSM, maxraftstate int) *Cluster {
 				peers[r2] = e
 			}
 			applyCh := make(chan raft.ApplyMsg, 4000)
-			p := raft.MakeEmptyPersister()
+			p := pf("kv", g, r)
 			rf := raft.Make(peers, r, p, applyCh)
 			kv := shardkv.MakeShardKV(g+1, c.SMNames, make_end, rf, applyCh, maxraftstate)
 			c.KVs[g] = append(c.KVs[g], kv)
@@ -124,17 +137,17 @@ func StartCluster(nGroups, nReplicas, nSM, maxraftstate int) *Cluster {
 			// 捕获 g/r 为局部副本，避免闭包共享循环变量（仅 default panic 分支用到）。
 			gg, rr := g, r
 			net.AddServer(id, func(method string, args, reply interface{}) {
-			switch method {
-			case "RequestVote":
-				rf.RequestVote(args.(*raft.RequestVoteArgs), reply.(*raft.RequestVoteReply))
-			case "RequestPreVote":
-				rf.RequestPreVote(args.(*raft.RequestPreVoteArgs), reply.(*raft.RequestPreVoteReply))
-			case "AppendEntries":
-				rf.AppendEntries(args.(*raft.AppendEntriesArgs), reply.(*raft.AppendEntriesReply))
-			case "InstallSnapshot":
-				rf.InstallSnapshot(args.(*raft.InstallSnapshotArgs), reply.(*raft.InstallSnapshotReply))
-			case "TimeoutNow":
-				rf.TimeoutNow(args.(*raft.TimeoutNowArgs), reply.(*raft.TimeoutNowReply))
+				switch method {
+				case "RequestVote":
+					rf.RequestVote(args.(*raft.RequestVoteArgs), reply.(*raft.RequestVoteReply))
+				case "RequestPreVote":
+					rf.RequestPreVote(args.(*raft.RequestPreVoteArgs), reply.(*raft.RequestPreVoteReply))
+				case "AppendEntries":
+					rf.AppendEntries(args.(*raft.AppendEntriesArgs), reply.(*raft.AppendEntriesReply))
+				case "InstallSnapshot":
+					rf.InstallSnapshot(args.(*raft.InstallSnapshotArgs), reply.(*raft.InstallSnapshotReply))
+				case "TimeoutNow":
+					rf.TimeoutNow(args.(*raft.TimeoutNowArgs), reply.(*raft.TimeoutNowReply))
 				case "ShardKV.Get":
 					kv.Get(args.(*shardkv.GetArgs), reply.(*shardkv.GetReply))
 				case "ShardKV.PutAppend":
@@ -150,6 +163,13 @@ func StartCluster(nGroups, nReplicas, nSM, maxraftstate int) *Cluster {
 		}
 	}
 	return c
+}
+
+// StartCluster 启动一个内存集群（Persister 工厂默认返回内存实现），保持旧调用方兼容。
+// 需要崩溃安全持久化时改用 StartClusterWithPersister + FilePersisterFactory。
+func StartCluster(nGroups, nReplicas, nSM, maxraftstate int) *Cluster {
+	return StartClusterWithPersister(nGroups, nReplicas, nSM, maxraftstate,
+		func(string, int, int) raft.Persister { return raft.MakeEmptyPersister() })
 }
 
 // Clerk 返回一个绑定到本集群 ShardMaster 的 ShardKV 客户端。

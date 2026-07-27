@@ -129,8 +129,8 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 
 | 模块 (包) | 源码文件 | 测试文件 | 有测试 | 高信号未覆盖导出符号 |
 |-----------|---------:|--------:|:------:|---------------------:|
-| `cluster` | 1 | 1 | ✅ | ConfigNum |
-| `demo` | 1 | 4 | ✅ | — |
+| `cluster` | 1 | 2 | ✅ | ConfigNum |
+| `demo` | 1 | 4 | ✅ | RunDemoPersistent |
 | `diagnostics` | 2 | 3 | ✅ | — |
 | `gateway` | 6 | 18 | ✅ | Flush, LoadGatewayConfig, SetCORS, SetHTTPServer, GroupStatus, GroupView, RaftStatusView |
 | `kvcli` | 16 | 25 | ✅ | MSetCtx, BatchResult, BenchResult, MDelResult, MSetResult |
@@ -144,6 +144,6 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 | `util` | 24 | 28 | ✅ | ExpBackoff, MarshalJSON, CbState |
 | `version` | 1 | 1 | ✅ | — |
 
-> 汇总：14 个包，0 个无测试；未引用导出符号 func=19 / type=17 / var=2 / const=0。「未覆盖符号」为软提示，可能含被间接覆盖的结果/视图类型。
+> 汇总：14 个包，0 个无测试；未引用导出符号 func=20 / type=17 / var=2 / const=0。「未覆盖符号」为软提示，可能含被间接覆盖的结果/视图类型。
 
 <!-- test-coverage-table:end -->

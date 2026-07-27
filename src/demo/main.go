@@ -62,10 +62,22 @@ func demoGatewayHandler(ck *shardkv.Clerk) http.Handler {
 	return mux
 }
 
-// RunDemo 启动一个内存集群并跑一遍演示流程，返回结果摘要（便于单测断言）。
+// RunDemo 启动内存集群跑演示（兼容既有单测）。
 func RunDemo() string {
 	c := cluster.StartCluster(2, 3, 3, 0)
 	defer c.Cleanup()
+	return runDemoOn(c)
+}
+
+// RunDemoPersistent 启动落盘持久化的集群跑演示（真部署化：崩溃复用同一目录可恢复）。
+func RunDemoPersistent(dataDir string) string {
+	c := cluster.StartClusterWithPersister(2, 3, 3, 0, cluster.FilePersisterFactory(dataDir))
+	defer c.Cleanup()
+	return runDemoOn(c)
+}
+
+// runDemoOn 在给定集群上跑完整演示流程，返回结果摘要（便于单测断言）。
+func runDemoOn(c *cluster.Cluster) string {
 	ck := c.Clerk()
 
 	// 定期把指标快照 dump 到 stderr，演示 metrics 的周期性可观测能力（cycle 26）。
@@ -252,7 +264,15 @@ func main() {
 		fmt.Print(FormatStartupReport(report))
 		fmt.Println("raft-kv demo starting...")
 	}
-	out := RunDemo()
+	dataDir := os.Getenv("RAFT_KV_DATA_DIR")
+	var out string
+	if dataDir != "" {
+		// 真部署化演示：状态落盘，演示结束后同一目录在进程重启时可恢复。
+		out = RunDemoPersistent(dataDir)
+		fmt.Printf("[demo] 持久化目录: %s\n", dataDir)
+	} else {
+		out = RunDemo()
+	}
 	if report.Mode != "quiet" {
 		fmt.Println("demo result:", out)
 		fmt.Println("raft-kv demo done.")
