@@ -115,7 +115,7 @@ type ShardMaster struct {
 
 // ============================== 构造 ==============================
 
-func Make(peers []*raft.ClientEnd, me int, persister *raft.Persister) *ShardMaster {
+func Make(peers []*raft.ClientEnd, me int, persister raft.Persister) *ShardMaster {
 	sm := &ShardMaster{
 		me:       me,
 		applyCh:  make(chan raft.ApplyMsg, 100),

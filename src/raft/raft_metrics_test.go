@@ -10,7 +10,7 @@ func TestRaftLogAppendsMetric(t *testing.T) {
 		role:       Leader,
 		currentTerm: 1,
 		log:        []LogEntry{},
-		persister:  &Persister{},
+		persister:  MakeEmptyPersister(),
 	}
 	before := Metrics.Counter("raft_log_appends_total").Value()
 	if _, _, ok := rf.Start(nil); !ok {

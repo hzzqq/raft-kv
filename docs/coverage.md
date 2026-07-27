@@ -136,7 +136,7 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 | `kvcli` | 16 | 25 | ✅ | MSetCtx, BatchResult, BenchResult, MDelResult, MSetResult |
 | `kvraft` | 1 | 4 | ✅ | OpResult |
 | `metrics` | 4 | 8 | ✅ | Desc, SetDesc |
-| `raft` | 3 | 9 | ✅ | Call, CondInstallSnapshot, RaftStateSize, Send, String, RpcMsg |
+| `raft` | 4 | 10 | ✅ | Call, CondInstallSnapshot, RaftStateSize, Send, String, RpcMsg |
 | `shardkv` | 15 | 23 | ✅ | GetE, PutE, MigrationPlan, MigrationStep |
 | `shardmaster` | 14 | 17 | ✅ | String, ConfigDelta, PlanResult |
 | `statusfmt` | 1 | 4 | ✅ | — |

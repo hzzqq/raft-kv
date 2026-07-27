@@ -14,7 +14,7 @@ func TestRaftStatusLeader(t *testing.T) {
 		log:          []LogEntry{{Term: 1}, {Term: 2}},
 		commitIndex:  1,
 		lastApplied:  0,
-		persister:    &Persister{},
+		persister:    MakeEmptyPersister(),
 	}
 	st := rf.Status()
 	if st.Role != Leader {
@@ -46,7 +46,7 @@ func TestRaftStatusFollowerLeaderID(t *testing.T) {
 		currentTerm: 1,
 		leaderId:  5,
 		log:       []LogEntry{},
-		persister: &Persister{},
+		persister: MakeEmptyPersister(),
 	}
 	st := rf.Status()
 	if st.Role != Follower {
@@ -65,7 +65,7 @@ func TestRaftStatusNoDeadlockOnLease(t *testing.T) {
 		role:      Leader,
 		currentTerm: 1,
 		log:       []LogEntry{{Term: 1}},
-		persister: &Persister{},
+		persister: MakeEmptyPersister(),
 		// peers/lastContact 留空：hasLeaderLeaseLocked 对空集群返回 false（contacted=0），不应 panic。
 	}
 	done := make(chan RaftStatus, 1)

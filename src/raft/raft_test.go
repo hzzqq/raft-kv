@@ -16,7 +16,7 @@ type config struct {
 	rafts      []*Raft
 	endnames   [][]*ClientEnd
 	applyCh    []chan ApplyMsg
-	persisters []*Persister
+	persisters []Persister
 	logs       [][]interface{} // 各节点已应用的状态机命令（按序）
 	connected  []bool
 	n          int
@@ -29,7 +29,7 @@ func makeConfig(t testing.TB, n int) *config {
 	cfg.rafts = make([]*Raft, n)
 	cfg.endnames = make([][]*ClientEnd, n)
 	cfg.applyCh = make([]chan ApplyMsg, n)
-	cfg.persisters = make([]*Persister, n)
+	cfg.persisters = make([]Persister, n)
 	cfg.logs = make([][]interface{}, n)
 	cfg.connected = make([]bool, n)
 

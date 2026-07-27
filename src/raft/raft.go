@@ -143,7 +143,7 @@ type InstallSnapshotReply struct {
 type Raft struct {
 	mu        sync.Mutex
 	peers     []*ClientEnd
-	persister *Persister
+	persister Persister
 	me        int
 	dead      int32
 	applyCh   chan ApplyMsg
@@ -1062,7 +1062,7 @@ func (rf *Raft) applier() {
 
 // ============================== Make ==============================
 
-func Make(peers []*ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
+func Make(peers []*ClientEnd, me int, persister Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{
 		peers:             peers,
 		persister:         persister,

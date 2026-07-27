@@ -23,7 +23,7 @@ type skvConfig struct {
 	make_end     func(string) *raft.ClientEnd
 	groups       [][]*ShardKV
 	groupNames   [][]string
-	kvPersist    [][]*raft.Persister // 每个副本的持久化器（崩溃恢复测试用：重启时复用同一 persister 恢复状态）
+	kvPersist    [][]raft.Persister // 每个副本的持久化器（崩溃恢复测试用：重启时复用同一 persister 恢复状态）
 	nGroups      int
 	nReplicas    int
 	nSM          int
@@ -42,7 +42,7 @@ func makeSKVConfig(t testing.TB, nGroups, nReplicas, nSM, maxraftstate int) *skv
 		cache:        map[string]*raft.ClientEnd{},
 		groups:       make([][]*ShardKV, nGroups),
 		groupNames:   make([][]string, nGroups),
-		kvPersist:    make([][]*raft.Persister, nGroups),
+		kvPersist:    make([][]raft.Persister, nGroups),
 		nGroups:      nGroups,
 		nReplicas:    nReplicas,
 		nSM:          nSM,

@@ -18,7 +18,7 @@ type kvConfig struct {
 	clerks       []*Clerk
 	rafts        [][]*raft.ClientEnd
 	kvEnds       []*raft.ClientEnd
-	persisters   []*raft.Persister
+	persisters   []raft.Persister
 	applyCh      []chan raft.ApplyMsg
 	connected    []bool
 	n            int
@@ -37,7 +37,7 @@ func makeKVConfig(t *testing.T, n int, maxraftstate ...int) *kvConfig {
 	ck.clerks = make([]*Clerk, n)
 	ck.rafts = make([][]*raft.ClientEnd, n)
 	ck.kvEnds = make([]*raft.ClientEnd, n)
-	ck.persisters = make([]*raft.Persister, n)
+	ck.persisters = make([]raft.Persister, n)
 	ck.applyCh = make([]chan raft.ApplyMsg, n)
 	ck.connected = make([]bool, n)
 	for i := 0; i < n; i++ {
