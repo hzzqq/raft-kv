@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -14,37 +15,47 @@ import (
 )
 
 func main() {
-	nGroups := 2
-	addr := ":8080"
-	dataDir := os.Getenv("RAFT_KV_DATA_DIR")
-	if len(os.Args) > 1 {
-		addr = os.Args[1]
-	}
-	if len(os.Args) > 2 {
-		dataDir = os.Args[2]
-	}
+	addr := flag.String("addr", ":8080", "HTTP 网关监听地址")
+	dataDir := flag.String("data-dir", "", "节点状态落盘目录（空=内存）")
+	tcpCfg := flag.String("tcp-config", "", "跨机部署节点地址清单 JSON（指定则走真实 TCP 传输）")
+	flag.Parse()
 
 	var c *cluster.Cluster
-	if dataDir != "" {
+	switch {
+	case *tcpCfg != "":
+		// 跨机部署：节点间 RPC 走真实 TCP（src/transport），可分布到不同进程/机器。
+		cfg, err := cluster.LoadTCPConfig(*tcpCfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "load tcp config:", err)
+			os.Exit(1)
+		}
+		c, err = cluster.StartClusterFromConfig(cfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "start cluster:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("raft-kv gateway 跨机模式: %s (groups=%d)\n", *tcpCfg, len(c.Groups))
+	case *dataDir != "":
 		// 真部署化：把每个节点的 Raft 状态/快照落盘，进程崩溃重启复用同一目录即可恢复。
-		c = cluster.StartClusterWithPersister(nGroups, 3, 3, 0, cluster.FilePersisterFactory(dataDir))
-		fmt.Printf("raft-kv gateway 持久化目录: %s\n", dataDir)
-	} else {
-		c = cluster.StartCluster(nGroups, 3, 3, 0)
+		c = cluster.StartClusterWithPersister(2, 3, 3, 0, cluster.FilePersisterFactory(*dataDir))
+		fmt.Printf("raft-kv gateway 持久化目录: %s\n", *dataDir)
+	default:
+		c = cluster.StartCluster(2, 3, 3, 0)
 	}
 	defer c.Cleanup()
 
+	nGroups := len(c.Groups)
 	s := NewServer(c)
 	s.Init(nGroups)
 
-	srv := &http.Server{Addr: addr, Handler: s.Handler()}
+	srv := &http.Server{Addr: *addr, Handler: s.Handler()}
 	s.SetHTTPServer(srv)
 
 	// 优雅退出：捕获 SIGINT/SIGTERM，先等待在途请求完成、再关闭监听，最后 defer 清理集群。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Printf("raft-kv gateway listening on %s (groups=%d)\n", addr, nGroups)
+	fmt.Printf("raft-kv gateway listening on %s (groups=%d)\n", *addr, nGroups)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintln(os.Stderr, "gateway error:", err)

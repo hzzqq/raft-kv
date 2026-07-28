@@ -13,6 +13,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -137,7 +138,7 @@ func runDemoOn(c *cluster.Cluster) string {
 	if putResp != nil {
 		putResp.Body.Close()
 	}
-	getResp, _ := get(base + "/kv/dkey")
+	getResp, _ := get("/kv/dkey") // get 内部已拼 base；曾误传 base+path 造成 URL 双重前缀必失败
 	dval := ""
 	if getResp != nil {
 		b, _ := io.ReadAll(getResp.Body)
@@ -149,7 +150,7 @@ func runDemoOn(c *cluster.Cluster) string {
 	if appResp != nil {
 		appResp.Body.Close()
 	}
-	getResp2, _ := get(base + "/kv/dkey")
+	getResp2, _ := get("/kv/dkey")
 	dval2 := ""
 	if getResp2 != nil {
 		b, _ := io.ReadAll(getResp2.Body)
@@ -157,7 +158,7 @@ func runDemoOn(c *cluster.Cluster) string {
 		getResp2.Body.Close()
 	}
 	metricsBody := ""
-	mResp, _ := get(base + "/metrics")
+	mResp, _ := get("/metrics")
 	if mResp != nil {
 		b, _ := io.ReadAll(mResp.Body)
 		metricsBody = string(b)
@@ -259,6 +260,9 @@ func FormatStartupReport(r StartupReport) string {
 }
 
 func main() {
+	tcpCfg := flag.String("tcp-config", "", "跨机部署节点地址清单 JSON（指定则走真实 TCP 传输的 RunDemoTCP）")
+	flag.Parse()
+
 	report := CollectStartupReport()
 	if report.Mode != "quiet" {
 		fmt.Print(FormatStartupReport(report))
@@ -266,15 +270,39 @@ func main() {
 	}
 	dataDir := os.Getenv("RAFT_KV_DATA_DIR")
 	var out string
-	if dataDir != "" {
+	switch {
+	case *tcpCfg != "":
+		// 跨机演示：节点间 RPC 走真实 TCP（src/transport），分布到不同监听地址。
+		var err error
+		out, err = RunDemoTCP(*tcpCfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "[demo] tcp:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("[demo] 跨机模式: %s\n", *tcpCfg)
+	case dataDir != "":
 		// 真部署化演示：状态落盘，演示结束后同一目录在进程重启时可恢复。
 		out = RunDemoPersistent(dataDir)
 		fmt.Printf("[demo] 持久化目录: %s\n", dataDir)
-	} else {
+	default:
 		out = RunDemo()
 	}
 	if report.Mode != "quiet" {
 		fmt.Println("demo result:", out)
 		fmt.Println("raft-kv demo done.")
 	}
+}
+
+// RunDemoTCP 按 tcp-config 启动跨机集群跑演示（真实 TCP 传输层）。
+func RunDemoTCP(cfgPath string) (string, error) {
+	cfg, err := cluster.LoadTCPConfig(cfgPath)
+	if err != nil {
+		return "", err
+	}
+	c, err := cluster.StartClusterFromConfig(cfg)
+	if err != nil {
+		return "", err
+	}
+	defer c.Cleanup()
+	return runDemoOn(c), nil
 }

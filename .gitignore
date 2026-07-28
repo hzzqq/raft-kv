@@ -49,3 +49,9 @@ bin/
 raft-kv-gateway.pid
 raft-kv-gateway.log
 *.pid
+
+# build_local.py 内存下载的本地 Go 工具链与构建缓存（体积大、机器相关，勿提交）
+.go-sdk/
+.gocache/
+.gopath/
+.tcp_test_out.log

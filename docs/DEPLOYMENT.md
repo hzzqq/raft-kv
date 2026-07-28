@@ -122,13 +122,68 @@ go test ./src/cluster/ -run TestClusterCrashRecovery -v
 > 注：本机 Windows 环境无 gcc，按项目纪律**不启用 `-race`**；
 > 该测试验证的是「持久化 → 重启恢复」链路，不覆盖并发竞态。
 
+### 2.5 跨机部署（真实 TCP）
+
+`src/transport` 是零依赖、gRPC 风格的真实 TCP 传输层（长度前缀帧 + 方法路由 + 错误帧 +
+连接池 + optional TLS），此前仅 `gateway` 的 HTTP 面使用。现已把它接到 `cluster` 的
+`make_end`，节点间 RPC 走真实网络而非进程内 channel，从而可分布到不同进程/机器。
+
+**核心改动**：
+- `raft.ClientEnd` 支持可选 `sendFn`：设置后 `Call` 走自定义发送函数而非内存 `Network`。
+- `cluster.StartClusterTCP(nGroups, nReplicas, nSM, maxraftstate, pf, addrs)`：每个节点起一个
+  `transport.Server`（注册「方法名 → 类型化 handler」分发），`make_end(name)` 返回走真实 TCP 的
+  `ClientEnd`（JSON 序列化 args/reply，完整方法名 `/raft/<Method>`）。
+- `cluster.StartClusterFromConfig` / `LoadTCPConfig`：从 JSON 清单加载，`gateway` / `demo` 的
+  `--tcp-config` 直接复用。
+
+**配置清单（tcp-config.json）**：
+
+```json
+{
+  "n_groups": 2, "n_replicas": 3, "n_sm": 3, "max_raft_state": 0,
+  "data_dir": "./data-tcp",
+  "nodes": [
+    {"name": "m0",   "addr": "127.0.0.1:10000"},
+    {"name": "m1",   "addr": "127.0.0.1:10001"},
+    {"name": "m2",   "addr": "127.0.0.1:10002"},
+    {"name": "g0-0", "addr": "127.0.0.1:10010"},
+    {"name": "g0-1", "addr": "127.0.0.1:10011"},
+    {"name": "g0-2", "addr": "127.0.0.1:10012"},
+    {"name": "g1-0", "addr": "127.0.0.1:10020"},
+    {"name": "g1-1", "addr": "127.0.0.1:10021"},
+    {"name": "g1-2", "addr": "127.0.0.1:10022"}
+  ]
+}
+```
+
+- 命名与内存模式一致：`m<j>` 为 ShardMaster、`g<g>-<r>` 为 ShardKV；`addrs` 必须覆盖全部
+  `nSM + nGroups*nReplicas` 个节点，否则 `StartClusterTCP` 直接报错。
+- `data_dir` 非空则各节点状态落盘（`FilePersister`），崩溃复用同一目录可恢复。
+
+**启动（多机把 addr 换成各机器 IP 即可）**：
+
+```bash
+# 网关跨机模式
+go run ./src/gateway --tcp-config tcp-config.json --addr :8080
+
+# 或 demo 跨机演示
+go run ./src/demo --tcp-config tcp-config.json
+```
+
+**验证**：`src/cluster/cluster_tcp_test.go` 的 `TestClusterTCPTransport` 在单进程内分配多个
+localhost 监听地址，用真实 TCP 串起 2-group 集群并跑通 Put/Get/跨组迁移——证明字节确实走
+真实网络（而非进程内 channel）。
+
+> TLS：把 `transport.ClientConn.DialTLS` / `Server.ServeTLS` 接入 `newTransportEnd` / `serveNode`
+> 即可启用加密传输（证书管理需自行提供），此处未默认开启。
+
 ---
 
 ## 三、已知边界（诚实清单）
 
-- **网络层是进程内 labrpc**：`demo` / `gateway` 的「集群」仍在同一进程内，
-  不是跨机部署。要跨机需把 `src/transport`（已具备真实 TCP + TLS 能力）接到
-  `cluster` 的 `make_end`，替换内存 `ClientEnd`——这是下一步，未在此交付内。
+- **跨机部署需用真实 TCP 清单驱动**：`demo` / `gateway` 默认仍是进程内集群（基于 labrpc
+  内存网络）；要跨机必须提供 `--tcp-config`（见 §2.5），把 `src/transport` 接到 `cluster`
+  的 `make_end`——此能力现已交付。
 - **无快照自动触发**：`maxraftstate=0` 时不做日志压缩，恢复靠全量日志重放；
   大状态场景应传入 `maxraftstate>0` 启用 `SaveSnapshot` 压缩。
-- **无鉴权 / 限流 / 多租户**：仅为工程标本，切勿直接暴露于公网。
+- **无鉴权 / 限流 / 多租户**：仅为工程标本，切勿直接暴露于公网；跨机部署时请置于可信网络内。

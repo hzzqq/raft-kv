@@ -35,6 +35,10 @@ import (
 const (
 	frameData  byte = 0
 	frameError byte = 1
+	// framePing 是应用层保活/健康探测帧：客户端发 ping（空 payload），服务端立即
+	// 回一个同类型帧（pong），不经过任何 handler。用于跨机部署里探测对端是否存活、
+	// 连接是否可用（比"发一次真 RPC 看是否报错"便宜且无副作用）。
+	framePing byte = 2
 
 	defaultMaxFrame = 16 << 20 // 16 MiB 单帧上限，防御超大帧打爆内存
 )
@@ -235,6 +239,13 @@ func (s *Server) serveConn(conn net.Conn) {
 		if err != nil {
 			return
 		}
+		if typ == framePing {
+			// 保活探测：立即回 pong，不进 handler、不计入 RPC 统计。
+			if err := writeFrame(w, framePing, nil); err != nil {
+				return
+			}
+			continue
+		}
 		if typ != frameData {
 			return // 协议错误：方法帧必须是数据帧
 		}
@@ -352,6 +363,10 @@ type ClientConn struct {
 	maxIdle     int
 	idleTimeout time.Duration
 	tlsCfg      *tls.Config
+	// dialAttempts / dialBackoff：建链瞬时失败（connection refused / 超时）时的有限重试，
+	// 提升跨机部署里"对端尚未起来"场景的鲁棒性。默认 1 次（不重试），保持既有行为。
+	dialAttempts int
+	dialBackoff  time.Duration
 
 	mu     sync.Mutex
 	idle   []*pooledConn
@@ -426,6 +441,16 @@ func (cc *ClientConn) SetDialTimeout(d time.Duration) {
 	cc.dialTO = d
 }
 
+// SetDialRetry 配置建链失败的有限重试：attempts 为总尝试次数（<=1 表示不重试，默认），
+// backoff 为首次重试前的等待，之后按 2 倍指数退避。适合跨机部署"对端尚未起来/瞬时抖动"
+// 场景；注意重试会拉长单次 Invoke 的最坏耗时，raft 这类自带重试的上层不必开启。
+func (cc *ClientConn) SetDialRetry(attempts int, backoff time.Duration) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.dialAttempts = attempts
+	cc.dialBackoff = backoff
+}
+
 // DialTimeout 返回当前建链超时配置。
 func (cc *ClientConn) DialTimeout() time.Duration {
 	cc.mu.Lock()
@@ -462,6 +487,8 @@ func (cc *ClientConn) getConn() (*pooledConn, error) {
 		return nil, ErrClosed
 	}
 	dialTO := cc.dialTO // 锁内拷出，避免 SetDialTimeout 并发写竞态
+	attempts := cc.dialAttempts
+	backoff := cc.dialBackoff
 	for len(cc.idle) > 0 {
 		pc := cc.idle[len(cc.idle)-1]
 		cc.idle = cc.idle[:len(cc.idle)-1]
@@ -475,12 +502,27 @@ func (cc *ClientConn) getConn() (*pooledConn, error) {
 	cc.dials++
 	cc.mu.Unlock()
 
+	if attempts < 1 {
+		attempts = 1
+	}
+	if backoff <= 0 {
+		backoff = 50 * time.Millisecond
+	}
 	var raw net.Conn
 	var err error
-	if cc.tlsCfg != nil {
-		raw, err = tls.DialWithDialer(&net.Dialer{Timeout: dialTO}, "tcp", cc.target, cc.tlsCfg)
-	} else {
-		raw, err = net.DialTimeout("tcp", cc.target, dialTO)
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(backoff)
+			backoff *= 2 // 指数退避，避免风暴式重连
+		}
+		if cc.tlsCfg != nil {
+			raw, err = tls.DialWithDialer(&net.Dialer{Timeout: dialTO}, "tcp", cc.target, cc.tlsCfg)
+		} else {
+			raw, err = net.DialTimeout("tcp", cc.target, dialTO)
+		}
+		if err == nil {
+			break
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -609,6 +651,42 @@ func (cc *ClientConn) Invoke(ctx context.Context, method string, reqData []byte)
 	cc.bytesRecv.Add(int64(len(resp)))
 	cc.putConn(pc)
 	return resp, nil
+}
+
+// Ping 发送一个应用层保活帧并等待 pong，验证「到 target 的 TCP 链路 + 对端服务循环」
+// 都是活的。成功时连接放回池中复用（顺带完成了连接预热）。ctx 截止时间生效。
+// 与 Warmup 的区别：Warmup 只建链，Ping 还验证对端会读帧并回应。
+func (cc *ClientConn) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	pc, err := cc.getConn()
+	if err != nil {
+		return err
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		if err := pc.conn.SetDeadline(dl); err != nil {
+			pc.conn.Close()
+			return err
+		}
+	} else {
+		pc.conn.SetDeadline(time.Time{})
+	}
+	if err := writeFrame(pc.w, framePing, nil); err != nil {
+		pc.conn.Close()
+		return err
+	}
+	typ, _, err := readFrame(pc.r)
+	if err != nil {
+		pc.conn.Close()
+		return err
+	}
+	if typ != framePing {
+		pc.conn.Close()
+		return fmt.Errorf("transport: unexpected pong frame type %d", typ)
+	}
+	cc.putConn(pc)
+	return nil
 }
 
 // InvokeMsg 是 Invoke 的类型安全封装：用 codec 编解码 req/reply。

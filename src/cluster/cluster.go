@@ -16,6 +16,7 @@ import (
 	"raftkv/src/raft"
 	"raftkv/src/shardkv"
 	"raftkv/src/shardmaster"
+	"raftkv/src/transport"
 )
 
 // Cluster 持有一个完整的内存 ShardKV 集群（含 ShardMaster）。
@@ -34,6 +35,10 @@ type Cluster struct {
 	nReplicas    int
 	nSM          int
 	maxraftstate int
+
+	// 跨机模式（StartClusterTCP）专用：真实 TCP 服务端与客户端连接，供 Cleanup 关闭。
+	tcpServers []*transport.Server
+	tcpConns   []*transport.ClientConn
 }
 
 // PersisterFactory 为集群中每个节点构造持久化器。kind 为 "sm"(ShardMaster) 或 "kv"(ShardKV)，
@@ -254,5 +259,15 @@ func (c *Cluster) Cleanup() {
 			c.SM[j].Kill()
 		}
 	}
-	c.Net.Cleanup()
+	// 内存模式（Net 非 nil）关闭 labrpc 网络；跨机模式 Net 为 nil，跳过。
+	if c.Net != nil {
+		c.Net.Cleanup()
+	}
+	// 跨机模式：关闭真实 TCP 服务端与客户端连接。
+	for _, srv := range c.tcpServers {
+		srv.Stop()
+	}
+	for _, cc := range c.tcpConns {
+		_ = cc.Close()
+	}
 }

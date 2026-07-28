@@ -101,7 +101,46 @@ curl http://localhost:8080/metrics           # -> JSON 指标快照
 ```
 
 > 网关地址可用第一个参数覆盖：`./start.sh serve :9090`。集群组数默认 2，改 `src/gateway/main.go`
-> 中的 `nGroups` 即可。注意：集群是进程内的（基于 labrpc 内存网络），生产部署需替换为真实传输层。
+> 中的 `nGroups` 即可。
+
+### 跨机部署（真实 TCP）
+
+节点间 RPC 可走真实的 `src/transport` TCP 传输层（localhost 或跨机），把 ShardMaster 与
+各 replica group 分布到不同进程/机器。`cluster.StartClusterTCP` 用「JSON 地址清单」串起集群，
+`gateway` / `demo` 通过 `--tcp-config` 加载同一清单进入跨机模式。
+
+```bash
+# 1) 写一份节点地址清单（本例全部在本机不同端口，跨机则换成各机器 IP）
+cat > tcp-config.json <<'JSON'
+{
+  "n_groups": 2, "n_replicas": 3, "n_sm": 3, "max_raft_state": 0,
+  "data_dir": "./data-tcp",
+  "nodes": [
+    {"name": "m0", "addr": "127.0.0.1:10000"},
+    {"name": "m1", "addr": "127.0.0.1:10001"},
+    {"name": "m2", "addr": "127.0.0.1:10002"},
+    {"name": "g0-0", "addr": "127.0.0.1:10010"},
+    {"name": "g0-1", "addr": "127.0.0.1:10011"},
+    {"name": "g0-2", "addr": "127.0.0.1:10012"},
+    {"name": "g1-0", "addr": "127.0.0.1:10020"},
+    {"name": "g1-1", "addr": "127.0.0.1:10021"},
+    {"name": "g1-2", "addr": "127.0.0.1:10022"}
+  ]
+}
+JSON
+
+# 2) 起网关（跨机模式：节点间走真实 TCP；data_dir 非空则落盘崩溃恢复）
+go run ./src/gateway --tcp-config tcp-config.json --addr :8080
+
+# 3) 客户端交互（与内存模式完全一致）
+curl -X PUT http://localhost:8080/kv/foo -d 'bar'
+curl http://localhost:8080/kv/foo
+```
+
+> `data_dir` 非空时各节点状态落盘到 `node-<kind>-<g>-<r>`，进程崩溃复用同一目录即可恢复
+> （与 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) 的「真部署化」一致）。完整字段与多机启动步骤见
+> [`docs/DEPLOYMENT.md` §2.5](docs/DEPLOYMENT.md)。
+
 
 ## 设计要点
 

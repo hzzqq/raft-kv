@@ -48,8 +48,9 @@ def main() -> int:
     root = sys.argv[1] if len(sys.argv) > 1 else "."
     md_files = []
     for dirpath, _dirs, files in os.walk(root):
-        # 跳过版本控制与构建产物目录
-        if any(seg in (".git", "bin", "node_modules") for seg in dirpath.split(os.sep)):
+        # 跳过版本控制、构建产物与本地 Go SDK 目录
+        skip_dirs = (".git", "bin", "node_modules", ".go-sdk", ".gopath", ".gocache")
+        if any(seg in skip_dirs for seg in dirpath.split(os.sep)):
             continue
         for fn in files:
             if fn.lower().endswith(".md"):

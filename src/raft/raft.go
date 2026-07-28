@@ -192,6 +192,11 @@ type Raft struct {
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
 	timerMu        sync.Mutex
+	// electionTimeoutFn 可注入的选举超时生成器（nil = 默认 [Min,Max) 均匀随机）。
+	// 用途：跨机部署 RTT 更长时可注入更大区间；测试可注入确定性超时复现竞态时序。
+	// 由 timerMu 保护（resetElectionTimer 的调用方常已持有 rf.mu，不能复用 rf.mu，
+	// 否则死锁；timerMu 恰好是计时器域的既有锁，锁序不变）。
+	electionTimeoutFn func() time.Duration
 
 	// ---- 快照（2D）----
 	lastIncludedIndex int
@@ -415,8 +420,27 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 // ============================== 选举 ==============================
 
+// SetElectionTimeoutFn 注入自定义选举超时生成器（每次重置计时器时调用一次）。
+// 必须在节点开始参与选举前设置（Make 返回后立刻调用）；传 nil 恢复默认随机区间。
+// 典型用途：跨机部署网络 RTT 较大时注入更大的超时区间，避免频繁误触发选举；
+// 测试注入确定性/受控随机的超时以复现特定时序。
+func (rf *Raft) SetElectionTimeoutFn(fn func() time.Duration) {
+	rf.timerMu.Lock()
+	rf.electionTimeoutFn = fn
+	rf.timerMu.Unlock()
+	rf.resetElectionTimer()
+}
+
 func (rf *Raft) resetElectionTimer() {
-	d := ElectionTimeoutMin + time.Duration(rand.Int63n(int64(ElectionTimeoutMax-ElectionTimeoutMin)))
+	rf.timerMu.Lock()
+	fn := rf.electionTimeoutFn
+	rf.timerMu.Unlock()
+	var d time.Duration
+	if fn != nil {
+		d = fn()
+	} else {
+		d = ElectionTimeoutMin + time.Duration(rand.Int63n(int64(ElectionTimeoutMax-ElectionTimeoutMin)))
+	}
 	rf.timerMu.Lock()
 	defer rf.timerMu.Unlock()
 	if !rf.electionTimer.Stop() {

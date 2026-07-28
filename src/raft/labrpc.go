@@ -11,11 +11,28 @@ type ClientEnd struct {
 	endname  int // 本端点名字（用于网络路由）
 	owner    int // 拥有该端点的 server（用于判断"发送方是否在线"）
 	serverId int // 真正要送达的 server id
+	// sendFn 为可选的自定义发送函数（跨机真实传输用）。非空时 Call 走它而非内存网络。
+	sendFn func(method string, args, reply interface{}) bool
 }
 
 // Call 同步发起一次 RPC，返回是否成功送达（收发任一方掉线则为 false）。
+// 若设置了 sendFn（跨机真实传输），则委托给它；否则走进程内内存网络。
 func (e *ClientEnd) Call(method string, args interface{}, reply interface{}) bool {
+	if e.sendFn != nil {
+		return e.sendFn(method, args, reply)
+	}
 	return e.net.Send(e.endname, method, args, reply)
+}
+
+// MakeSendFnEnd 构造一个走自定义 send 函数的客户端端点（跨机真实传输用）。
+// sendFn 返回 false 表示本次 RPC 不可达。net 为 nil——未设置 sendFn 时 Call 才会用到 net。
+func MakeSendFnEnd(sendFn func(method string, args, reply interface{}) bool) *ClientEnd {
+	return &ClientEnd{sendFn: sendFn}
+}
+
+// SetSendFn 设置自定义发送函数；非空时 Call 走它而非内存网络。
+func (e *ClientEnd) SetSendFn(fn func(method string, args, reply interface{}) bool) {
+	e.sendFn = fn
 }
 
 // RpcMsg 是网络在节点之间传递的 RPC 信封。
