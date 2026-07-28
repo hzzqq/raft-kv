@@ -68,10 +68,14 @@ func makeKVConfig(t *testing.T, n int, maxraftstate ...int) *kvConfig {
 			switch method {
 			case "RequestVote":
 				rrf.RequestVote(args.(*raft.RequestVoteArgs), reply.(*raft.RequestVoteReply))
+			case "RequestPreVote":
+				rrf.RequestPreVote(args.(*raft.RequestPreVoteArgs), reply.(*raft.RequestPreVoteReply))
 			case "AppendEntries":
 				rrf.AppendEntries(args.(*raft.AppendEntriesArgs), reply.(*raft.AppendEntriesReply))
 			case "InstallSnapshot":
 				rrf.InstallSnapshot(args.(*raft.InstallSnapshotArgs), reply.(*raft.InstallSnapshotReply))
+			case "TimeoutNow":
+				rrf.TimeoutNow(args.(*raft.TimeoutNowArgs), reply.(*raft.TimeoutNowReply))
 			}
 		})
 		kvh := kv
@@ -144,10 +148,14 @@ func (ck *kvConfig) restart(i int) {
 		switch method {
 		case "RequestVote":
 			rrf.RequestVote(args.(*raft.RequestVoteArgs), reply.(*raft.RequestVoteReply))
+		case "RequestPreVote":
+			rrf.RequestPreVote(args.(*raft.RequestPreVoteArgs), reply.(*raft.RequestPreVoteReply))
 		case "AppendEntries":
 			rrf.AppendEntries(args.(*raft.AppendEntriesArgs), reply.(*raft.AppendEntriesReply))
 		case "InstallSnapshot":
 			rrf.InstallSnapshot(args.(*raft.InstallSnapshotArgs), reply.(*raft.InstallSnapshotReply))
+		case "TimeoutNow":
+			rrf.TimeoutNow(args.(*raft.TimeoutNowArgs), reply.(*raft.TimeoutNowReply))
 		}
 	})
 	kvh := kv

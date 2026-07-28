@@ -129,7 +129,7 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 
 | 模块 (包) | 源码文件 | 测试文件 | 有测试 | 高信号未覆盖导出符号 |
 |-----------|---------:|--------:|:------:|---------------------:|
-| `cluster` | 2 | 5 | ✅ | ConfigNum, LoadTCPConfig, StartClusterFromConfig, ClusterTCPConfig |
+| `cluster` | 2 | 6 | ✅ | ConfigNum, LoadTCPConfig, StartClusterFromConfig, ClusterTCPConfig |
 | `demo` | 1 | 4 | ✅ | RunDemoPersistent, RunDemoTCP |
 | `diagnostics` | 2 | 3 | ✅ | — |
 | `gateway` | 6 | 18 | ✅ | Flush, LoadGatewayConfig, SetCORS, SetHTTPServer, GroupStatus, GroupView, RaftStatusView |

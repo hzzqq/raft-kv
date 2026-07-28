@@ -235,6 +235,22 @@ func (c *Cluster) WaitAllConfigs(num int) {
 	}
 }
 
+// EnableKV 控制第 g 组第 r 个副本的网络连通性（false=对称分区：进出 RPC 全部失败）。
+// 仅内存网络（StartCluster*）支持；TCP 模式（StartClusterTCP）请直接停对应 transport.Server。
+// 底层依赖 raft.Network.Send 的双向检查：目标或发送方任一被 Enable(false) 即投递失败。
+func (c *Cluster) EnableKV(g, r int, up bool) {
+	if c.Net == nil {
+		panic("EnableKV 仅支持内存网络集群（TCP 模式请停 transport.Server）")
+	}
+	c.Net.Enable(1000+g*100+r, up)
+}
+
+// KVRaftStatus 返回第 g 组第 r 个副本的 raft 只读状态快照（角色/任期/应用进度），
+// 供分区/快照类测试断言副本追赶进度，不触发任何 RPC。
+func (c *Cluster) KVRaftStatus(g, r int) raft.RaftStatus {
+	return c.KVs[g][r].RaftStatus()
+}
+
 // Churn 在 groups 间做 rounds 轮分片漂移：每轮把第 (i*shardStep)%NShards 号分片迁到
 // 第 i%nGroups 组，轮间间隔 interval。制造可控的「多 group 迁移并发」，供测试断言
 // 配置持续推进、数据不丢。属于 Move 式 churn（非 Join/Leave 再平衡），是安全迁移路径。

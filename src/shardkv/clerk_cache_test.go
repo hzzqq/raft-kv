@@ -28,8 +28,14 @@ func TestClerkOrderServers(t *testing.T) {
 // TestClerkLeaderCache 验证成功读写后 Clerk 的 per-gid leader 缓存被填充：
 // 后续请求优先直连该副本，减少迁移/leader 切换期的盲目广播。
 func TestClerkLeaderCache(t *testing.T) {
-	cfg := makeSKVConfig(t, 1, 3, 100, -1)
+	// 注意（修复两处测试自身 bug，此前本测试从未真正跑通过）：
+	// 1) 第 3 参是 shardmaster 副本数（nSM），误写为 100——100 节点 raft 集群
+	//    选举难以收敛（quorum=51），应为常规的 3；
+	// 2) 漏调 joinGroup(0)：没有任何 group 加入时配置恒为 Num=0，
+	//    Clerk.PutAppend 会在 cfg.Num==0 上无限自旋（永久挂死）。
+	cfg := makeSKVConfig(t, 1, 3, 3, -1)
 	defer cfg.cleanup()
+	cfg.joinGroup(0)
 	ck := cfg.makeClerk()
 	ck.Put("x", "hello")
 	if v := ck.Get("x"); v != "hello" {

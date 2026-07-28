@@ -436,12 +436,25 @@ func TestHasCommittedCurrentTerm(t *testing.T) {
 	// 重新选举后应能再次置位：让当前 leader 退位（stepDown 到更高任期），其余副本会在
 	// 选举超时后选出新 leader 并提交新 noop，标记再次变为 true（证明该标记随任期重置
 	// 而非永久卡死或永不被设置）。
+	// 注意两点（此前测试自身的 bug）：
+	// 1) stepDown 是「调用方持锁」的内部方法，必须持 rf.mu 调用，否则对 ticker/
+	//    heartbeat goroutine 无内存可见性保证，旧 leader 可能继续以 Leader 身份发心跳；
+	// 2) 退位后旧 leader 日志与他人一样新，完全可能再次当选——语义要求是「更高任期的
+	//    leader（无论是谁）重新提交 noop 并置位」，而非「必须换人」。
 	oldLeader := l
-	cfg.rafts[oldLeader].stepDown(cfg.rafts[oldLeader].currentTerm + 1)
+	cfg.rafts[oldLeader].mu.Lock()
+	oldTerm := cfg.rafts[oldLeader].currentTerm
+	cfg.rafts[oldLeader].stepDown(oldTerm + 1)
+	cfg.rafts[oldLeader].mu.Unlock()
 	reElected := false
 	for i := 0; i < 1000; i++ {
-		if nl := cfg.leader(); nl >= 0 && nl != oldLeader && cfg.rafts[nl].HasCommittedCurrentTerm() {
-			reElected = true
+		if nl := cfg.leader(); nl >= 0 {
+			st := cfg.rafts[nl].Status()
+			if st.Term > oldTerm && st.CommittedCurrentTerm {
+				reElected = true
+			}
+		}
+		if reElected {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)

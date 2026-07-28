@@ -222,6 +222,12 @@ func (cfg *skvConfig) restartReplica(g, r int) {
 		switch method {
 		case "RequestVote":
 			rf.RequestVote(args.(*raft.RequestVoteArgs), reply.(*raft.RequestVoteReply))
+		case "RequestPreVote":
+			// 重启 handler 必须与初始 AddServer 的方法集完全一致：曾缺 PreVote/TimeoutNow
+			// 分支，重启副本收到预投票直接 t.Fatalf，把「杀主后正常恢复」误报为失败。
+			rf.RequestPreVote(args.(*raft.RequestPreVoteArgs), reply.(*raft.RequestPreVoteReply))
+		case "TimeoutNow":
+			rf.TimeoutNow(args.(*raft.TimeoutNowArgs), reply.(*raft.TimeoutNowReply))
 		case "AppendEntries":
 			rf.AppendEntries(args.(*raft.AppendEntriesArgs), reply.(*raft.AppendEntriesReply))
 		case "InstallSnapshot":
