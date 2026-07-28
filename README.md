@@ -391,6 +391,19 @@ R3 #54–#82 全部本地提交；#54–#72 已按授权 fast-forward 推送，�
 - **网关共识健康可告警（#222）**：`/metrics` 暴露 `raft_min_health_score` gauge（按需计算各副本 `RaftCheck` 最低分，min 语义，任一副本异常即拉低），使共识健康可经 Prometheus scrape 与阈值告警（此前仅在 `/debug/raft` JSON 里不可告警）。
 - **kvraft 状态机可观测（#223）**：`KVServer.Status()` 只读健康快照（角色/任期/leader/apply 进度/数据键数/会话表大小/GC 配置）+ `kv_data_keys`/`kv_sessions` 规模 gauge + `gc_sweeps_total`/`gc_sessions_evicted_total` GC 计数；此前 KV 状态机对运维完全不透明，与 raft/shardkv 已暴露的健康快照不对齐。
 
+### 人工主导迭代交付（I1–I20，真部署化收口 + 混沌挂死根因深啃）
+
+自驱收官后转人工主导（用户授权「迭代20次」）。本轮最重要的产出是**把 shardkv 混沌测试 600s 挂死从「沙箱环境问题」证伪为三个真实 bug 并全部修复**：
+
+- **I1–I11（真部署化）**：`cluster` 接入 `src/transport` 真实 TCP（`StartClusterTCP` + 节点地址清单跨机部署）；raft `ClientEnd` 可插拔 `sendFn`；gob 保证日志 `Command(interface{})` 跨机还原；transport 增加 `framePing` 保活 + 拨号指数退避；README/DEPLOYMENT 快速开始；选举超时可注入。
+- **混沌挂死三重根因（修复见 `fix(raft/shardkv)` 提交）**：
+  1. **labrpc 串行分发**：`Server.loop` 单 goroutine 处理 RPC，阻塞型 handler 堵死心跳/投票 → 每 RPC 独立 goroutine；
+  2. **InstallSnapshot 自锁死锁**：RPC 持 `rf.mu` 后调用导出版 `CondInstallSnapshot` 再次 Lock（`sync.Mutex` 不可重入）→ 拆 `condInstallSnapshotLocked`；
+  3. **状态机失联**：快照安装直接顶高 `lastApplied` 导致 `SnapshotValid` 永不投递 → applier 快照分支一次跳到位。
+- **僵尸 InstallShard 丢写（根因 2/3 修复后暴露，`TestSKVReadIndex` 曾 100% 复现）**：分片已定居（持有 + 无 `pendingIn`）后，残留 fetcher 以更高 `MigrateConfigNum` 提交陈旧空副本，LWW 整体覆盖已 ack 的客户端写 → `applyInstallShard` 新增**定居守卫**（`settled && !pendingIn` 直接拒绝）。
+- **I12–I15（回归钉死）**：cluster 层 follower 快照追赶 / leader 分区恢复集成测试（`EnableKV` 分区开关 + `KVRaftStatus` 探针）；`install_guard_test.go` 白盒钉死定居守卫三条语义；`snapshot_rpc_regress_test.go` 钉死快照 RPC 不死锁 + `SnapshotValid` 必达。
+- **工程**：`build_local.py`（无 Go 环境内存下载 SDK 同进程构建）；测试基建修复（PreVote/TimeoutNow handler 补全、`makeSKVConfig` nSM 参数、`TestHasCommittedCurrentTerm` 重选举）。
+
 ## 自驱迭代状态（已收官）
 
 本项目经历 **140 轮 AI 自主迭代（cycle 1–140，2026-07-19 → 2026-07-26，311 commits）**，覆盖共识核心、自研 TCP 传输层、gRPC 网关、可观测性、门禁工具链等。

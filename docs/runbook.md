@@ -50,17 +50,33 @@ CLI 快捷方式：`./start.sh status` / `./start.sh migrate` / `./start.sh conf
 **含义**：两种限流其一触发——① 全局并发上限（默认 64，`Server.sem` 信号量）被占满；② 单客户端令牌桶（`client_rate`/`client_burst`，默认 200 rps / 突发 40，按 `X-Client-ID` 或 `RemoteAddr` IP 区分）超量。后者可针对性限制个别失控客户端而不影响其他客户端。
 **排查**：属预期保护行为；若常态性触顶，说明上游并发过高或后端迁移期变慢。可经 `main.go` 的 `maxConcurrent` 调大，或降低 `kvcli bench` 的并发 worker 数；单客户端限流可用 `SetClientRateLimit` 调高 rps / burst 或设 `rps<=0` 关闭。限流仅作用在网关入口，不丢数据——客户端按 429 + `Retry-After` 退避重试即可。
 
-## 3. kvraft 包「flaky 挂死」说明（非代码 bug）
+## 3. 「测试挂死」排障史：曾被误判为环境问题的三个真实 bug（重要教训）
 
-`src/kvraft` 的不可靠/分区类测试（如 `TestKVSnapshotStress`、分区场景）在受限 CPU
-环境下偶发挂死，**这是 MIT 测试 harness 的时序敏感性所致，不是本仓库的回归**：
+> **⚠️ 本节曾断言「挂死是 MIT harness 时序敏感 / 环境问题，不要当代码缺陷修复」——
+> 该结论已被证伪。** 2026-07 混沌测试 600s 挂死深挖后确认是三个真实 bug 叠加，
+> 全部已修复（见 `fix(raft/shardkv)` 提交与 README「人工主导迭代交付」节）：
 
-- Clerk 幂等正确：`ck.seq` 在重试循环外递增一次，单次逻辑操作 seq 恒定，服务端
-  `lastSeq` 去重有效；
-- 快照正确：`installSnapshot` 完整恢复 `data/lastSeq/lastResult`，`encodeSnapshot`
-  在持锁状态下调用，无竞态；
-- 因此整体 `go test ./...` 时若 kvraft 偶挂，直接重跑该包即可，不要当作代码缺陷
-  去「修复」。
+1. **labrpc 串行分发**：`Server.loop` 单 goroutine 逐条处理 RPC，任何阻塞型 handler
+   （如等待锁的 `InstallSnapshot`）会堵死同节点后续所有心跳/投票 → 已改为每 RPC
+   独立 goroutine。
+2. **InstallSnapshot 自锁死锁**：RPC 持 `rf.mu` 后调用导出版 `CondInstallSnapshot`
+   内部再次 `Lock`（`sync.Mutex` 不可重入）→ 需要快照追赶的 follower 整实例锁死
+   （goroutine dump 中 1346 个 goroutine 堆积在 `rf.mu`）→ 已拆
+   `condInstallSnapshotLocked` 供持锁调用方使用。
+3. **状态机失联**：快照安装直接把 `lastApplied` 顶到 `lastIncludedIndex`，applier
+   永不投递 `SnapshotValid`，KV 状态机拿不到快照数据 → 已改为只推进 `commitIndex`
+   并唤醒 applier 投递。
+
+**连锁教训**：修复 2/3 后 `SnapshotValid` 正常投递，反而暴露 shardkv「僵尸
+InstallShard」丢写（分片定居后残留 fetcher 以更高 `MigrateConfigNum` 提交空副本，
+LWW 覆盖已 ack 的客户端写；`TestSKVReadIndex` 曾 100% 复现）→ `applyInstallShard`
+已加**定居守卫**（`settled && !pendingIn` 直接拒绝）。
+
+**排障方法论**（下次再遇挂死按此走，勿直接归咎环境）：
+- 复现时抓 goroutine dump（`kill -QUIT` / `SIGABRT`），统计堆积在哪把锁；
+- 用归因实验隔离改动（`git stash` 二分定位到文件粒度）；
+- 临时埋点（环境变量开关 + 关键 key 轨迹）抓「写入→覆盖→读空」生命线，
+  提交前务必清除埋点。
 
 ## 4. 已知的正确性设计决策
 
