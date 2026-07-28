@@ -149,8 +149,12 @@ func TestClientBreaker(t *testing.T) {
 }
 
 // TestClientMetrics 验证客户端指标被记录。
+// handler 注入 20ms 延迟：Windows 的 Go 单调时钟粒度可达 0.5–15.6ms，回环请求
+// 快于一个时钟刻时 time.Since 会测出 0，导致「正延迟」断言在 Windows 本地
+// 平台性误报（CI ubuntu 无此问题）。20ms 稳超最粗粒度，各平台断言均有意义。
 func TestClientMetrics(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(20 * time.Millisecond)
 		if r.URL.Path == "/kv/fail" {
 			w.WriteHeader(500)
 			return
