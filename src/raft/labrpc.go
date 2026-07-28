@@ -54,8 +54,16 @@ func (s *Server) loop(handler func(method string, args, reply interface{})) {
 	for {
 		select {
 		case m := <-s.ch:
-			handler(m.method, m.args, m.reply)
-			close(m.done)
+			// 每个 RPC 独立 goroutine 处理（与 MIT 原版 labrpc 及真实 RPC 服务器一致）。
+			// 曾为串行处理，结果阻塞型业务 handler（Get/PutAppend 等 raft commit，
+			// 可等数百 ms）会把排在后面的 raft 心跳/投票 RPC 堵死；srv.ch(200) 一满，
+			// 所有发送方卡死在 Send 的 select——混沌测试 600s 挂死的直接根因。
+			// raft/shardkv 的所有 handler 本就自带锁且不依赖 RPC 到达顺序（任期/索引
+			// 检查天然容忍乱序），并发分派是安全的。
+			go func(m *RpcMsg) {
+				handler(m.method, m.args, m.reply)
+				close(m.done)
+			}(m)
 		case <-s.done:
 			// 关闭时要排空尚未处理的 RPC：否则若有 Send 正阻塞在 <-m.done，
 			// 旧循环直接 return 会让发送方永久挂起（节点重启竞态）。

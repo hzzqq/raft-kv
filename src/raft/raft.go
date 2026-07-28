@@ -967,10 +967,24 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.persist()
 }
 
-// CondInstallSnapshot 由状态机在收到 InstallSnapshot 后调用。
+// CondInstallSnapshot 由状态机在收到 InstallSnapshot 后调用（导出兼容入口）。
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	return rf.condInstallSnapshotLocked(lastIncludedTerm, lastIncludedIndex, snapshot)
+}
+
+// condInstallSnapshotLocked 是安装快照的主体逻辑，调用方必须已持有 rf.mu。
+// 两个历史 bug 的修复点（follower 快照追赶 600s 挂死复盘）：
+//  1. 死锁：InstallSnapshot RPC 持锁后曾调用导出版 CondInstallSnapshot 再次 Lock——
+//     sync.Mutex 不可重入，任何需要快照追赶的 follower 会把整个 raft 实例锁死，
+//     所有后续 RPC（含心跳/投票）全部堆积在 rf.mu 上（dump 中 1346 个 goroutine）。
+//  2. 状态机失联：此处曾把 lastApplied 直接顶到 lastIncludedIndex，applier 便永远
+//     不会走「idx <= lastIncludedIndex」分支，SnapshotValid 消息永远不发——
+//     即便不死锁，follower 的 KV 状态机也拿不到快照数据（隐性数据缺失）。
+//     现在只推进 commitIndex 并唤醒 applier，由 applier 发 SnapshotValid 给状态机，
+//     lastApplied 在 applier 的快照分支一次跳到位。
+func (rf *Raft) condInstallSnapshotLocked(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 	if lastIncludedIndex <= rf.lastIncludedIndex {
 		return true // 已经有更新的快照
 	}
@@ -991,13 +1005,13 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	if rf.commitIndex < lastIncludedIndex {
 		rf.commitIndex = lastIncludedIndex
 	}
-	if rf.lastApplied < lastIncludedIndex {
-		rf.lastApplied = lastIncludedIndex
-	}
 	rf.persister.SaveSnapshot(snapshot)
 	rf.persist()
+	// 唤醒 applier：commitIndex 已前移，applier 将向状态机投递 SnapshotValid 消息。
+	rf.applyCond.Signal()
 	return true
 }
+
 // InstallSnapshot 接收并安装领导者推送的快照。
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
@@ -1014,7 +1028,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.LastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
-	rf.CondInstallSnapshot(args.LastIncludedTerm, args.LastIncludedIndex, args.Data)
+	rf.condInstallSnapshotLocked(args.LastIncludedTerm, args.LastIncludedIndex, args.Data)
 }
 
 // ============================== 后台循环 ==============================
@@ -1062,13 +1076,15 @@ func (rf *Raft) applier() {
 		idx := rf.lastApplied
 		var msg ApplyMsg
 		if idx <= rf.lastIncludedIndex {
-			// 快照内的部分，用快照消息通知状态机
+			// 快照内的部分，用快照消息通知状态机；lastApplied 一次跳到快照点，
+			// 避免逐条自增重复投递同一份快照（快照消息本身覆盖 <=SnapshotIndex 全部状态）。
 			msg = ApplyMsg{
 				SnapshotValid: true,
 				Snapshot:      rf.snapshot,
 				SnapshotTerm:  rf.lastIncludedTerm,
 				SnapshotIndex: rf.lastIncludedIndex,
 			}
+			rf.lastApplied = rf.lastIncludedIndex
 			Metrics.Counter("snapshots_installed").Inc()
 		} else {
 			pos := idx - rf.lastIncludedIndex - 1

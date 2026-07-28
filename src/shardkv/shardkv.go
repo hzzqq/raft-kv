@@ -19,6 +19,7 @@ import (
 	"raftkv/src/shardmaster"
 )
 
+
 // Metrics 是本进程内 ShardKV 组件的可观测性指标（best-effort 聚合，跨 group 共享）。
 // 网关 / 演示程序可读取 shardkv.Metrics.Snapshot() 展示实时吞吐、延迟与错误率。
 var Metrics = metrics.NewRegistry()
@@ -963,6 +964,21 @@ func (kv *ShardKV) applyInstallShard(op Op, res *applyResult) {
 		return
 	}
 	if kv.config.Shards[s] == kv.gid {
+		// 定居守卫（僵尸 InstallShard 丢写修复，TestSKVReadIndex 在 labrpc 并发化后
+		// 100% 复现）：本组已持有该分片且不存在未决迁移（!pendingIn）——即分片已
+		// 「定居」并开始服务客户端写——此时到达的任何 InstallShard 都是残留 fetcher
+		// 的僵尸提案（propose 超时重试 / 自愈回源等路径重复拉取的陈旧副本），哪怕
+		// 其 MigrateConfigNum 更高（fetcher 每轮重试都会用**当时**的 config.Num 重新
+		// 标记，配置号并不代表数据更新）。若放行，下方 LWW 会用陈旧空副本整体替换
+		// 已接收客户端写的分片，造成静默丢写（复现轨迹：g1 cfg3 装入 s0 → 客户端
+		// Put 落盘 ack → 僵尸 InstallShard(migCfg=4, nkeys=0) 覆盖 → Get 读到空）。
+		// 真正的合法安装只发生在 pendingIn[s]=true（本组正在等待该分片）期间。
+		if _, settled := kv.shards[s]; settled && !kv.pendingIn[s] {
+			if res != nil {
+				res.err = OK
+			}
+			return
+		}
 		// 本组拥有该分片：以「迁移配置号」做 LWW（后写胜出）决定如何并入，杜绝
 		// 迟到/陈旧传输把已提交的更新数据冲掉（A→B→A 高频来回再平衡下，旧实现用
 		// mergeShardData「仅补缺失 key、不覆盖已有值」会用陈旧快照覆盖新写入，导致
