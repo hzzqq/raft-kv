@@ -18,7 +18,8 @@ gRPC 风格传输层（`src/transport`）与可复用集群框架（`src/cluster
 
 它**不是**：
 
-- ❌ 一个面向生产的 KV 存储（没有鉴权、没有多机房、没有真正的跨机 gRPC 部署形态）。
+- ❌ 一个面向生产的 KV 存储（没有鉴权、没有多机房；虽有 per-process 跨机部署形态，
+  见 §2.6，但仅供可信网络内演示/压测，不暴露公网）。
 - ❌ 一个能直接替换 etcd/Consul 的组件。
 - ❌ 一个持续维护的框架库。
 
@@ -177,13 +178,53 @@ localhost 监听地址，用真实 TCP 串起 2-group 集群并跑通 Put/Get/�
 > TLS：把 `transport.ClientConn.DialTLS` / `Server.ServeTLS` 接入 `newTransportEnd` / `serveNode`
 > 即可启用加密传输（证书管理需自行提供），此处未默认开启。
 
+### 2.6 真·跨机：每节点一个独立进程（I21–I25 交付）
+
+§2.5 的 `gateway --tcp-config` 是「单进程内起全部节点、TCP 只在 loopback 上走」——
+适合本机验证字节确实走真实网络。要落到「每台机器一个进程」的部署形态，用 **`kvnode`**：
+它让**一个 OS 进程只跑地址清单里的一个节点**，全部节点起来后，网关再以 **`-connect`
+纯客户端**模式挂到集群前面（本进程不再持有任何节点句柄）。
+
+> **原则**：地址清单（`ClusterTCPConfig`）所有节点共享同一份；每个节点各自带 `-name`
+> 只跑清单里的那一个节点；网关用 `-connect` 纯客户端接入。
+
+**多机启动步骤**（以 3 SM + 2 group×3 副本、共 9 节点为例）：
+
+```bash
+# 1) 所有机器共用同一份 deploy.json（节点的 addr 填各自机器的可达 IP/端口）
+# 2) 在放 ShardMaster 副本的机器上各起一个进程：
+machine-A$ go run ./src/kvnode -config deploy.json -name m0
+machine-B$ go run ./src/kvnode -config deploy.json -name m1
+machine-C$ go run ./src/kvnode -config deploy.json -name m2
+# 3) 在放 group 副本的机器上各起一个进程（一台机器可放多个节点）：
+machine-D$ go run ./src/kvnode -config deploy.json -name g0-0
+machine-D$ go run ./src/kvnode -config deploy.json -name g0-1
+machine-E$ go run ./src/kvnode -config deploy.json -name g0-2
+# ... g1-0 / g1-1 / g1-2 同理
+# 4) 在能连到上述 addr 的任意机器上挂纯客户端网关：
+gateway$ go run ./src/gateway -connect deploy.json -addr :8080
+# 客户端交互与内存模式完全一致：
+curl -X PUT http://<gateway-host>:8080/kv/foo -d 'bar'
+```
+
+- `kvnode` 收到 `SIGINT/SIGTERM` 会优雅停止（先关业务状态机 → 关 TCP → 关出向连接）。
+- `data_dir` 非空时节点状态落盘（`FilePersister`），崩溃后同目录重启即恢复（与 §2.2 一致）。
+- 网关 `-connect` 模式不持本地节点：`/readyz` 退化为直连 ShardMaster 取最新 ConfigNum
+  （transport 层 2s 超时），`ConfigNum`/`WaitConfig` 同样走这一远程降级路径，避免空指针/卡死。
+
+**端到端证明**：`scripts/cross_machine_test.py` 在本机拉起 **10 个真实 OS 进程**
+（9 个 `kvnode` + 1 个 `gateway -connect`），用 `taskkill /PID /F` 杀掉每组多数派之外的
+少数派节点，验证集群在真实进程级故障下仍可读写——复跑稳定。这正是「真·跨机」形态的最小
+可复现验证。
+
 ---
 
 ## 三、已知边界（诚实清单）
 
 - **跨机部署需用真实 TCP 清单驱动**：`demo` / `gateway` 默认仍是进程内集群（基于 labrpc
-  内存网络）；要跨机必须提供 `--tcp-config`（见 §2.5），把 `src/transport` 接到 `cluster`
-  的 `make_end`——此能力现已交付。
+  内存网络）；要跨机有两种形态——① 单进程 TCP（§2.5 的 `--tcp-config`，loopback 上验证
+  字节走真实网络）；② **真·每节点独立进程**（§2.6 的 `kvnode` + `gateway -connect`，适合
+  多机部署）。两者都通过把 `src/transport` 接到 `cluster` 的 `make_end` 实现——此能力现已交付。
 - **无快照自动触发**：`maxraftstate=0` 时不做日志压缩，恢复靠全量日志重放；
   大状态场景应传入 `maxraftstate>0` 启用 `SaveSnapshot` 压缩。
 - **无鉴权 / 限流 / 多租户**：仅为工程标本，切勿直接暴露于公网；跨机部署时请置于可信网络内。

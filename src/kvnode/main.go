@@ -28,12 +28,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "用法: kvnode -config deploy.json -name m0|g0-0")
 		os.Exit(2)
 	}
-	cfg, err := cluster.LoadTCPConfig(*cfgPath)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "load config:", err)
-		os.Exit(1)
-	}
-	node, err := cluster.StartNodeTCP(cfg, *name)
+	cfg, node, err := startNode(*cfgPath, *name)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "start node:", err)
 		os.Exit(1)
@@ -46,4 +41,17 @@ func main() {
 	<-ch
 	fmt.Printf("kvnode %s stopping...\n", *name)
 	node.Stop()
+}
+
+// startNode 加载配置并启动单节点，抽出来便于测试 main 的入口逻辑。
+func startNode(cfgPath, name string) (cluster.ClusterTCPConfig, *cluster.TCPNode, error) {
+	cfg, err := cluster.LoadTCPConfig(cfgPath)
+	if err != nil {
+		return cluster.ClusterTCPConfig{}, nil, err
+	}
+	node, err := cluster.StartNodeTCP(cfg, name)
+	if err != nil {
+		return cluster.ClusterTCPConfig{}, nil, err
+	}
+	return cfg, node, nil
 }

@@ -134,7 +134,7 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 | `diagnostics` | 2 | 3 | ✅ | — |
 | `gateway` | 6 | 18 | ✅ | Flush, LoadGatewayConfig, SetCORS, SetHTTPServer, GroupStatus, GroupView, RaftStatusView |
 | `kvcli` | 16 | 25 | ✅ | MSetCtx, BatchResult, BenchResult, MDelResult, MSetResult |
-| `kvnode` | 1 | 0 | ❌ | — |
+| `kvnode` | 1 | 1 | ✅ | — |
 | `kvraft` | 1 | 4 | ✅ | OpResult |
 | `metrics` | 4 | 8 | ✅ | Desc, SetDesc |
 | `raft` | 4 | 12 | ✅ | Call, MakeSendFnEnd, RaftStateSize, Send, SetSendFn, String, RpcMsg |
@@ -145,6 +145,6 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 | `util` | 24 | 28 | ✅ | ExpBackoff, MarshalJSON, CbState |
 | `version` | 1 | 1 | ✅ | — |
 
-> 汇总：15 个包，1 个无测试；未引用导出符号 func=23 / type=17 / var=2 / const=0。「未覆盖符号」为软提示，可能含被间接覆盖的结果/视图类型。
+> 汇总：15 个包，0 个无测试；未引用导出符号 func=23 / type=17 / var=2 / const=0。「未覆盖符号」为软提示，可能含被间接覆盖的结果/视图类型。
 
 <!-- test-coverage-table:end -->

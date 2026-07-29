@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–146，共 104 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
+> 覆盖 cycle 39–147，共 105 轮交付；时间跨度 2026-07-22 ~ 2026-07-29。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -111,6 +111,7 @@
 - **[96] `docs_crosslink_integrity`** — 文档时效收口——coverage.md 仍称 kvraft_status_test.go『尚未提交』(实际 #228 已提交) 且快照框定停于 #212-#226（隐性：coverage.md 与迭代实际进度脱节(迭代已推进至 #234):既误称某单测文件未提交,又未反映 #227-#234 新增 cluster-free 单测与 docs/observability.md;全仓内部 markdown 链接此前从未系统性校验；score=15）
 - **[120] `docs_ci_sync_120`** — 文档/CI 收口：可观测性文档同步新增标签指标 + CounterVec 原语 + 指标校验器识别 CounterVec/GaugeVec（隐性：新增 http_responses_total{code,method}/CounterVec 原语零文档记载；check_metrics_docs 不识别 CounterVec/GaugeVec，未来标签指标漂移无门禁拦截（R2 隐性）；score=14）
 - **[146] `docs_cross_machine`** — README 跨机部署补充「真·跨机（每节点独立进程）」小节（kvnode 多进程 + gateway -connect 示例 + 指向 cross_machine_test.py）（隐性：原 README 跨机章节只有单进程 --tcp-config 形态，缺生产多机拓扑文档（R2 文档盲区）；score=13）
+- **[147] `docs_kvnode_followup`** — 跨机部署收尾：DEPLOYMENT §2.6 补「真·每节点独立进程」多机启动细节（kvnode 多进程 + gateway -connect 纯客户端 + 指向 cross_machine_test.py）；kvnode 抽 startNode 并加 main_test.go 消覆盖硬缺口（kvnode 测试 0→1，覆盖表 ❌→✅）（隐性：I21-I25 交付后 DEPLOYMENT 仍只写单进程 --tcp-config 形态、kvnode 入口零测试（red），文档/测试盲区；score=12）
 
 ## scripts
 
