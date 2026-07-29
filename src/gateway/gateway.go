@@ -1328,6 +1328,12 @@ const stallUnhealthySec = 2.0
 // 为真才表示能正常服务读写），且无任何分片的迁移卡滞（StallSeconds 超阈值视为冻结
 // 风险）。是 /status 与 /readyz 共用的健康判据（I18 就绪探针）。
 func (s *Server) clusterHealthy() bool {
+	// 远程接入模式（ConnectTCP）：本进程无 KV 副本句柄，读不到 ShardDebug。
+	// 退化判据：ShardMaster 有 leader 且可应答（单次直连 Query，transport 2s 超时，
+	// 不会像 Clerk 一样无限重试阻塞探针）。
+	if s.c.Remote() {
+		return s.c.SMLatestConfigNum() >= 0
+	}
 	for g := range s.c.KVs {
 		ready := false
 		for r := range s.c.KVs[g] {

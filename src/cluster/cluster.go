@@ -39,7 +39,15 @@ type Cluster struct {
 	// 跨机模式（StartClusterTCP）专用：真实 TCP 服务端与客户端连接，供 Cleanup 关闭。
 	tcpServers []*transport.Server
 	tcpConns   []*transport.ClientConn
+
+	// 远程客户端模式（ConnectTCP）专用：本进程无任何节点句柄，只有出向连接。
+	// remote=true 时 Cleanup 只关连接；ConfigNum/WaitConfig 改走 ShardMaster 远程查询。
+	remote      bool
+	remoteConns *[]*transport.ClientConn
 }
+
+// Remote 报告本 Cluster 是否为 ConnectTCP 的远程客户端视图（无本地节点句柄）。
+func (c *Cluster) Remote() bool { return c.remote }
 
 // PersisterFactory 为集群中每个节点构造持久化器。kind 为 "sm"(ShardMaster) 或 "kv"(ShardKV)，
 // g/r 为 group 下标 / 副本下标（ShardMaster 的 g 传 -1）。内存部署用 MakeEmptyPersister；
@@ -214,7 +222,12 @@ func (c *Cluster) Move(shard, g int) {
 }
 
 // ConfigNum 返回第 g 个 group 第 r 个副本当前生效的配置版本号。
+// 远程模式（ConnectTCP）没有本地副本句柄，退化为 ShardMaster leader 视角的最新配置号
+// （上界语义：副本本地可能尚未追平，但对 WaitConfig 的「配置已发布」判断已足够）。
 func (c *Cluster) ConfigNum(g, r int) int {
+	if c.remote {
+		return c.SMLatestConfigNum()
+	}
 	return c.KVs[g][r].ConfigNum()
 }
 
@@ -263,6 +276,15 @@ func (c *Cluster) Churn(rounds int, interval time.Duration, shardStep int) {
 
 // Cleanup 关闭所有 ShardKV / ShardMaster 并清理网络（回收 goroutine）。
 func (c *Cluster) Cleanup() {
+	// 远程客户端模式：本进程无节点句柄，只需关闭出向 TCP 连接。
+	if c.remote {
+		if c.remoteConns != nil {
+			for _, cc := range *c.remoteConns {
+				_ = cc.Close()
+			}
+		}
+		return
+	}
 	for g := 0; g < c.nGroups; g++ {
 		for r := 0; r < c.nReplicas; r++ {
 			if c.KVs[g][r] != nil {

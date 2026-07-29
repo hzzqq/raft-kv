@@ -141,6 +141,55 @@ curl http://localhost:8080/kv/foo
 > （与 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) 的「真部署化」一致）。完整字段与多机启动步骤见
 > [`docs/DEPLOYMENT.md` §2.5](docs/DEPLOYMENT.md)。
 
+#### 真·跨机（每节点一个独立进程）
+
+上面的 `--tcp-config` 是「单进程起全部节点、节点间走真实 TCP」；若要**每台机器一个进程**
+（最贴近生产/多机拓扑），用 `kvnode` 逐节点启动、`gateway -connect` 以**纯客户端**接入：
+
+- `kvnode` 只承载单个节点（ShardMaster `m<j>` 或 KV 副本 `g<g>-<r>`），不含其他节点句柄；
+- `gateway -connect <清单>` 不持有任何本地副本，只构造远程 `make_end` 视图，经 HTTP 转发 RPC。
+
+```bash
+# 0) 同一份节点地址清单（跨机时把 addr 换成各机器 IP，清单可分发到每台机器）
+cat > deploy.json <<'JSON'
+{
+  "n_groups": 2, "n_replicas": 3, "n_sm": 3, "max_raft_state": 0,
+  "data_dir": "./data-dist",
+  "nodes": [
+    {"name": "m0", "addr": "192.168.1.10:10000"},
+    {"name": "m1", "addr": "192.168.1.11:10001"},
+    {"name": "m2", "addr": "192.168.1.12:10002"},
+    {"name": "g0-0", "addr": "192.168.1.10:10010"},
+    {"name": "g0-1", "addr": "192.168.1.11:10011"},
+    {"name": "g0-2", "addr": "192.168.1.12:10012"},
+    {"name": "g1-0", "addr": "192.168.1.10:10020"},
+    {"name": "g1-1", "addr": "192.168.1.11:10021"},
+    {"name": "g1-2", "addr": "192.168.1.12:10022"}
+  ]
+}
+JSON
+
+# 1) 在每台机器上只启动本机对应的节点（一台机器可跑多个节点，名字对应即可）
+go run ./src/kvnode -config deploy.json -name m0      # 机器 192.168.1.10
+go run ./src/kvnode -config deploy.json -name g0-0     # 同上机器
+go run ./src/kvnode -config deploy.json -name g1-0
+# ... 在 192.168.1.11 / .12 上分别启动 m1/m2 与各自 g*-* 节点
+
+# 2) 网关以纯客户端接入（本进程不含任何节点，只做 HTTP <-> 远程 RPC 转发）
+go run ./src/gateway -connect deploy.json --addr :8080
+
+# 3) 客户端交互与内存模式完全一致
+curl -X PUT http://localhost:8080/kv/foo -d 'bar'
+curl http://localhost:8080/kv/foo
+```
+
+> **并发安全**：ShardKV 分片迁移（sendShard/fetchShard）会从多个 goroutine 并发调用
+> `make_end`，`buildEndFactory` 内部用 `sync.Mutex` 保护地址→连接的缓存 map，避免
+> `concurrent map access` panic。远程接入模式下 `Cluster.remote == true`，`/readyz`、
+> `ConfigNum`、`WaitConfig` 自动降级为「直连 ShardMaster 取最新 ConfigNum」，不依赖本地副本句柄。
+> 一键 OS 进程级实测（10 进程：9 节点 + 1 网关，含少数派宕机容错）见
+> [`scripts/cross_machine_test.py`](scripts/cross_machine_test.py)（`python scripts/cross_machine_test.py`）。
+
 
 ## 设计要点
 

@@ -17,11 +17,25 @@ import (
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP 网关监听地址")
 	dataDir := flag.String("data-dir", "", "节点状态落盘目录（空=内存）")
-	tcpCfg := flag.String("tcp-config", "", "跨机部署节点地址清单 JSON（指定则走真实 TCP 传输）")
+	tcpCfg := flag.String("tcp-config", "", "跨机部署节点地址清单 JSON（本进程起全部节点，节点间走真实 TCP）")
+	connectCfg := flag.String("connect", "", "纯客户端接入已运行的跨机集群（节点由 kvnode 进程各自承载），值为同一份部署 JSON")
 	flag.Parse()
 
 	var c *cluster.Cluster
 	switch {
+	case *connectCfg != "":
+		// 真·跨机：节点在别处（kvnode 进程/其他机器），本进程只做 HTTP↔Clerk 翻译。
+		cfg, err := cluster.LoadTCPConfig(*connectCfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "load connect config:", err)
+			os.Exit(1)
+		}
+		c, err = cluster.ConnectTCP(cfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "connect cluster:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("raft-kv gateway 远程接入模式: %s (groups=%d)\n", *connectCfg, len(c.Groups))
 	case *tcpCfg != "":
 		// 跨机部署：节点间 RPC 走真实 TCP（src/transport），可分布到不同进程/机器。
 		cfg, err := cluster.LoadTCPConfig(*tcpCfg)

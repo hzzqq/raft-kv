@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–140，共 98 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
+> 覆盖 cycle 39–146，共 104 轮交付；时间跨度 2026-07-22 ~ 2026-07-26。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -19,6 +19,7 @@
 - **[82] `gw_debug_raft`** — GET /debug/raft 汇聚端点(各副本 RaftStatus + RaftCheck 自检)（隐性：运维需登录各节点才能看共识健康,脑裂/任期翻滚/apply落后无统一视图；score=16）
 - **[83] `gw_raft_health_metric`** — /metrics 暴露 raft_min_health_score gauge（隐性：raft 健康此前不可被 Prometheus scrape/告警(仅 JSON 端点)；score=15）
 - **[118] `gw_labeled_req_metrics`** — 网关请求指标升级为带标签 CounterVec：http_requests_total{method} + http_responses_total{code,method}（隐性：旧实现用『http_responses_<code>』式独立指标名，缺 method 维度且无法在单指标内切片算错误率/分方法 QPS(R2 隐性可观测缺口)；score=18）
+- **[144] `gateway_connect_mode`** — gateway -connect 纯客户端接入模式 + clusterHealthy 远程降级（直连 ShardMaster 取最新 ConfigNum）（隐性：纯客户端模式无本地副本，原 /readyz 遍历本地 KV 句柄会导致空指针/卡死（R2 远程接入可用性缺口）；score=15）
 
 ## kvcli
 
@@ -109,6 +110,7 @@
 - **[94] `docs_migrate_gauges`** — 收口迁移可观测文档(#229 gauge / #230 diagnosis 此前零文档记载)（隐性：shardkv_pending_in/out/owned/total 四个 Prometheus 告警主指标(#229) 与 /debug/shards 的 diagnosis 自检字段(#230) 在 runbook/usage/architecture/coverage 全未记载,运维无法基于其做阈值告警；score=16）
 - **[96] `docs_crosslink_integrity`** — 文档时效收口——coverage.md 仍称 kvraft_status_test.go『尚未提交』(实际 #228 已提交) 且快照框定停于 #212-#226（隐性：coverage.md 与迭代实际进度脱节(迭代已推进至 #234):既误称某单测文件未提交,又未反映 #227-#234 新增 cluster-free 单测与 docs/observability.md;全仓内部 markdown 链接此前从未系统性校验；score=15）
 - **[120] `docs_ci_sync_120`** — 文档/CI 收口：可观测性文档同步新增标签指标 + CounterVec 原语 + 指标校验器识别 CounterVec/GaugeVec（隐性：新增 http_responses_total{code,method}/CounterVec 原语零文档记载；check_metrics_docs 不识别 CounterVec/GaugeVec，未来标签指标漂移无门禁拦截（R2 隐性）；score=14）
+- **[146] `docs_cross_machine`** — README 跨机部署补充「真·跨机（每节点独立进程）」小节（kvnode 多进程 + gateway -connect 示例 + 指向 cross_machine_test.py）（隐性：原 README 跨机章节只有单进程 --tcp-config 形态，缺生产多机拓扑文档（R2 文档盲区）；score=13）
 
 ## scripts
 
@@ -138,6 +140,7 @@
 - **[137] `check_all_json`** — check_all.py --json 机器可读门禁报告（隐性：统一门禁结果仅文本输出,CI/看板无法程序化消费聚合结果(R2 可观测缺口);且 --json 初版未捕获子进程 stdout 致 JSON 被污染；score=15）
 - **[139] `go_patterns_fatal`** — check_go_patterns 新增 log.Fatal/os.Exit 库代码 WARN 模式（隐性：库代码(main/测试除外)中 log.Fatal/os.Exit 会直接中止进程,此前未被任何门禁覆盖(R2 隐性错误面)；score=14）
 - **[140] `godoc_pkg_doc`** — godoc 包级文档注释(// Package X)覆盖的软提示（隐性：14 个导出包全部缺 // Package 包级文档,go doc 包概览为空却无人察觉;设为硬失败会打挂 CI 故仅软提示(R2 可观测盲区)；score=14）
+- **[145] `cross_machine_e2e_test`** — OS 进程级跨机实测（10 进程：9 节点 + 1 网关，taskkill 模拟宕机验证少数派容错）；TestNodePerProcessCluster 集成回归（隐性：此前跨机仅单进程 loopback 验证，缺真·多进程边界与宕机容错实测（R2 部署化真验缺口）；score=19）
 
 ## other
 
