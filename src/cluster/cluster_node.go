@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"sync"
 
+	"raftkv/src/diagnostics"
 	"raftkv/src/raft"
 	"raftkv/src/shardkv"
 	"raftkv/src/shardmaster"
@@ -46,6 +47,54 @@ func (n *TCPNode) Stop() {
 	for _, cc := range n.conns {
 		_ = cc.Close()
 	}
+}
+
+// NodeDiagnostics 是单个节点进程的健康快照（跨机运维可观测性）。
+//
+// 背景：真·跨机部署下每个 kvnode 进程只持有一个节点（ShardMaster 副本或 group 副本），
+// 而已有 HTTP 端点只存在于 gateway 进程——一旦某台机器上的节点异常（落后、卡在
+// pendingIn、丢了 leader 租约），运维无从查询该节点自身状态，只能翻日志。本结构把
+// 「Raft 运行状态 + 分片持有/迁移状态 + diagnostics 判定」聚合成一份可 JSON 序列化的
+// 快照，由 kvnode 的 -http 端点自曝，使跨机巡检可以逐节点 curl。
+// 字段命名沿用 gateway.ShardDebugView 的惯例（PascalCase、可选字段 omitempty），
+// 使本端点与既有 /debug/shards 输出风格一致，运维侧解析逻辑可直接复用。
+type NodeDiagnostics struct {
+	Name      string
+	Kind      string // "shardmaster" | "shardkv"
+	ConfigNum int    // 本节点已生效的配置版本号
+	// RaftRole 是 Raft 角色的文字形式。raft.Role 底层是 int 且未实现 MarshalJSON，
+	// 直接序列化只得到 0/1/2，人工 curl 时得查表；故冗余一份可读值。
+	RaftRole   string                 `json:",omitempty"`
+	Raft       *raft.RaftStatus       `json:",omitempty"` // Raft 运行状态（任期/提交进度/租约）
+	Shard      *shardkv.ShardDebug    `json:",omitempty"` // 分片持有与迁移未决态（仅 ShardKV）
+	RaftCheck  *diagnostics.Diagnosis `json:",omitempty"` // Raft 层不变量自检
+	ShardCheck *diagnostics.Diagnosis `json:",omitempty"` // 分片层不变量自检（仅 ShardKV）
+}
+
+// Diagnostics 采集本节点的健康快照。只读、无副作用，可安全地在 HTTP 处理中并发调用。
+func (n *TCPNode) Diagnostics() NodeDiagnostics {
+	d := NodeDiagnostics{Name: n.Name}
+	switch {
+	case n.kv != nil:
+		d.Kind = "shardkv"
+		rs := n.kv.RaftStatus()
+		sd := n.kv.ShardDebug()
+		d.Raft, d.Shard = &rs, &sd
+		d.RaftRole = rs.Role.String()
+		d.ConfigNum = sd.ConfigNum
+		rc, sc := diagnostics.RaftCheck(rs), diagnostics.ShardCheck(sd)
+		d.RaftCheck, d.ShardCheck = &rc, &sc
+	case n.sm != nil:
+		d.Kind = "shardmaster"
+		rs := n.sm.RaftStatus()
+		d.Raft = &rs
+		d.RaftRole = rs.Role.String()
+		rc := diagnostics.RaftCheck(rs)
+		d.RaftCheck = &rc
+	default:
+		d.Kind = "unknown"
+	}
+	return d
 }
 
 // parseNodeName 解析节点名："m<j>" → (true, j, -1, -1)；"g<g>-<r>" → (false, -1, g, r)。

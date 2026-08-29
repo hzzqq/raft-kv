@@ -212,6 +212,42 @@ curl -X PUT http://<gateway-host>:8080/kv/foo -d 'bar'
 - 网关 `-connect` 模式不持本地节点：`/readyz` 退化为直连 ShardMaster 取最新 ConfigNum
   （transport 层 2s 超时），`ConfigNum`/`WaitConfig` 同样走这一远程降级路径，避免空指针/卡死。
 
+### 2.6.1 逐节点诊断端点（`-http`）
+
+跨机形态下每个进程只持有一个节点，而 `gateway` 的 `/debug/shards` 只能看到**它自己**
+持有的副本——`-connect` 纯客户端模式下更是一个都看不到。所以哪台机器上的节点落后了、
+卡在 `pendingIn` 了、丢了 leader 租约，光靠网关查不出来，只能翻日志。
+
+给 `kvnode` 加 `-http` 即让**该节点自曝状态**，逐台 `curl` 就能巡检：
+
+```bash
+machine-D$ go run ./src/kvnode -config deploy.json -name g0-0 -http :9100
+
+# 存活探针（进程在即 200，可直接喂给 k8s livenessProbe / LB 健康检查）
+curl -fsS http://machine-D:9100/healthz          # -> ok
+
+# 一行式摘要（人工巡检，无需解析 JSON）
+curl -s http://machine-D:9100/
+# name=g0-0 kind=shardkv config=3
+# raft : role=Leader term=2 commit=41 applied=41 lease=true
+# shard: gid=1 leader=true owned=5 pendingIn=[] pendingOut=[] stall=0.0s
+
+# 完整快照 JSON（Raft 状态 + 分片持有/迁移 + diagnostics 不变量自检）
+curl -s http://machine-D:9100/status | jq .
+```
+
+- 输出结构 `cluster.NodeDiagnostics` 沿用 `gateway.ShardDebugView` 的字段风格
+  （PascalCase、可选字段 `omitempty`），运维侧解析逻辑可与 `/debug/shards` 共用。
+- `RaftRole` 额外给出角色**文字**形式：`raft.Role` 底层是 `int` 且未实现 `MarshalJSON`，
+  裸序列化只有 `0/1/2`，人工判读需查表。
+- `RaftCheck` / `ShardCheck` 是 `diagnostics` 包的不变量自检结果（`Score` + `Issues`），
+  把「这节点是否健康」从人肉判读裸状态变成可消费信号。
+- **排障路径**：集群写不进去时，逐节点 `curl /` 看 ① 有没有 leader（全是 Follower →
+  选举失败/网络分区）；② `stall` 是否在涨（分片卡在迁移未决态）；③ `applied` 是否追平
+  `commit`（应用层落后）。
+- 端点为**只读**、无副作用；`-http` 留空则完全不起 HTTP（默认行为不变）。
+- ⚠️ 与业务端口一样**无鉴权**，仅可暴露于可信网络（见 §3）。
+
 **端到端证明**：`scripts/cross_machine_test.py` 在本机拉起 **10 个真实 OS 进程**
 （9 个 `kvnode` + 1 个 `gateway -connect`），用 `taskkill /PID /F` 杀掉每组多数派之外的
 少数派节点，验证集群在真实进程级故障下仍可读写——复跑稳定。这正是「真·跨机」形态的最小

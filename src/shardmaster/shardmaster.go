@@ -27,6 +27,7 @@ var Metrics = metrics.NewRegistry()
 // ============================== 常量与类型 ==============================
 
 const NShards = 10
+
 // Err 是配置服务的错误码（如 ErrNotLeader）。
 type Err string
 
@@ -52,16 +53,20 @@ type JoinArgs struct {
 	CkId    int64
 	Seq     int64
 }
+
 // JoinReply 是 Join 的响应。
 type JoinReply struct{ Err Err }
+
 // LeaveArgs 是 Leave 请求的入参（退出的副本组 GIDs）。
 type LeaveArgs struct {
 	Gids []int
 	CkId int64
 	Seq  int64
 }
+
 // LeaveReply 是 Leave 的响应。
 type LeaveReply struct{ Err Err }
+
 // MoveArgs 是 Move 请求的入参（指定 shard→gid 映射）。
 type MoveArgs struct {
 	Shard int
@@ -69,10 +74,13 @@ type MoveArgs struct {
 	CkId  int64
 	Seq   int64
 }
+
 // MoveReply 是 Move 的响应。
 type MoveReply struct{ Err Err }
+
 // QueryArgs 是 Query 请求的入参（按配置版本号查询）。
 type QueryArgs struct{ Num int }
+
 // QueryReply 是 Query 的响应，含目标配置。
 type QueryReply struct {
 	Err    Err
@@ -129,6 +137,7 @@ func Make(peers []*raft.ClientEnd, me int, persister raft.Persister) *ShardMaste
 	go sm.applier()
 	return sm
 }
+
 // Kill 关闭配置服务节点，仅测试使用。
 func (sm *ShardMaster) Kill() {
 	atomic.StoreInt32(&sm.dead, 1)
@@ -416,6 +425,7 @@ func (sm *ShardMaster) propose(op Op) Err {
 		return ErrTimeout
 	}
 }
+
 // Join 将新副本组加入集群，复制为配置变更。
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	sm.mu.Lock()
@@ -428,6 +438,7 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	}
 	reply.Err = sm.propose(Op{Kind: "Join", CkId: args.CkId, Seq: args.Seq, Servers: args.Servers})
 }
+
 // Leave 将副本组移出集群，复制为配置变更。
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	sm.mu.Lock()
@@ -440,6 +451,7 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	}
 	reply.Err = sm.propose(Op{Kind: "Leave", CkId: args.CkId, Seq: args.Seq, Gids: args.Gids})
 }
+
 // Move 手动调整 shard→gid 映射，复制为配置变更。
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	sm.mu.Lock()
@@ -480,10 +492,12 @@ type Clerk struct {
 	clientId int64
 	seq      int64
 }
+
 // MakeClerk 创建并启动一个 ShardMaster 的 Clerk。
 func MakeClerk(sm []string, make_end func(string) *raft.ClientEnd) *Clerk {
 	return &Clerk{sm: sm, make_end: make_end, clientId: nrand(), seq: 0}
 }
+
 // Query 按配置版本号拉取集群配置。
 func (ck *Clerk) Query(num int) Config {
 	for {
@@ -498,6 +512,7 @@ func (ck *Clerk) Query(num int) Config {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
 // Join 提交 Join 配置变更。
 func (ck *Clerk) Join(servers map[int][]string) {
 	ck.mu.Lock()
@@ -516,6 +531,7 @@ func (ck *Clerk) Join(servers map[int][]string) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
 // Leave 提交 Leave 配置变更。
 func (ck *Clerk) Leave(gids []int) {
 	ck.mu.Lock()
@@ -534,6 +550,7 @@ func (ck *Clerk) Leave(gids []int) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
 // Move 提交 Move 配置变更。
 func (ck *Clerk) Move(shard int, gid int) {
 	ck.mu.Lock()
@@ -558,6 +575,13 @@ func (ck *Clerk) Move(shard int, gid int) {
 func nrand() int64 {
 	return rand.Int63()
 }
+
+// RaftStatus 返回本 ShardMaster 副本的 Raft 运行状态（与 ShardKV.RaftStatus 同范式），
+// 供跨机部署下每个节点进程自曝健康快照（kvnode /status）。
+func (sm *ShardMaster) RaftStatus() raft.RaftStatus {
+	return sm.rf.Status()
+}
+
 // String 返回配置的文本表示（调试用）。
 func (sm *ShardMaster) String() string {
 	sm.mu.Lock()
