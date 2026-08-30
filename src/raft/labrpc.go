@@ -85,14 +85,45 @@ type Network struct {
 	servers map[int]*Server
 	ends    map[int]*ClientEnd
 	enabled map[int]bool // 每个 server 是否可达
+	part    map[int]int  // serverId -> 分区号（PartitionServers 设置；未登记表示不受分区限制）
 }
+
 // MakeNetwork 创建实验用网络，管理 ClientEnd/Server 与可控延迟、分区。
 func MakeNetwork() *Network {
 	return &Network{
 		servers: make(map[int]*Server),
 		ends:    make(map[int]*ClientEnd),
 		enabled: make(map[int]bool),
+		part:    make(map[int]int),
 	}
+}
+
+// PartitionServers 把节点划分为互不连通的分区：同分区内投递正常，跨分区一律失败。
+// 与 Enable(false) 的区别是「节点仍活着、分区内仍能互相通信」，因此能模拟真实的
+// 网络分裂（脑裂）而非节点掉线——少数派 leader 依旧自认为 leader，但拿不到 quorum。
+//
+// 未出现在任何分区里的 id 不受限制，可访问所有分区（例如 owner 9000 的客户端端点），
+// 这让「客户端能连上少数派 leader，但请求仍无法提交」成为可观测现象。
+// 不传参数（PartitionServers()）表示撤销分区、恢复全连通。
+func (n *Network) PartitionServers(parts ...[]int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.part = make(map[int]int, len(parts))
+	for i, p := range parts {
+		for _, id := range p {
+			n.part[id] = i + 1 // 从 1 开始，0 保留给「未登记」
+		}
+	}
+}
+
+// reachable 判断发送方 oid → 接收方 sid 是否跨分区被隔断（持锁调用）。
+func (n *Network) reachable(oid, sid int) bool {
+	po, oko := n.part[oid]
+	ps, oks := n.part[sid]
+	if !oko || !oks {
+		return true // 任一端未登记分区（客户端 / 未参与分裂的节点）：不受限制
+	}
+	return po == ps
 }
 
 // AddServer 注册一个 Raft 节点，handler 负责把 RPC 分派给具体方法。
@@ -151,9 +182,10 @@ func (n *Network) Send(endname int, method string, args interface{}, reply inter
 	if v, ok := n.enabled[oid]; ok {
 		enabledSrc = v
 	}
+	linked := n.reachable(oid, sid)
 	n.mu.Unlock()
 
-	if !exists || !enabledDst || !enabledSrc {
+	if !exists || !enabledDst || !enabledSrc || !linked {
 		return false
 	}
 	m := &RpcMsg{method: method, args: args, reply: reply, done: make(chan struct{})}

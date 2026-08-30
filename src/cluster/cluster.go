@@ -258,6 +258,28 @@ func (c *Cluster) EnableKV(g, r int, up bool) {
 	c.Net.Enable(1000+g*100+r, up)
 }
 
+// PartitionKV 按副本下标把第 g 组切成互不连通的若干分区（真网络分裂：分区内互通、
+// 跨分区不可达），例如 PartitionKV(0, []int{0,1}, []int{2,3,4}) 造出 2+3 脑裂。
+// 与 EnableKV(false) 的差别是节点仍存活、少数派内部仍能通信，因此少数派 leader
+// 会保持 Leader 角色但拿不到 quorum——正是断言「不会脑裂双写」的关键场景。
+// 不传分区（PartitionKV(g)）表示恢复全连通。仅内存网络（StartCluster*）支持。
+//
+// 注意：ShardMaster 与客户端端点不在分区内，两侧都可访问（配置服务保持可用）。
+func (c *Cluster) PartitionKV(g int, parts ...[]int) {
+	if c.Net == nil {
+		panic("PartitionKV 仅支持内存网络集群（TCP 模式请停 transport.Server）")
+	}
+	ids := make([][]int, 0, len(parts))
+	for _, p := range parts {
+		side := make([]int, 0, len(p))
+		for _, r := range p {
+			side = append(side, 1000+g*100+r)
+		}
+		ids = append(ids, side)
+	}
+	c.Net.PartitionServers(ids...)
+}
+
 // KVRaftStatus 返回第 g 组第 r 个副本的 raft 只读状态快照（角色/任期/应用进度），
 // 供分区/快照类测试断言副本追赶进度，不触发任何 RPC。
 func (c *Cluster) KVRaftStatus(g, r int) raft.RaftStatus {

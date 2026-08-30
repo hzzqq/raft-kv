@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–149，共 107 轮交付；时间跨度 2026-07-22 ~ 2026-08-30。
+> 覆盖 cycle 39–150，共 108 轮交付；时间跨度 2026-07-22 ~ 2026-08-30。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -46,6 +46,7 @@
 
 - **[76] `raft_metrics`** — Raft 共识层可观测性补齐(raft_log_appends_total / raft_term_changes_total)（隐性：控制面任期翻转与写入吞吐不可见,排查脑裂/频繁选举无量化依据；score=14）
 - **[80] `raft_status_selfcheck`** — Raft.Status() 只读快照 + diagnostics.RaftCheck 不变量自检（隐性：共识层对运维完全不透明(脑裂/任期翻滚/apply落后无信号)；RaftCheck 此前无单测；score=18）
+- **[150] `exp_partition_split_brain`** — 真网络分裂（脑裂）故障注入原语 + 场景 B：2+3 分区下不双写、愈合后收敛（隐性：原有分区注入只有 Enable(false)（整节点掉线），造不出「少数派节点仍存活且内部互通、旧 leader 仍自认 leader」的真脑裂——而这才是双写风险最大、最需要被证明的场景；score=18）
 
 ## shardkv
 

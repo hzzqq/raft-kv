@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"raftkv/src/raft"
+	"raftkv/src/shardkv"
 )
 
 // waitCaughtUp 轮询直到第 g 组第 r 个副本的 LastApplied 追上 target（最多 timeout）。
@@ -85,6 +86,80 @@ func TestClusterFollowerSnapshotCatchUp(t *testing.T) {
 	ck.Put("after-heal", "yes")
 	if got := ck.Get("after-heal"); got != "yes" {
 		t.Fatalf("after-heal = %q", got)
+	}
+}
+
+// TestClusterPartitionKVNoSplitBrain（I149）：验证 PartitionKV 造出的「真脑裂」下不会双写。
+// 与 TestClusterLeaderPartitionRecovery 的差别是这里用真网络分裂（少数派节点仍存活、
+// 少数派内部仍互通）而非整节点掉线，因此旧 leader 会保持 Leader 角色——正是双写风险
+// 最大的场景。断言：少数派 CommitIndex 冻结（拿不到 quorum）、多数派照常提交、
+// 愈合后少数派降级追平，且分区期间打进少数派日志的未提交写不会出现在最终状态里。
+func TestClusterPartitionKVNoSplitBrain(t *testing.T) {
+	const (
+		g         = 0
+		nReplicas = 5
+	)
+	c := StartCluster(1, nReplicas, 3, -1)
+	defer c.Cleanup()
+
+	c.Join(g)
+	c.WaitConfig(g, 0, 1)
+	ck := c.Clerk()
+	ck.Put("k-before", "v1")
+
+	oldLead := leaderOf(c, g, nReplicas)
+	if oldLead < 0 {
+		t.Fatalf("no leader in group %d", g)
+	}
+	oldSt := c.KVRaftStatus(g, oldLead)
+
+	// 2+3 分裂：旧 leader 落在少数派。
+	minority := []int{oldLead, (oldLead + 1) % nReplicas}
+	majority := []int{}
+	for r := 0; r < nReplicas; r++ {
+		if r != minority[0] && r != minority[1] {
+			majority = append(majority, r)
+		}
+	}
+	c.PartitionKV(g, minority, majority)
+
+	// 多数派换主并继续服务。
+	newLead := -1
+	for wait := time.Now().Add(10 * time.Second); time.Now().Before(wait) && newLead < 0; {
+		for _, r := range majority {
+			if st := c.KVRaftStatus(g, r); st.Role == raft.Leader && st.Term > oldSt.Term {
+				newLead = r
+				break
+			}
+		}
+		if newLead < 0 {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	if newLead < 0 {
+		t.Fatalf("多数派未选出新 leader（旧 leader=%d term=%d）", oldLead, oldSt.Term)
+	}
+	if err := ck.PutE("k-during", "v2"); err != shardkv.OK {
+		t.Fatalf("多数派应可写，实得 err=%v", err)
+	}
+
+	// 少数派：旧 leader 仍自认 leader，但提交进度冻结（拿不到 quorum）。
+	if st := c.KVRaftStatus(g, oldLead); st.CommitIndex > oldSt.CommitIndex {
+		t.Fatalf("少数派 leader 竟推进了提交: %d -> %d（quorum 判定有 bug）",
+			oldSt.CommitIndex, st.CommitIndex)
+	}
+
+	// 愈合：旧 leader 必须降级并追平，且分区期间少数派未提交的写不得出现。
+	c.PartitionKV(g)
+	target := c.KVRaftStatus(g, newLead).LastApplied
+	if st, ok := waitCaughtUp(c, g, oldLead, target, 15*time.Second); !ok {
+		t.Fatalf("旧 leader r%d 愈合后未追平: LastApplied=%d < %d", oldLead, st.LastApplied, target)
+	}
+	if got := ck.Get("k-during"); got != "v2" {
+		t.Fatalf("愈合后分区期间数据丢失: k-during=%q", got)
+	}
+	if got := ck.Get("k-before"); got != "v1" {
+		t.Fatalf("愈合后历史数据丢失: k-before=%q", got)
 	}
 }
 

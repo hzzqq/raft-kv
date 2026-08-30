@@ -1,5 +1,4 @@
+// stubs.go —— 尚未实现的场景占位，随迭代逐个替换。
 package main
 
-// 占位：场景 B/C 在后续迭代实现。
-func runPartition() { println("scenario 'partition' 尚未实现（见迭代 I2）") }
-func runPerf()      { println("scenario 'perf' 尚未实现（见迭代 I3）") }
+func runPerf() { log("scenario 'perf' 尚未实现（见迭代 I3）") }

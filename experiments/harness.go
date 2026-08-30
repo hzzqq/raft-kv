@@ -45,6 +45,34 @@ func bootstrap(c *cluster.Cluster, nGroups int) {
 	}
 }
 
+// waitLeaderIn 只在给定副本子集里等新 leader（term>minTerm）。分区场景必须限定范围：
+// 被隔离的旧 leader 收不到更高任期的心跳，本地仍自称 leader（这是分区语义，不是 bug）。
+func waitLeaderIn(c *cluster.Cluster, g int, cand []int, minTerm int, timeout time.Duration) (int, raft.RaftStatus) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, r := range cand {
+			st := c.KVRaftStatus(g, r)
+			if st.Role == raft.Leader && st.Term > minTerm {
+				return r, st
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	return -1, raft.RaftStatus{}
+}
+
+// waitCaughtUp 轮询直到第 g 组第 r 个副本的 LastApplied 追上 target。
+func waitCaughtUp(c *cluster.Cluster, g, r, target int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if c.KVRaftStatus(g, r).LastApplied >= target {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
 // waitLeader 轮询直到出现 Role==Leader 且 term>minTerm 的副本（用于探测新 leader）。
 func waitLeader(c *cluster.Cluster, g, nR, minTerm int, timeout time.Duration) (int, raft.RaftStatus) {
 	deadline := time.Now().Add(timeout)
