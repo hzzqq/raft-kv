@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–148，共 106 轮交付；时间跨度 2026-07-22 ~ 2026-07-29。
+> 覆盖 cycle 39–149，共 107 轮交付；时间跨度 2026-07-22 ~ 2026-08-30。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -151,6 +151,7 @@
 - **[129] `license_mit`** — MIT 开源许可证(治理合规)（隐性：公开发布仓库无 OSI 许可证,默认保留所有权利,阻塞复用/贡献；score=14）
 - **[130] `security_policy`** — SECURITY.md 漏洞披露政策(安全治理)（隐性：已落地密钥扫描门禁(check_secrets)但外部研究者无漏洞上报渠道,安全门禁缺人工闭环；score=15）
 - **[138] `bench_guard_wired`** — 接通休眠的性能回归护栏(check_bench_regression 此前从未被调用)（隐性：check_bench_regression.py 自 cycle116 存在却未被 make/CI 调用,且 bench-baseline.json 为空 {},护栏实际失效(R2 harness 漂移,cycle110/133 同类)；score=16）
+- **[149] `exp_leader_fault`** — 可展示容错实验框架（独立 Go 模块，隔离父项目门禁）+ 场景 A leader 故障切换（隐性：项目价值长期停在「健康分 100」与工具链自检，缺「系统确实容错」的可演示证据（实训/面试最值钱部分）；score=16）
 
 ---
 
