@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–165，共 118 轮交付；时间跨度 2026-07-19 ~ 2026-08-31。
+> 覆盖 cycle 39–167，共 119 轮交付；时间跨度 2026-07-19 ~ 2026-08-31T13:25:10。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -161,6 +161,7 @@
 - **[153] `deploy_compose_observability`** — 真部署化：docker-compose 起 3 ShardMaster + 3 ShardKV + gateway 多进程集群，配 Prometheus scrape / 11 条告警规则 / 11 面板 Grafana 看板；并新增 deploycheck 包把部署配置与代码真实指标名绑死为不变量测试（隐性：可观测此前只存在于进程内指标与 JSON 端点，从未在真实多进程形态下被 scrape 与可视化；更危险的是看板/告警极易引用代码里根本不存在的指标名（看板幻觉），面板静默空白却无人发现；score=20）
 - **[154] `console_experiments_tab`** — 控制台新增「实验与验证」Tab：只读托管 experiments/results/ 真实产物，把场景 A/B 时间线渲染成时序日志、场景 C 数据渲染成柱状图；并补 experiments/README.md 记录三场景方法、真实结果与诚实声明（隐性：三个可展示实验此前只能靠命令行跑，结果散落在终端、无法在统一控制台里展示与复核；产物缺少方法说明与边界声明，旁人看 JSON/日志不知其含义与局限；score=14）
 - **[161] `perf_scaling_guard`** — 场景C 性能回归护栏（--assert + TestScalingRatio）（隐性：场景C 扩展比 2.87x 只是文字结论、无回归护栏，心跳节流修复被 revert 后扩展比趋近 1.0x 无人察觉；score=17）
+- **[167] `I167`** — （隐性：；score=）
 
 ---
 
