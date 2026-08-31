@@ -1068,7 +1068,11 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		s.recordRequestMetrics(r.Method, st, float64(time.Since(start).Microseconds())/1000.0)
 		// #205：响应体大小直方图（线上字节，gzip 开启时为压缩后字节），与延迟直方图
 		// 并列，供 /metrics 观测带宽与大响应分布。纯观测，零行为影响。
-		Metrics.Histogram("gateway_response_bytes").Record(float64(mw.respBytes))
+		// 直方图语义诚实化（R7）：p50/p95/p99 来自最近 4096 次观测的样本环形缓冲，
+		// 按观测次数滑窗、非时间滑窗。低流量/故障窗口会残留历史样本，故故障期分位
+		// 可能「反而偏低」被误读成延迟改善——这是观测口径限制，不是真实延迟下降。
+		Metrics.HistWithHelp("gateway_response_bytes",
+			"网关响应体大小直方图（字节；gzip 开启时为压缩后字节）。分位来自最近 4096 次观测的样本环形缓冲（按观测次数滑窗，非时间滑窗），低流量时残留历史样本。").Record(float64(mw.respBytes))
 		// I61：后端健康熔断观测。按最终状态码更新熔断状态（5xx 累计，非 5xx 重置/恢复）。
 		s.observeBackend(st)
 	}
@@ -1104,7 +1108,10 @@ func (s *Server) recordAccess(method, path string, status int, d time.Duration, 
 func (s *Server) recordRequestMetrics(method string, status int, latencyMs float64) {
 	Metrics.CounterVec("http_requests_total", "method").WithLabelValues(method).Inc()
 	Metrics.CounterVec("http_responses_total", "code", "method").WithLabelValues(strconv.Itoa(status), method).Inc()
-	Metrics.Histogram("http_request_latency_ms").Record(latencyMs)
+	// 直方图语义诚实化（R7）：见 gateway_response_bytes 注释——分位按样本次数滑窗，
+	// 非时间滑窗；故障期流量骤降时 p99 可能反而「好看」，切勿据此判定延迟改善。
+	Metrics.HistWithHelp("http_request_latency_ms",
+		"网关请求延迟直方图（毫秒）。分位(p50/p95/p99)来自最近 4096 次观测的样本环形缓冲（按观测次数滑窗，非时间滑窗）：低流量/故障窗口会残留历史样本，故故障期 p99 可能反而偏低，不能直接解读为延迟改善。").Record(latencyMs)
 }
 
 // handleDebugAccessLog 返回进程内访问日志的最近 N 条（默认 50，可用 ?limit= 覆盖），
