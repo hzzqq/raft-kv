@@ -1,0 +1,39 @@
+# deploy/prometheus.yml —— 两类抓取目标，缺一不可
+#
+#   raftkv-nodes    每个 kvnode 进程的 /metrics（共识面：term / is_leader / leader 切换次数 /
+#                   apply_lag / 分片持有与迁移）。**必须逐节点抓**——网关以 -connect 纯客户端
+#                   模式接入，读不到任何远端节点的内存状态。
+#   raftkv-gateway  网关 /metrics（请求面：QPS、状态码、延迟分位、限流/熔断计数）。
+#
+# 抓取间隔 5s：leader 切换是秒级事件，15s 默认间隔会把整段切换过程糊掉。
+global:
+  scrape_interval: 5s
+  scrape_timeout: 3s
+  evaluation_interval: 5s
+  external_labels:
+    cluster: raftkv-local
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: raftkv-nodes
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["sm0:9100", "sm1:9100", "sm2:9100"]
+        labels:
+          role: shardmaster
+      - targets: ["kv0:9100", "kv1:9100", "kv2:9100"]
+        labels:
+          role: shardkv
+
+  - job_name: raftkv-gateway
+    metrics_path: /metrics
+    # 网关 /metrics 按 Accept 协商输出格式；Prometheus 默认 Accept 含 text/plain 与
+    # openmetrics，两者都会命中 Prometheus 文本分支（见 gateway.handleMetrics）。
+    static_configs:
+      - targets: ["gateway:8080"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

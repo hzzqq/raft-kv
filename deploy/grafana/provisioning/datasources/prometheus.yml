@@ -1,0 +1,12 @@
+# Grafana 数据源自动供给：容器起来即可用，无需手点 UI。
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: raftkv-prom
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s

@@ -1,0 +1,391 @@
+{
+  "uid": "raftkv-overview",
+  "title": "raft-kv 总览（共识 + 请求面）",
+  "description": "左列请求面（网关 /metrics），右列共识面（各 kvnode /metrics）。全部查询只用代码真实暴露的指标名，由 src/deploycheck 不变量测试守住。",
+  "tags": ["raftkv", "raft", "shardkv"],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "节点存活数",
+      "description": "raftkv_node_up 求和；应恒等于 6（3 ShardMaster + 3 group0 副本）。掉到 5 说明有容器挂了。",
+      "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 5 },
+              { "color": "green", "value": 6 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "sum(raftkv_node_up)",
+          "legendFormat": "up"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "group0 leader 切换次数（5m）",
+      "description": "每次切换必有且仅有一个副本赢得选举，故全组 increase 求和即切换次数。杀掉当前 leader 容器后此格 +1。",
+      "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 2 },
+              { "color": "red", "value": 4 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "sum(increase(raftkv_raft_leader_elections_total{group=\"0\"}[5m]))",
+          "legendFormat": "elections"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "最低 Raft 自检分",
+      "description": "diagnostics 包的不变量自检（0-100）取全节点最小值；<100 即有节点存在一致性/健康问题。",
+      "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 80 },
+              { "color": "green", "value": 100 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "min(raftkv_raft_health_score)",
+          "legendFormat": "min score"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "已生效分片配置版本",
+      "description": "raftkv_shard_config_num 最大值；副本间长期不一致见 ShardConfigDiverged 告警。",
+      "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "decimals": 0 },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "max(raftkv_shard_config_num)",
+          "legendFormat": "config"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "QPS（按方法）",
+      "description": "网关请求速率。空曲线说明没有流量——用 --profile load 起 loadgen 打压。",
+      "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "sum by (method) (rate(http_requests_total[1m]))",
+          "legendFormat": "{{method}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "sum(rate(http_requests_total[1m]))",
+          "legendFormat": "总计"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "请求延迟分位（p50 / p95 / p99）",
+      "description": "注意：分位来自 4096 样本环形缓冲（按次数滑窗，非时间滑窗），因此低流量时会残留历史样本影响。",
+      "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "http_request_latency_ms_p50",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "http_request_latency_ms_p95",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "http_request_latency_ms_p99",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "谁是 Leader（group0，1=自认 Leader）",
+      "description": "阶梯图：故障切换时可直接看出 leader 从哪个容器跳到哪个。同时叠加 has_leader_lease——只有持租约者能提交日志。",
+      "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1.2,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "lineWidth": 2, "fillOpacity": 15, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "raftkv_raft_is_leader{group=\"0\"}",
+          "legendFormat": "leader {{node}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "raftkv_raft_has_leader_lease{group=\"0\"}",
+          "legendFormat": "lease {{node}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "任期 Term（按组）",
+      "description": "term 快速翻滚 = 选举风暴（见 RaftElectionStorm 告警）。sm 为 ShardMaster 组。",
+      "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "max by (group) (raftkv_raft_term)",
+          "legendFormat": "group {{group}}"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "apply 落后量（commit - applied）",
+      "description": "持续 >0 说明状态机应用卡住，该副本的读会陈旧。",
+      "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 20, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "raftkv_raft_apply_lag",
+          "legendFormat": "{{node}}"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "错误率（4xx / 5xx）",
+      "description": "5xx 持续 >0 见 GatewayServerErrors 告警；故障切换瞬间可能出现少量重试导致的抖动。",
+      "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "sum(rate(http_responses_total{code=~\"5..\"}[1m]))",
+          "legendFormat": "5xx"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "sum(rate(http_responses_total{code=~\"4..\"}[1m]))",
+          "legendFormat": "4xx"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "分片持有与迁移未决",
+      "description": "owned 之和应等于分片总数；stall_seconds 持续增长 = 迁移卡死（冻结配置推进）。",
+      "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "sum(raftkv_shard_owned)",
+          "legendFormat": "owned 合计"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "sum(raftkv_shard_pending_in)",
+          "legendFormat": "pending_in"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "sum(raftkv_shard_pending_out)",
+          "legendFormat": "pending_out"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
+          "expr": "max(raftkv_shard_stall_seconds)",
+          "legendFormat": "stall_seconds"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,101 @@
+# deploy/alerts.yml —— 把「集群到底有没有病」变成可告警的表达式。
+#
+# 设计原则：每条规则都指向一个**具体的失效模式**，并写清运维该看哪里。
+# 全部表达式只使用代码真实暴露的指标名（由 src/deploycheck 的不变量测试守住，改名即测试失败）。
+groups:
+  - name: raftkv-consensus
+    rules:
+      # 无 leader：写入必然全部失败。选举期间短暂无主是正常的，故 for 30s。
+      - alert: RaftNoLeader
+        expr: sum by (group) (raftkv_raft_is_leader) == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "group {{ $labels.group }} 无 leader 已 30s"
+          description: "写入路径不可用。逐节点 curl :9100/ 看是否全为 Follower（选举失败/网络分区）。"
+
+      # 双主哨兵：同一 group 内长期 sum>1 说明脑裂（旧 leader 未降级且仍自认 Leader）。
+      # 注意 is_leader 是「自认」，不代表能提交日志；真正的判据是 has_leader_lease。
+      - alert: RaftSplitBrainSuspect
+        expr: sum by (group) (raftkv_raft_is_leader) > 1
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "group {{ $labels.group }} 同时有多个副本自认 Leader"
+          description: "检查 raftkv_raft_has_leader_lease：只有持租约者能提交。持续双主须立即介入。"
+
+      # 选举风暴：5 分钟内切换 >3 次，通常是网络抖动或节点反复重启。
+      - alert: RaftElectionStorm
+        expr: sum by (group) (increase(raftkv_raft_leader_elections_total[5m])) > 3
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "group {{ $labels.group }} 5 分钟内 leader 切换 {{ $value | printf \"%.0f\" }} 次"
+
+      # 状态机应用卡住：commitIndex 已推进但 lastApplied 追不上，2 分钟内始终 >0。
+      - alert: RaftApplyLagStuck
+        expr: min_over_time(raftkv_raft_apply_lag[2m]) > 0
+        for: 0s
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} apply 持续落后（lag={{ $value }}）"
+          description: "applier 卡死或状态机处理过慢；该副本读到的数据会陈旧。"
+
+      # 不变量自检掉分：diagnostics 包发现了一致性/健康问题。
+      - alert: RaftHealthDegraded
+        expr: min by (node) (raftkv_raft_health_score) < 80
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} Raft 自检分 {{ $value }} < 80"
+
+      - alert: RaftKVNodeDown
+        expr: up{job="raftkv-nodes"} == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "节点 {{ $labels.instance }} 抓取失败（进程退出或网络不可达）"
+
+  - name: raftkv-shards
+    rules:
+      # 分片迁移卡死：未决分片的卡滞时长持续增长会冻结整个配置推进。
+      - alert: ShardMigrationStalled
+        expr: max by (group) (raftkv_shard_stall_seconds) > 30
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "group {{ $labels.group }} 分片迁移卡滞 {{ $value | printf \"%.0f\" }}s"
+          description: "查 raftkv_shard_pending_in / pending_out：残留未决即冻结配置推进。"
+
+      # 各副本配置版本长期不一致 = 配置推进卡在某个副本。
+      - alert: ShardConfigDiverged
+        expr: max by (group) (raftkv_shard_config_num) - min by (group) (raftkv_shard_config_num) > 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "group {{ $labels.group }} 副本间配置版本不一致已 2 分钟"
+
+  - name: raftkv-gateway
+    rules:
+      - alert: GatewayServerErrors
+        expr: sum(rate(http_responses_total{code=~"5.."}[2m])) > 0.5
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "网关 5xx 速率 {{ $value | printf \"%.2f\" }}/s"
+
+      # p99 为最近 4096 次请求的分位（环形缓冲，非时间滑窗），阈值按本地部署经验取 500ms。
+      - alert: GatewayHighLatencyP99
+        expr: http_request_latency_ms_p99 > 500
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "网关 p99 延迟 {{ $value | printf \"%.0f\" }}ms"
+
+      # 网关侧聚合的共识健康分（取各副本最小值）；-connect 模式下该值可能缺失，故用 absent 兜底不告警。
+      - alert: GatewayRaftHealthLow
+        expr: raft_min_health_score < 80
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "网关观测到共识健康分 {{ $value }} < 80"

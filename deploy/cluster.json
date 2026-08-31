@@ -1,0 +1,15 @@
+{
+  "n_groups": 1,
+  "n_replicas": 3,
+  "n_sm": 3,
+  "max_raft_state": 1000,
+  "data_dir": "/data",
+  "nodes": [
+    { "name": "m0", "addr": "sm0:7000" },
+    { "name": "m1", "addr": "sm1:7000" },
+    { "name": "m2", "addr": "sm2:7000" },
+    { "name": "g0-0", "addr": "kv0:7100" },
+    { "name": "g0-1", "addr": "kv1:7100" },
+    { "name": "g0-2", "addr": "kv2:7100" }
+  ]
+}

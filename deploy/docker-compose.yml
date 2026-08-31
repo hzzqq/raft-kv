@@ -1,0 +1,185 @@
+# deploy/docker-compose.yml —— 真部署化：每个 Raft 副本一个容器 + 网关 + Prometheus + Grafana
+#
+# 拓扑（与 cluster.json 严格一一对应，由 src/deploycheck 的不变量测试守住）：
+#   sm0 sm1 sm2   ShardMaster 组的 3 个副本（m0/m1/m2）—— 控制面 Raft 组，3 节点
+#   kv0 kv1 kv2   group0 的 3 个副本（g0-0/g0-1/g0-2）—— 数据面 Raft 组，3 节点
+#   gateway       HTTP 网关，-connect 纯客户端接入（进程内不持任何节点）
+#   prometheus    逐节点 scrape /metrics（共识面）+ 网关 /metrics（请求面）
+#   grafana       预置数据源与看板，开箱即见 QPS/延迟/leader 切换次数
+#
+# 起停：
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   docker compose -f deploy/docker-compose.yml --profile load up -d   # 额外挂持续压测
+#   docker compose -f deploy/docker-compose.yml down -v
+#
+# 端口（宿主机）：
+#   8080 网关 REST      9090 Prometheus      3000 Grafana（admin/admin）
+#   9101-9103 sm0-sm2 诊断端点   9111-9113 kv0-kv2 诊断端点
+#
+# 故障演练（看板上能直接看到 leader 切换 +1、term 上升、写入短暂抖动后恢复）：
+#   docker compose -f deploy/docker-compose.yml kill kv0     # 杀掉 group0 的一个副本
+#   docker compose -f deploy/docker-compose.yml start kv0    # 拉回来，观察 apply_lag 追平
+
+x-node-base: &node-base
+  image: raftkv:local
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  restart: unless-stopped
+  networks: [raftkv]
+  volumes:
+    - ./cluster.json:/etc/raftkv/cluster.json:ro
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9100/healthz"]
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 5s
+
+services:
+  # ---------- 控制面：ShardMaster 3 副本 ----------
+  sm0:
+    <<: *node-base
+    container_name: raftkv-sm0
+    command: ["kvnode", "-config", "/etc/raftkv/cluster.json", "-name", "m0", "-http", ":9100"]
+    ports: ["9101:9100"]
+    volumes:
+      - ./cluster.json:/etc/raftkv/cluster.json:ro
+      - sm0-data:/data
+  sm1:
+    <<: *node-base
+    container_name: raftkv-sm1
+    command: ["kvnode", "-config", "/etc/raftkv/cluster.json", "-name", "m1", "-http", ":9100"]
+    ports: ["9102:9100"]
+    volumes:
+      - ./cluster.json:/etc/raftkv/cluster.json:ro
+      - sm1-data:/data
+  sm2:
+    <<: *node-base
+    container_name: raftkv-sm2
+    command: ["kvnode", "-config", "/etc/raftkv/cluster.json", "-name", "m2", "-http", ":9100"]
+    ports: ["9103:9100"]
+    volumes:
+      - ./cluster.json:/etc/raftkv/cluster.json:ro
+      - sm2-data:/data
+
+  # ---------- 数据面：group0 3 副本 ----------
+  kv0:
+    <<: *node-base
+    container_name: raftkv-kv0
+    command: ["kvnode", "-config", "/etc/raftkv/cluster.json", "-name", "g0-0", "-http", ":9100"]
+    ports: ["9111:9100"]
+    volumes:
+      - ./cluster.json:/etc/raftkv/cluster.json:ro
+      - kv0-data:/data
+  kv1:
+    <<: *node-base
+    container_name: raftkv-kv1
+    command: ["kvnode", "-config", "/etc/raftkv/cluster.json", "-name", "g0-1", "-http", ":9100"]
+    ports: ["9112:9100"]
+    volumes:
+      - ./cluster.json:/etc/raftkv/cluster.json:ro
+      - kv1-data:/data
+  kv2:
+    <<: *node-base
+    container_name: raftkv-kv2
+    command: ["kvnode", "-config", "/etc/raftkv/cluster.json", "-name", "g0-2", "-http", ":9100"]
+    ports: ["9113:9100"]
+    volumes:
+      - ./cluster.json:/etc/raftkv/cluster.json:ro
+      - kv2-data:/data
+
+  # ---------- HTTP 网关（纯客户端接入；启动时自动 Join + WaitConfig） ----------
+  gateway:
+    image: raftkv:local
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: raftkv-gateway
+    command: ["gateway", "-connect", "/etc/raftkv/cluster.json", "-addr", ":8080"]
+    restart: unless-stopped
+    networks: [raftkv]
+    volumes:
+      - ./cluster.json:/etc/raftkv/cluster.json:ro
+    ports: ["8080:8080"]
+    # 6 个节点全部 healthy 后再起网关：Init() 里的 Join/WaitConfig 需要 ShardMaster 已可选主
+    depends_on:
+      sm0: { condition: service_healthy }
+      sm1: { condition: service_healthy }
+      sm2: { condition: service_healthy }
+      kv0: { condition: service_healthy }
+      kv1: { condition: service_healthy }
+      kv2: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+
+  # ---------- 可观测栈 ----------
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: raftkv-prometheus
+    restart: unless-stopped
+    networks: [raftkv]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prom-data:/prometheus
+    ports: ["9090:9090"]
+    depends_on:
+      gateway: { condition: service_started }
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: raftkv-grafana
+    restart: unless-stopped
+    networks: [raftkv]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # 直接落到 raft-kv 总览看板，省掉点菜单
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/raftkv-overview.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["3000:3000"]
+    depends_on:
+      prometheus: { condition: service_started }
+
+  # ---------- 持续压测（可选 profile：load） ----------
+  # 给看板打真实流量，否则 QPS/延迟面板是空的。
+  loadgen:
+    image: raftkv:local
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: raftkv-loadgen
+    profiles: ["load"]
+    restart: unless-stopped
+    networks: [raftkv]
+    entrypoint: ["sh", "-c"]
+    command:
+      - 'while true; do kvcli -addr http://gateway:8080 bench loadgen mixed 500 8 || true; sleep 2; done'
+    depends_on:
+      gateway: { condition: service_healthy }
+
+networks:
+  raftkv:
+    driver: bridge
+
+volumes:
+  sm0-data:
+  sm1-data:
+  sm2-data:
+  kv0-data:
+  kv1-data:
+  kv2-data:
+  prom-data:
+  grafana-data:
