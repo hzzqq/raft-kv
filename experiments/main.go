@@ -17,6 +17,7 @@ import (
 
 func main() {
 	scenario := flag.String("scenario", "leader", "leader | partition | perf")
+	assert := flag.Bool("assert", false, "perf 场景：扩展比/错误数不达标则非零退出（CI 性能回归护栏）")
 	flag.Parse()
 	resetClock()
 	switch *scenario {
@@ -25,7 +26,7 @@ func main() {
 	case "partition":
 		runPartition()
 	case "perf":
-		runPerf()
+		runPerf(*assert)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q (leader|partition|perf)\n", *scenario)
 		os.Exit(2)

@@ -39,12 +39,18 @@ const (
 	perfReplicas = 3
 	perfClients  = 12
 	perfWindow   = 3 * time.Second
+
+	// perfAssertMinSpeedup 是 --assert 模式的扩展比门槛：1→5 组吞吐必须达到单组的
+	// 2.0x 以上，否则视为性能回归（例如心跳节流修复被 revert 后，所有配置都会跌回
+	// ~100 ops/sec，扩展比趋近 1.0x）。
+	perfAssertMinSpeedup = 2.0
 )
 
 // runOneConfig 在 nGroups 个 group 上跑一轮并发写读，返回测量结果。
 // 每个客户端独占键前缀，键经 key2shard 摊到 10 个分片上，因此 group 越多、
 // 能并行提交的 Raft 组越多——这正是要测的扩展性。
-func runOneConfig(nGroups int) perfResult {
+// window 控制每轮时长，便于测试用更短窗口加速；生产曲线用 perfWindow。
+func runOneConfig(nGroups int, window time.Duration) perfResult {
 	c := cluster.StartCluster(nGroups, perfReplicas, 3, -1)
 	defer c.Cleanup()
 	bootstrap(c, nGroups)
@@ -61,7 +67,7 @@ func runOneConfig(nGroups int) perfResult {
 		ops, errs int
 		wg        sync.WaitGroup
 	)
-	deadline := time.Now().Add(perfWindow)
+	deadline := time.Now().Add(window)
 	t0 := time.Now()
 	for cid := 0; cid < perfClients; cid++ {
 		wg.Add(1)
@@ -158,7 +164,7 @@ func writeSVG(path string, rs []perfResult) error {
 	return os.WriteFile(path, []byte(s), 0o644)
 }
 
-func runPerf() {
+func runPerf(assert bool) {
 	groupsList := []int{1, 2, 3, 5}
 	resetClock()
 	log("场景 C：分片扩展性对比（每组 %d 副本，%d 并发客户端，每档 %.0fs）",
@@ -167,7 +173,7 @@ func runPerf() {
 	results := make([]perfResult, 0, len(groupsList))
 	for _, g := range groupsList {
 		log("跑 %d 组…", g)
-		r := runOneConfig(g)
+		r := runOneConfig(g, perfWindow)
 		log("  %d 组: %.1f ops/sec (ops=%d, p50=%.1fms, p95=%.1fms, err=%d)",
 			r.Groups, r.OpsPerSec, r.Ops, r.P50ms, r.P95ms, r.Errors)
 		results = append(results, r)
@@ -231,5 +237,25 @@ func runPerf() {
 	default:
 		log("场景 C 结论：分片未带来净增益（%.2fx）——瓶颈不在 Raft 组数。先查单次提交延迟是否被固定周期钉住（当前 p50=%.1fms，心跳间隔 110ms）",
 			speedup, top.P50ms)
+	}
+
+	// --assert 模式：给 CI / 提交门禁当性能回归护栏。任何一档出现错误或半成品
+	// （吞吐≈0）都直接判失败，不只看扩展比。
+	if assert {
+		for _, r := range results {
+			if r.Errors > 0 {
+				log("✗ --assert 失败：%d 组出现 %d 个错误", r.Groups, r.Errors)
+				os.Exit(2)
+			}
+			if r.OpsPerSec < 1 {
+				log("✗ --assert 失败：%d 组吞吐 %.1f ops/sec（疑似集群未就绪/死锁）", r.Groups, r.OpsPerSec)
+				os.Exit(2)
+			}
+		}
+		if speedup < perfAssertMinSpeedup {
+			log("✗ --assert 失败：1→%d 组扩展比 %.2fx < 阈值 %.2fx（吞吐回归？）", top.Groups, speedup, perfAssertMinSpeedup)
+			os.Exit(2)
+		}
+		log("✓ --assert 通过：1→%d 组扩展比 %.2fx >= %.2fx，无错误", top.Groups, speedup, perfAssertMinSpeedup)
 	}
 }
