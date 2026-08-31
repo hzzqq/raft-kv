@@ -55,3 +55,4 @@ raft-kv-gateway.log
 .gocache/
 .gopath/
 .tcp_test_out.log
+.smoke/
