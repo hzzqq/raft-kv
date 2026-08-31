@@ -256,6 +256,9 @@ var (
 	reBrackets  = regexp.MustCompile(`\[[^\[\]]*\]`)
 	reGrouping  = regexp.MustCompile(`\b(by|without|on|ignoring|group_left|group_right)\s*\([^()]*\)`)
 	reIdentNext = regexp.MustCompile(`[a-zA-Z_:][a-zA-Z0-9_:]*`)
+	// 指标名后紧跟的标签匹配器：用于抽取 {label=...} 里被引用的 label。
+	reMetricBrace  = regexp.MustCompile(`([a-zA-Z_:][a-zA-Z0-9_:]*)\{([^{}]*)\}`)
+	reLabelMatcher = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:=|!=|=~|!~)\s*"`)
 )
 
 // promQLKeywords 是不该被当成指标名的保留字/操作符（函数名靠「后随 (」判定，无需枚举）。
@@ -331,6 +334,12 @@ var registrarMethods = map[string]bool{
 // 五条序列（见 metrics.Registry.WritePrometheus），看板引用的是派生名。
 var histogramMethods = map[string]bool{"Histogram": true, "HistWithHelp": true}
 
+// vecMethods 是「带标签向量」的注册方法：首个字符串实参是指标名，其后的字符串实参
+// 即标签名（CounterVecWithHelp 还需跳过 help 文本，故标签从实参[2:] 起；CounterVec
+// 无 help，标签从实参[1:] 起）。
+var vecHelpMethods = map[string]bool{"CounterVecWithHelp": true, "GaugeVecWithHelp": true}
+var vecNoHelpMethods = map[string]bool{"CounterVec": true, "GaugeVec": true}
+
 var histSuffixes = []string{"_count", "_sum", "_p50", "_p95", "_p99"}
 
 // DeclaredMetrics 用 go/ast 扫描给定 Go 源文件，返回代码**真实暴露**的指标名集合。
@@ -389,6 +398,108 @@ func stringLit(e ast.Expr) (string, bool) {
 		return "", false
 	}
 	return s, true
+}
+
+// metricSourceFiles 返回代码侧「真实暴露指标」的源文件集合（kvnode 手写 Prometheus
+// 文本 + gateway 的 Registry 注册 + 其余非测试 Go 源）。供 DeclaredMetrics 与
+// DeclaredMetricLabels 共用，避免两处各自硬编码文件清单而漂移。
+func metricSourceFiles() []string {
+	files := []string{"../kvnode/metrics.go", "../gateway/gateway.go"}
+	for _, dir := range []string{"../shardkv", "../shardmaster", "../raft"} {
+		matches, _ := filepath.Glob(filepath.Join(dir, "*.go"))
+		for _, m := range matches {
+			if !strings.HasSuffix(m, "_test.go") {
+				files = append(files, m)
+			}
+		}
+	}
+	return files
+}
+
+// LabelSelectorsFromPromQL 抽出每条查询里「指标名 {label=...}」形式的标签选择器，
+// 返回 metric -> 被引用的 label 列表。用于校验看板/告警引用的 label 是否真实存在：
+// 引用一个代码没暴露的 label（如 raftkv_raft_is_leader{role="leader"} 的 role），
+// 查询会恒空、面板静默空白——这正是「看板幻觉」的运行时版，而 DeclaredMetrics 只查
+// 指标名存在、查不到这种维度错误。
+func LabelSelectorsFromPromQL(expr string) map[string][]string {
+	s := reString.ReplaceAllString(expr, `""`)
+	out := map[string][]string{}
+	for _, m := range reMetricBrace.FindAllStringSubmatch(s, -1) {
+		metric, inner := m[1], m[2]
+		if promQLKeywords[strings.ToLower(metric)] {
+			continue
+		}
+		var labs []string
+		for _, lm := range reLabelMatcher.FindAllStringSubmatch(inner, -1) {
+			labs = append(labs, lm[1])
+		}
+		if len(labs) > 0 {
+			out[metric] = append(out[metric], labs...)
+		}
+	}
+	return out
+}
+
+// DeclaredMetricLabels 返回代码真实暴露的指标名 -> 该指标运行时携带的标签集合。
+// 两个来源：
+//   - kvnode 手写 Prometheus 文本（raftkv_*）：所有指标经 nodeLabels 统一带
+//     {node,kind,group,replica}；
+//   - gateway 的 Registry Vec 注册：标签名是注册调用的实参。
+//
+// Prometheus 内建指标（up / scrape_duration_seconds）自动带 job/instance，不在此枚举，
+// 调用方应跳过其 label 校验。
+func DeclaredMetricLabels(files ...string) (map[string]map[string]bool, error) {
+	labels := map[string]map[string]bool{
+		"up":                      {}, // prometheus 内建，自动带 job/instance
+		"scrape_duration_seconds": {},
+	}
+	fset := token.NewFileSet()
+	for _, f := range files {
+		file, err := parser.ParseFile(fset, f, nil, parser.SkipObjectResolution)
+		if err != nil {
+			return nil, fmt.Errorf("解析 %s: %w", f, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.CallExpr:
+				sel, ok := node.Fun.(*ast.SelectorExpr)
+				if !ok || len(node.Args) == 0 {
+					return true
+				}
+				name, ok := stringLit(node.Args[0])
+				if !ok {
+					return true
+				}
+				switch {
+				case vecHelpMethods[sel.Sel.Name]:
+					labels[name] = labelSetFromArgs(node.Args[2:])
+				case vecNoHelpMethods[sel.Sel.Name]:
+					labels[name] = labelSetFromArgs(node.Args[1:])
+				default:
+					if histogramMethods[sel.Sel.Name] || registrarMethods[sel.Sel.Name] {
+						labels[name] = map[string]bool{} // 非向量指标无标签
+					}
+				}
+			case *ast.BasicLit:
+				if s, ok := stringLit(node); ok && strings.HasPrefix(s, "raftkv_") {
+					labels[s] = map[string]bool{"node": true, "kind": true, "group": true, "replica": true}
+				}
+			}
+			return true
+		})
+	}
+	return labels, nil
+}
+
+// labelSetFromArgs 把一批字符串实参（标签名）收成集合。
+func labelSetFromArgs(args []ast.Expr) map[string]bool {
+	m := map[string]bool{}
+	for _, a := range args {
+		if s, ok := stringLit(a); ok && s != "" {
+			m[s] = true
+		}
+	}
+	return m
 }
 
 // ---------------------------------------------------------------- 工具

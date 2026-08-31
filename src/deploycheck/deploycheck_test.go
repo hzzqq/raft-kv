@@ -288,19 +288,7 @@ func TestComposeMountedFilesExist(t *testing.T) {
 // declaredMetrics 汇总代码真实暴露的全部指标名。
 func declaredMetrics(t *testing.T) map[string]bool {
 	t.Helper()
-	files := []string{"../kvnode/metrics.go", "../gateway/gateway.go"}
-	for _, dir := range []string{"../shardkv", "../shardmaster", "../raft"} {
-		matches, err := filepath.Glob(filepath.Join(dir, "*.go"))
-		if err != nil {
-			t.Fatalf("glob %s: %v", dir, err)
-		}
-		for _, m := range matches {
-			if !strings.HasSuffix(m, "_test.go") {
-				files = append(files, m)
-			}
-		}
-	}
-	set, err := DeclaredMetrics(files...)
+	set, err := DeclaredMetrics(metricSourceFiles()...)
 	if err != nil {
 		t.Fatalf("解析代码指标名: %v", err)
 	}
@@ -411,6 +399,84 @@ func TestPrometheusRuleFileMountMatches(t *testing.T) {
 		if !strings.Contains(string(compose), ":"+target+":ro") {
 			t.Errorf("rule_files 指向 %s，但 compose 未把任何文件挂到该路径", target)
 		}
+	}
+}
+
+// isPromBuiltin 是 Prometheus 内建指标，自动带 job/instance 等标签，不查其 label 维度。
+func isPromBuiltin(metric string) bool {
+	return metric == "up" || metric == "scrape_duration_seconds"
+}
+
+// TestDashboardLabelSelectorsExist：看板查询里 {label=...} 引用的标签必须真实存在。
+// 这是 TestDashboardMetricsAreRealMetrics 的维度升级——指标名存在还不够，引用的 label
+// 不存在同样会让面板恒空（看板幻觉运行时版）。例如 raftkv_raft_is_leader{role="leader"}
+// 的 role 标签根本没暴露，查询永远返回空，而「一片绿」会被误读成系统健康。
+func TestDashboardLabelSelectorsExist(t *testing.T) {
+	labels, err := DeclaredMetricLabels(metricSourceFiles()...)
+	if err != nil {
+		t.Fatalf("解析代码指标标签: %v", err)
+	}
+	_, panels, err := ParseDashboard(p("grafana/dashboards/raftkv-overview.json"))
+	if err != nil {
+		t.Fatalf("解析看板: %v", err)
+	}
+	bad := 0
+	for _, pan := range panels {
+		for _, expr := range pan.Exprs {
+			for metric, labs := range LabelSelectorsFromPromQL(expr) {
+				if isPromBuiltin(metric) {
+					continue
+				}
+				got, ok := labels[metric]
+				if !ok {
+					continue // 指标名不存在由 TestDashboardMetricsAreRealMetrics 报告
+				}
+				for _, l := range labs {
+					if !got[l] {
+						t.Errorf("面板 %q 查询 %s 引用指标 %s 不存在的标签 %q（查询会恒空/看板幻觉）",
+							pan.Title, expr, metric, l)
+						bad++
+					}
+				}
+			}
+		}
+	}
+	if bad == 0 {
+		t.Logf("看板 label 选择器全部真实存在（共 %d 面板）", len(panels))
+	}
+}
+
+// TestAlertLabelSelectorsExist：告警规则同理，引用的 label 必须真实存在。
+func TestAlertLabelSelectorsExist(t *testing.T) {
+	labels, err := DeclaredMetricLabels(metricSourceFiles()...)
+	if err != nil {
+		t.Fatalf("解析代码指标标签: %v", err)
+	}
+	exprs, err := ParseAlertExprs(p("alerts.yml"))
+	if err != nil {
+		t.Fatalf("解析 alerts.yml: %v", err)
+	}
+	bad := 0
+	for _, alert := range SortedKeys(exprs) {
+		for metric, labs := range LabelSelectorsFromPromQL(exprs[alert]) {
+			if isPromBuiltin(metric) {
+				continue
+			}
+			got, ok := labels[metric]
+			if !ok {
+				continue
+			}
+			for _, l := range labs {
+				if !got[l] {
+					t.Errorf("告警 %s 查询 %s 引用指标 %s 不存在的标签 %q（查询会恒空/告警永不触发）",
+						alert, exprs[alert], metric, l)
+					bad++
+				}
+			}
+		}
+	}
+	if bad == 0 {
+		t.Logf("告警 label 选择器全部真实存在（共 %d 条规则）", len(exprs))
 	}
 }
 
