@@ -65,8 +65,18 @@ func main() {
 //
 //	GET /healthz  存活探针（进程在即 200，便于 k8s/负载均衡探活）
 //	GET /status   本节点健康快照 JSON（Raft 状态 + 分片持有/迁移 + diagnostics 判定）
+//	GET /metrics  同一份快照的 Prometheus 文本格式（I152，供 Prometheus 逐节点 scrape）
 func diagHandler(node *cluster.TCPNode) http.Handler {
 	mux := http.NewServeMux()
+	// Prometheus 指标：跨进程部署下 gateway 读不到远端节点的共识状态，
+	// 「leader 切换次数 / 当前 leader / apply 落后」只能由节点自曝。详见 metrics.go。
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		d := node.Diagnostics()
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		if err := writeNodeMetrics(w, d); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)

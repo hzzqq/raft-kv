@@ -153,7 +153,9 @@ func (c *Client) BenchWithTimeout(ops, workers int, op string, valueSize int, ti
 						_, err = c.getCtx(ctx, key)
 					}
 				}
-				local = append(local, float64(time.Since(t0).Microseconds())/1000.0)
+				// 用纳秒换算成毫秒：Microseconds() 会把亚微秒截断，
+				// 而内存网络 + 立即复制（kickCh）下单次操作可低至数十微秒。
+				local = append(local, float64(time.Since(t0).Nanoseconds())/1e6)
 				if err != nil {
 					atomic.AddInt64(&errCount, 1)
 				}

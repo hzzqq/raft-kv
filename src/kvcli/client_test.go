@@ -78,8 +78,15 @@ func TestClientBench(t *testing.T) {
 	if res.OpsPerSec <= 0 {
 		t.Fatalf("Bench OpsPerSec = %.1f, want > 0", res.OpsPerSec)
 	}
-	if res.LatP50 <= 0 || res.LatP95 <= 0 || res.LatP99 <= 0 {
-		t.Fatalf("Bench latencies not all positive: p50=%.2f p95=%.2f p99=%.2f",
+	// 不能断言分位数严格 > 0：内存网络 + 立即复制下单次操作可能低于宿主机
+	// 单调时钟粒度（Windows 约 1ms），0 是合法观测值。真正有意义的性质是
+	// 「非负」且「分位数单调不减」。
+	if res.LatP50 < 0 || res.LatP95 < 0 || res.LatP99 < 0 {
+		t.Fatalf("Bench latencies negative: p50=%.3f p95=%.3f p99=%.3f",
+			res.LatP50, res.LatP95, res.LatP99)
+	}
+	if res.LatP50 > res.LatP95 || res.LatP95 > res.LatP99 {
+		t.Fatalf("Bench latency percentiles not monotonic: p50=%.3f p95=%.3f p99=%.3f",
 			res.LatP50, res.LatP95, res.LatP99)
 	}
 }

@@ -545,7 +545,10 @@ func TestSKVReMigration(t *testing.T) {
 	cfg.waitGroupConfig(1, 0, 2)
 
 	shard := key2shard("drift")
-	const rounds = 40
+	const (
+		rounds  = 40 // 客户端写读轮数下限（线性一致断言的样本量）
+		wantNum = 40 // 配置推进目标：低于此视为迁移冻结
+	)
 
 	// 后台快速来回迁移该分片。间隔 90ms：快于 2-group 单跳迁移完成时间，足以暴露
 	// 重新迁移下的 pendingIn 残留/数据丢失；又不至于快于 RPC 往返（30ms 原值属物理
@@ -564,19 +567,34 @@ func TestSKVReMigration(t *testing.T) {
 	}()
 
 	// 单个客户端对该分片内的 key 持续写入并读回，断言线性一致。
+	//
+	// 循环的退出条件同时看「轮数达标」与「两组配置都推进到 wantNum」：配置推进量由
+	// 后台 churn 的墙钟时间决定（90ms 一次 Move），不能隐式依赖客户端有多慢。
+	// I150 给 Raft 加了「新日志立即复制」后写延迟从 ~123ms 降到 ~10ms，40 轮 0.3s
+	// 就跑完，churn 只来得及发 3 次 Move —— 配置到不了 40 是测试的时间耦合，
+	// 不是迁移冻结。30s 硬上界兜底：真冻结时交由后面的断言报出「冻结在第 N 号」。
 	key := "drift-key"
-	for seq := 0; seq < rounds; seq++ {
+	deadline := time.Now().Add(30 * time.Second)
+	lastVal := ""
+	for seq := 0; ; seq++ {
 		val := fmt.Sprintf("drift-%d", seq)
 		ck.Put(key, val)
 		if got := ck.Get(key); got != val {
 			close(done)
 			t.Fatalf("re-migration: after Put(%q)=%q, Get=%q want %q", key, val, got, val)
 		}
+		lastVal = val
+		if seq+1 >= rounds &&
+			cfg.groupConfigNum(0, 0) >= wantNum && cfg.groupConfigNum(1, 0) >= wantNum {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
 	}
 	close(done)
 
 	// 硬断言：两组配置都必须推进到最新（约 2+rounds 个版本），否则视为冻结。
-	const wantNum = 40
 	cfg.waitGroupConfig(0, 0, wantNum)
 	cfg.waitGroupConfig(1, 0, wantNum)
 	if n := cfg.groupConfigNum(0, 0); n < wantNum {
@@ -585,9 +603,9 @@ func TestSKVReMigration(t *testing.T) {
 	if n := cfg.groupConfigNum(1, 0); n < wantNum {
 		t.Fatalf("group1 config froze at %d (want >=%d): %s", n, wantNum, cfg.groups[1][0].DebugState())
 	}
-	// 最终值仍可读且正确
-	if v := ck.Get(key); v != fmt.Sprintf("drift-%d", rounds-1) {
-		t.Fatalf("after re-migration Get(%q)=%q want %q", key, v, fmt.Sprintf("drift-%d", rounds-1))
+	// 最终值仍可读且正确（取实际写出的最后一个值：轮数可能因等配置推进而超过 rounds）
+	if v := ck.Get(key); v != lastVal {
+		t.Fatalf("after re-migration Get(%q)=%q want %q", key, v, lastVal)
 	}
 }
 

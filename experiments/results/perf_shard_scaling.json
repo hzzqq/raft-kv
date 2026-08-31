@@ -1,0 +1,51 @@
+{
+  "generated_at": "2026-08-30T21:50:14+08:00",
+  "results": [
+    {
+      "groups": 1,
+      "replicas": 3,
+      "clients": 12,
+      "seconds": 3.0123985,
+      "ops": 2805,
+      "ops_per_sec": 931.1517051943824,
+      "p50_ms": 12.52,
+      "p95_ms": 25.999,
+      "errors": 0
+    },
+    {
+      "groups": 2,
+      "replicas": 3,
+      "clients": 12,
+      "seconds": 3.0093698,
+      "ops": 4592,
+      "ops_per_sec": 1525.9008713385772,
+      "p50_ms": 6.999,
+      "p95_ms": 18.24,
+      "errors": 0
+    },
+    {
+      "groups": 3,
+      "replicas": 3,
+      "clients": 12,
+      "seconds": 3.0031064,
+      "ops": 5911,
+      "ops_per_sec": 1968.2952292333032,
+      "p50_ms": 4.002,
+      "p95_ms": 17.001,
+      "errors": 0
+    },
+    {
+      "groups": 5,
+      "replicas": 3,
+      "clients": 12,
+      "seconds": 3.0066606,
+      "ops": 8068,
+      "ops_per_sec": 2683.375702598424,
+      "p50_ms": 3.999,
+      "p95_ms": 10.999,
+      "errors": 0
+    }
+  ],
+  "transport": "in-memory labrpc (no real network/disk)",
+  "window_sec": 3
+}

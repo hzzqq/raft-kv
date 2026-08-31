@@ -1,0 +1,13 @@
+[t=+0.00s] 场景 B：网络分区脑裂（1 组 × 5 副本，2+3 分裂）
+[t=+1.00s] 分区前 leader = g0-0 | term=2 commit=8
+[t=+1.00s] 网络分裂生效：少数派 [0 1]（含旧 leader）| 多数派 [2 3 4]
+[t=+1.33s] ✓ 多数派选出新 leader = g0-4 | term=3（旧 term=2）
+[t=+2.34s] ✓ 多数派读写正常（during-partition=ok），客户端未感知故障
+[t=+2.34s] 少数派旧 leader 自述: role=Leader term=2 commit=8 leaderLease=false
+[t=+5.34s] ✓ 客户端直连少数派 leader 写入被拒: err=ErrTimeout（耗时 3.0s），未拿到任何成功确认
+[t=+5.34s] ✓ 少数派提交进度冻结在 commit=8，同期多数派已推进到 commit=10
+[t=+5.34s] 网络愈合，等待少数派降级追平…
+[t=+5.53s] ✓ 旧 leader 已降级为 Follower、任期对齐到 term=3、applied=10（追平多数派）
+[t=+5.53s] ✓ 少数派未提交的 ghost-write 已被新 leader 日志覆盖，最终状态里不存在
+[t=+5.53s] ✓ 所有已确认写入全部存活（分区前 + 分区中），零丢失
+[t=+5.53s] 场景 B 结论：quorum 而非连通性决定可写性 —— 少数派活着也写不进，故不会脑裂双写

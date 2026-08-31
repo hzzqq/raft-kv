@@ -150,6 +150,14 @@ type Raft struct {
 
 	applyCond *sync.Cond
 	killCh    chan struct{}
+	// kickCh 让 Start() 立刻唤醒一次复制，而不必等下一次心跳 tick（缓冲 1，天然合批：
+	// 高并发写只会触发一次广播，多条新日志随同一批 AppendEntries 出去）。
+	// 不加这个唤醒时，单次写入延迟被钉在心跳间隔（实测 p50≈123ms），吞吐等于
+	// 并发数 ÷ 心跳间隔，与分片数无关——这是 experiments 场景 C 量出来的真实瓶颈。
+	kickCh chan struct{}
+	// leaderElections 是本副本赢得选举的累计次数（mu 保护），经 Status() 外传，
+	// 供跨进程部署的 Prometheus 按 group/replica 观测 leader 切换（I152）。
+	leaderElections int
 
 	// ---- 持久化状态（论文 Figure 2 的 persistent state）----
 	currentTerm int
@@ -341,6 +349,11 @@ type RaftStatus struct {
 	LastApplied          int    // 已应用索引
 	CommittedCurrentTerm bool   // leader 是否已在当前任期提交过条目（线性一致读守卫）
 	HasLeaderLease       bool   // leader 是否在 ElectionTimeoutMin 内与多数派保持接触
+	// LeaderElections 是本副本自进程启动以来赢得选举（becomeLeader）的累计次数。
+	// 单调不减，可直接被 Prometheus 当累计量 scrape：全组求和的增量即该 group 的
+	// leader 切换次数（每次切换必有且仅有一个副本赢得选举）。跨进程部署时 gateway
+	// 读不到远端节点内存，故必须随状态快照一起外传（I152）。
+	LeaderElections int
 }
 
 // Status 返回当前节点的只读状态快照。仅在持锁下采集既有字段，不修改任何状态、
@@ -359,6 +372,7 @@ func (rf *Raft) Status() RaftStatus {
 		LastApplied:          rf.lastApplied,
 		CommittedCurrentTerm: rf.committedCurrentTerm,
 		HasLeaderLease:       rf.hasLeaderLeaseLocked(),
+		LeaderElections:      rf.leaderElections,
 	}
 	if rf.role == Leader {
 		st.LeaderID = rf.me
@@ -414,7 +428,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// 与 raft_log_applied(已应用) 区分，便于观察写入吞吐与复制滞后。
 	Metrics.CounterWithHelp("raft_log_appends_total", "累计 leader 追加的日志条目数").Inc()
 	rf.persist()
-	// 复制由心跳计时器（~110ms）触发，避免持锁发 RPC 造成死锁。
+	// 立刻唤醒一次复制（非阻塞，缓冲 1 自动合批）。广播本身放到 ticker 里做，
+	// 避免在持有 rf.mu 时发 RPC 造成死锁；心跳计时器仍是兜底路径。
+	select {
+	case rf.kickCh <- struct{}{}:
+	default:
+	}
 	return idx, rf.currentTerm, true
 }
 
@@ -634,6 +653,10 @@ func (rf *Raft) becomeLeader() {
 	rf.committedCurrentTerm = false
 	rf.preVoteWon = false
 	rf.lastContact[rf.me] = time.Now()
+	// 本副本视角的累计选举胜出次数：随 Status() 外传，使跨进程部署下
+	// Prometheus 也能观测 leader 切换（包级 Metrics 是进程内全局的，
+	// 混合了同进程所有 Raft 实例，无法按 group/replica 切片）。
+	rf.leaderElections++
 	Metrics.Counter("leader_changes").Inc()
 	// 任期开始时追加一条 no-op（空命令）。按 Raft 提交规则，leader 只能
 	// 通过提交"当前任期"的条目来间接提交旧任期的日志；no-op 作为当前任期的
@@ -1057,6 +1080,18 @@ func (rf *Raft) ticker() {
 				rf.mu.Unlock()
 			}
 			rf.resetHeartbeatTimer()
+		case <-rf.kickCh:
+			// 新日志到达：立刻复制一轮，不等心跳 tick。顺带重置心跳计时器
+			// （刚广播过就不必紧跟一次空心跳，省一轮无谓 RPC）。
+			rf.mu.Lock()
+			if rf.role == Leader {
+				rf.lastContact[rf.me] = time.Now()
+				rf.mu.Unlock()
+				rf.broadcastAppendEntries()
+				rf.resetHeartbeatTimer()
+			} else {
+				rf.mu.Unlock()
+			}
 		}
 	}
 }
@@ -1119,6 +1154,7 @@ func Make(peers []*ClientEnd, me int, persister Persister, applyCh chan ApplyMsg
 		electionTimer:     time.NewTimer(ElectionTimeoutMax),
 		heartbeatTimer:    time.NewTimer(HeartbeatInterval),
 		killCh:            make(chan struct{}),
+		kickCh:            make(chan struct{}, 1),
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
 
