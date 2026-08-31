@@ -55,7 +55,7 @@ func TestPrometheusHelp(t *testing.T) {
 }
 
 func TestHistogramPercentiles(t *testing.T) {
-	h := NewHistogram(100)
+	h := NewHistogram() // 默认容量 8192，1000 样本全部落在 60s 窗口内
 	for i := 1; i <= 1000; i++ {
 		h.Record(float64(i))
 	}
@@ -71,15 +71,41 @@ func TestHistogramPercentiles(t *testing.T) {
 	}
 }
 
-func TestHistogramRingOverwrite(t *testing.T) {
-	h := NewHistogram(8)
-	for i := 1; i <= 100; i++ {
-		h.Record(float64(i))
+// TestHistogramTimeWindowEviction 验证时间滑窗：窗口外的样本被排除，
+// 分位数只反映最近 window 内的观测——这是相对「按观测次数滑窗」的关键修正，
+// 保证故障期流量骤降时 p99 不会因残留历史样本而虚低。
+func TestHistogramTimeWindowEviction(t *testing.T) {
+	h := NewTimeWindowHistogram(50*time.Millisecond, 100)
+	now := time.Now()
+	h.recordAt(1, now.Add(-100*time.Millisecond)) // 超出 50ms 窗口，应被淘汰
+	h.recordAt(2, now.Add(-40*time.Millisecond))  // 窗口内
+	h.recordAt(9, now)                            // 窗口内（最新）
+	s := h.Snapshot()
+	if s.Count != 2 {
+		t.Fatalf("want 2 in-window samples, got %d", s.Count)
+	}
+	if s.Min != 2 || s.Max != 9 {
+		t.Fatalf("windowed min/max want 2/9, got %v/%v", s.Min, s.Max)
+	}
+	if s.P99 != 9 {
+		t.Fatalf("p99 want 9 (newest in-window), got %v", s.P99)
+	}
+}
+
+// TestHistogramCapBound 验证容量上限（内存安全）：窗口内但样本数超过 cap 时，
+// 保留最近 cap 个（丢弃最旧），避免无限增长。
+func TestHistogramCapBound(t *testing.T) {
+	h := NewTimeWindowHistogram(time.Hour, 8) // 大窗口，确保只按容量淘汰
+	now := time.Now()
+	for i := 0; i < 100; i++ {
+		h.recordAt(float64(i), now) // 同一时刻，全在窗口内
 	}
 	s := h.Snapshot()
-	// 容量 8：只保留最近 8 个样本（93..100），p50 应 >= 93。
-	if s.P50 < 93 {
-		t.Fatalf("ring overwrite wrong: p50=%v (want >=93)", s.P50)
+	if s.Count != 8 {
+		t.Fatalf("cap bound want 8 samples, got %d", s.Count)
+	}
+	if s.Min != 92 || s.Max != 99 {
+		t.Fatalf("cap-bound min/max want 92/99, got %v/%v", s.Min, s.Max)
 	}
 }
 

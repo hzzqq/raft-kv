@@ -184,7 +184,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "请求延迟分位（p50 / p95 / p99）",
-      "description": "注意：分位来自 4096 样本环形缓冲（按次数滑窗，非时间滑窗），因此低流量时会残留历史样本影响。",
+      "description": "注意：分位来自最近 60s 时间滑窗内样本（窗口外已淘汰），故故障期流量骤降时不会因残留历史样本而虚低；内存上限 8192 样本，极端高 QPS 时窗口内超量会丢最旧。",
       "datasource": { "type": "prometheus", "uid": "raftkv-prom" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
       "fieldConfig": {

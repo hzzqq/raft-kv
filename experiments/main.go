@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 )
 
 func main() {
@@ -20,6 +21,9 @@ func main() {
 	assert := flag.Bool("assert", false, "perf 场景：扩展比/错误数不达标则非零退出（CI 性能回归护栏）")
 	flag.Parse()
 	resetClock()
+	// 生成时刻标记：被重定向进 results/scene_*.log，供控制台解析「生成于 <时间>」，
+	// 与场景 C 的 perf JSON generated_at 语义对齐（R9b）。
+	fmt.Printf("generated_at=%s\n", time.Now().Format(time.RFC3339))
 	switch *scenario {
 	case "leader":
 		runLeader()

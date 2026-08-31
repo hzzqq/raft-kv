@@ -601,7 +601,6 @@ func (c *capturingRecorder) Write(b []byte) (int, error) {
 	return c.buf.Write(b)
 }
 
-
 // SetCache 开启响应缓存：ttl 为成功响应缓存时长，maxKeys 为最大缓存条目（FIFO 淘汰）。
 // 负缓存（5xx）时长固定为 min(ttl/10, 2s)，仅用于缓解后端抖动期的惊群。生产可用。
 func (s *Server) SetCache(ttl time.Duration, maxKeys int) {
@@ -1068,11 +1067,12 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		s.recordRequestMetrics(r.Method, st, float64(time.Since(start).Microseconds())/1000.0)
 		// #205：响应体大小直方图（线上字节，gzip 开启时为压缩后字节），与延迟直方图
 		// 并列，供 /metrics 观测带宽与大响应分布。纯观测，零行为影响。
-		// 直方图语义诚实化（R7）：p50/p95/p99 来自最近 4096 次观测的样本环形缓冲，
-		// 按观测次数滑窗、非时间滑窗。低流量/故障窗口会残留历史样本，故故障期分位
-		// 可能「反而偏低」被误读成延迟改善——这是观测口径限制，不是真实延迟下降。
+		// 直方图语义诚实化（R7）：p50/p95/p99 来自最近 60s 时间滑窗内的样本（非累计、
+		// 非按观测次数滑窗）。窗口外样本已被淘汰，故故障期流量骤降时不会因残留历史
+		// 样本把分位算「虚低」而被误读成延迟改善。内存上限 8192 样本（极端高 QPS 时
+		// 窗口内超量则丢最旧）——已在 /metrics HELP 与 Grafana 面板注明。
 		Metrics.HistWithHelp("gateway_response_bytes",
-			"网关响应体大小直方图（字节；gzip 开启时为压缩后字节）。分位来自最近 4096 次观测的样本环形缓冲（按观测次数滑窗，非时间滑窗），低流量时残留历史样本。").Record(float64(mw.respBytes))
+			"网关响应体大小直方图（字节；gzip 开启时为压缩后字节）。分位(p50/p95/p99)来自最近 60s 时间滑窗内样本（窗口外已淘汰，故故障期流量骤降不会虚低）；内存上限 8192 样本（极端高 QPS 时丢最旧）。").Record(float64(mw.respBytes))
 		// I61：后端健康熔断观测。按最终状态码更新熔断状态（5xx 累计，非 5xx 重置/恢复）。
 		s.observeBackend(st)
 	}
@@ -1108,10 +1108,10 @@ func (s *Server) recordAccess(method, path string, status int, d time.Duration, 
 func (s *Server) recordRequestMetrics(method string, status int, latencyMs float64) {
 	Metrics.CounterVec("http_requests_total", "method").WithLabelValues(method).Inc()
 	Metrics.CounterVec("http_responses_total", "code", "method").WithLabelValues(strconv.Itoa(status), method).Inc()
-	// 直方图语义诚实化（R7）：见 gateway_response_bytes 注释——分位按样本次数滑窗，
-	// 非时间滑窗；故障期流量骤降时 p99 可能反而「好看」，切勿据此判定延迟改善。
+	// 直方图语义诚实化（R7）：见 gateway_response_bytes 注释——分位按时间滑窗（最近 60s），
+	// 非按观测次数滑窗；故障期 p99 不再因残留历史样本而「虚低」，可直接参考（但仍为单进程观测）。
 	Metrics.HistWithHelp("http_request_latency_ms",
-		"网关请求延迟直方图（毫秒）。分位(p50/p95/p99)来自最近 4096 次观测的样本环形缓冲（按观测次数滑窗，非时间滑窗）：低流量/故障窗口会残留历史样本，故故障期 p99 可能反而偏低，不能直接解读为延迟改善。").Record(latencyMs)
+		"网关请求延迟直方图（毫秒）。分位(p50/p95/p99)来自最近 60s 时间滑窗内样本（窗口外已淘汰，故故障期流量骤降不会虚低，可参考）；内存上限 8192 样本（极端高 QPS 时丢最旧）。").Record(latencyMs)
 }
 
 // handleDebugAccessLog 返回进程内访问日志的最近 N 条（默认 50，可用 ?limit= 覆盖），
@@ -1271,6 +1271,7 @@ func (s *Server) handleDebugRoutes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
+
 // SetHTTPServer 替换底层 *http.Server，便于测试注入自定义监听器与超时。
 func (s *Server) SetHTTPServer(srv *http.Server) {
 	s.mu.Lock()
@@ -1582,10 +1583,10 @@ func (s *Server) handleDebugShards(w http.ResponseWriter, r *http.Request) {
 		for r := range s.c.KVs[g] {
 			sd := s.c.KVs[g][r].ShardDebug()
 			out = append(out, ShardDebugView{
-				Group:        g,
-				Replica:      r,
-				Diagnosis:    diagnostics.ShardCheck(sd),
-				ShardDebug:   sd,
+				Group:      g,
+				Replica:    r,
+				Diagnosis:  diagnostics.ShardCheck(sd),
+				ShardDebug: sd,
 			})
 		}
 	}
@@ -1600,9 +1601,9 @@ func (s *Server) handleDebugShards(w http.ResponseWriter, r *http.Request) {
 // Diagnosis.Issues 仅含 "ok" 时表示不变量全部满足；否则列出具体问题（commit 越界/apply
 // 越界/leader 无租约提示），Score 钳制在 0–100 供监控阈值告警。
 type RaftStatusView struct {
-	Group     int             `json:"group"`
-	Replica   int             `json:"replica"`
-	Raft      raft.RaftStatus `json:"raft"`
+	Group     int                   `json:"group"`
+	Replica   int                   `json:"replica"`
+	Raft      raft.RaftStatus       `json:"raft"`
 	Diagnosis diagnostics.Diagnosis `json:"diagnosis"`
 }
 

@@ -57,49 +57,72 @@ func (g *Gauge) Value() float64 {
 	return math.Float64frombits(uint64(atomic.LoadInt64(&g.v)))
 }
 
-// Histogram 记录 float64 样本（如延迟毫秒数），使用固定容量环形缓冲，
-// 无论样本量多大都保持内存有界、分位数查询廉价。
+// Histogram 记录 float64 样本（如延迟毫秒数），按时间滑窗维护分位数，
+// 同时用固定容量上限保证内存有界。分位数（p50/p95/p99）只统计滑窗内的样本，
+// 因此故障期流量骤降时不会因残留历史样本而把 p99 算「虚低」——这是相对
+// 「按观测次数滑窗的样本环形缓冲」的关键修正（后者会把很久以前的样本一直算进来）。
+//
+// 滑窗语义：Snapshot 仅对 [now-window, now] 内的样本取分位；Record 时懒淘汰窗口外
+// 样本；若窗口内样本数超过 cap（极端高 QPS），再丢弃最旧者（内存安全上界）。
 type Histogram struct {
 	mu      sync.Mutex
 	cap     int
-	pos     int
-	samples []float64
-	count   int64
-	sum     float64
-	min     float64
-	max     float64
+	window  time.Duration
+	samples []histSample
 }
 
-const defaultHistCap = 4096
+// histSample 是带采集时间戳的单条样本，用于时间滑窗淘汰。
+type histSample struct {
+	v  float64
+	ts time.Time
+}
 
-// NewHistogram 创建一个直方图；capacity 省略或 <=0 时使用默认容量 4096。
+const defaultHistCap = 8192
+
+// defaultHistWindow 是默认时间滑窗宽度；分位数只反映最近该时长内的观测。
+const defaultHistWindow = 60 * time.Second
+
+// NewHistogram 创建一个直方图；capacity 省略或 <=0 时使用默认容量 8192，
+// 时间滑窗使用默认 60s。
 func NewHistogram(capacity ...int) *Histogram {
+	return NewTimeWindowHistogram(defaultHistWindow, capacity...)
+}
+
+// NewTimeWindowHistogram 创建指定时间滑窗与容量上限的直方图。
+// window<=0 时回退到 defaultHistWindow；capacity<=0 时回退到 defaultHistCap。
+func NewTimeWindowHistogram(window time.Duration, capacity ...int) *Histogram {
 	cap := defaultHistCap
 	if len(capacity) > 0 && capacity[0] > 0 {
 		cap = capacity[0]
 	}
-	return &Histogram{cap: cap, samples: make([]float64, 0, cap), min: math.Inf(1), max: math.Inf(-1)}
+	if window <= 0 {
+		window = defaultHistWindow
+	}
+	return &Histogram{cap: cap, window: window}
 }
 
-// Record 记录一个样本。
+// Record 记录一个样本（以当前时间作为采集时刻）。
 func (h *Histogram) Record(v float64) {
+	h.recordAt(v, time.Now())
+}
+
+// recordAt 以指定采集时刻记录样本（供测试注入确定性时间戳）。
+func (h *Histogram) recordAt(v float64, ts time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.count++
-	h.sum += v
-	if v < h.min {
-		h.min = v
+	h.samples = append(h.samples, histSample{v: v, ts: ts})
+	// 懒淘汰：先丢窗口外（过期）样本，再按容量上限丢最旧（窗口内超量）。
+	cutoff := ts.Add(-h.window)
+	i := 0
+	for i < len(h.samples) && h.samples[i].ts.Before(cutoff) {
+		i++
 	}
-	if v > h.max {
-		h.max = v
+	if i > 0 {
+		h.samples = h.samples[i:]
 	}
-	if len(h.samples) < h.cap {
-		h.samples = append(h.samples, v)
-		return
+	if len(h.samples) > h.cap {
+		h.samples = h.samples[len(h.samples)-h.cap:]
 	}
-	// 缓冲满后按环形覆盖，避免无限增长。
-	h.samples[h.pos%h.cap] = v
-	h.pos++
 }
 
 // HistSnapshot 是直方图的 JSON 友好快照。
@@ -114,26 +137,43 @@ type HistSnapshot struct {
 	P99   float64 `json:"p99"`
 }
 
-// Snapshot 返回当前分位数统计。
+// Snapshot 返回当前时间滑窗内的分位数统计（只统计 [now-window, now] 的样本）。
 func (h *Histogram) Snapshot() HistSnapshot {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	n := len(h.samples)
+	now := time.Now()
+	cutoff := now.Add(-h.window)
+	var vals []float64
+	var sum, mn, mx float64
+	first := true
+	for _, s := range h.samples {
+		if s.ts.Before(cutoff) {
+			continue
+		}
+		vals = append(vals, s.v)
+		sum += s.v
+		if first || s.v < mn {
+			mn = s.v
+		}
+		if first || s.v > mx {
+			mx = s.v
+		}
+		first = false
+	}
+	n := int64(len(vals))
 	if n == 0 {
 		return HistSnapshot{}
 	}
-	sorted := append([]float64(nil), h.samples...)
-	sort.Float64s(sorted)
-	mean := h.sum / float64(n)
+	sort.Float64s(vals)
 	return HistSnapshot{
-		Count: h.count,
-		Sum:   h.sum,
-		Mean:  mean,
-		Min:   h.min,
-		Max:   h.max,
-		P50:   percentile(sorted, 0.50),
-		P95:   percentile(sorted, 0.95),
-		P99:   percentile(sorted, 0.99),
+		Count: n,
+		Sum:   sum,
+		Mean:  sum / float64(n),
+		Min:   mn,
+		Max:   mx,
+		P50:   percentile(vals, 0.50),
+		P95:   percentile(vals, 0.95),
+		P99:   percentile(vals, 0.99),
 	}
 }
 
@@ -176,7 +216,7 @@ type Registry struct {
 	histograms  map[string]*Histogram
 	gauges      map[string]*Gauge
 	funcGauges  map[string]*FuncGauge // 函数式瞬时指标（延迟取值）
-	descs       map[string]string      // 指标 HELP 描述（Prometheus 规范推荐）
+	descs       map[string]string     // 指标 HELP 描述（Prometheus 规范推荐）
 	prefix      string                // 非空表示该表是某父表的子系统，所有名字加此前缀
 }
 
@@ -557,7 +597,7 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 				"# TYPE %s_p50 gauge\n%s_p50 %g\n"+
 				"# TYPE %s_p95 gauge\n%s_p95 %g\n"+
 				"# TYPE %s_p99 gauge\n%s_p99 %g\n",
-			sn, sn, h.Count, sn, sn, h.Sum, 			sn, sn, h.P50, sn, sn, h.P95, sn, sn, h.P99); err != nil {
+			sn, sn, h.Count, sn, sn, h.Sum, sn, sn, h.P50, sn, sn, h.P95, sn, sn, h.P99); err != nil {
 			return err
 		}
 	}
