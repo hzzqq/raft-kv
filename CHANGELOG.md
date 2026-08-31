@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–150，共 108 轮交付；时间跨度 2026-07-22 ~ 2026-08-30。
+> 覆盖 cycle 39–154，共 112 轮交付；时间跨度 2026-07-22 ~ 2026-08-31。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -47,6 +47,7 @@
 - **[76] `raft_metrics`** — Raft 共识层可观测性补齐(raft_log_appends_total / raft_term_changes_total)（隐性：控制面任期翻转与写入吞吐不可见,排查脑裂/频繁选举无量化依据；score=14）
 - **[80] `raft_status_selfcheck`** — Raft.Status() 只读快照 + diagnostics.RaftCheck 不变量自检（隐性：共识层对运维完全不透明(脑裂/任期翻滚/apply落后无信号)；RaftCheck 此前无单测；score=18）
 - **[150] `exp_partition_split_brain`** — 真网络分裂（脑裂）故障注入原语 + 场景 B：2+3 分区下不双写、愈合后收敛（隐性：原有分区注入只有 Enable(false)（整节点掉线），造不出「少数派节点仍存活且内部互通、旧 leader 仍自认 leader」的真脑裂——而这才是双写风险最大、最需要被证明的场景；score=18）
+- **[151] `exp_perf_shard_scaling`** — 场景 C：分片扩展性性能曲线（1/2/3/5 组吞吐与延迟对比，落盘 JSON + 自绘 SVG）（隐性：写路径复制此前完全依赖 110ms 心跳触发——Start() 只追加日志就返回，真正的 AppendEntries 要等下一次心跳。单次写延迟被硬钉在约 123ms（≈110ms 心跳 + RTT），吞吐上限约 100 ops/sec，且这个瓶颈在既有测试里完全看不出来（测试只断言正确性、不看延迟）；score=20）
 
 ## shardkv
 
@@ -153,6 +154,8 @@
 - **[130] `security_policy`** — SECURITY.md 漏洞披露政策(安全治理)（隐性：已落地密钥扫描门禁(check_secrets)但外部研究者无漏洞上报渠道,安全门禁缺人工闭环；score=15）
 - **[138] `bench_guard_wired`** — 接通休眠的性能回归护栏(check_bench_regression 此前从未被调用)（隐性：check_bench_regression.py 自 cycle116 存在却未被 make/CI 调用,且 bench-baseline.json 为空 {},护栏实际失效(R2 harness 漂移,cycle110/133 同类)；score=16）
 - **[149] `exp_leader_fault`** — 可展示容错实验框架（独立 Go 模块，隔离父项目门禁）+ 场景 A leader 故障切换（隐性：项目价值长期停在「健康分 100」与工具链自检，缺「系统确实容错」的可演示证据（实训/面试最值钱部分）；score=16）
+- **[153] `deploy_compose_observability`** — 真部署化：docker-compose 起 3 ShardMaster + 3 ShardKV + gateway 多进程集群，配 Prometheus scrape / 11 条告警规则 / 11 面板 Grafana 看板；并新增 deploycheck 包把部署配置与代码真实指标名绑死为不变量测试（隐性：可观测此前只存在于进程内指标与 JSON 端点，从未在真实多进程形态下被 scrape 与可视化；更危险的是看板/告警极易引用代码里根本不存在的指标名（看板幻觉），面板静默空白却无人发现；score=20）
+- **[154] `console_experiments_tab`** — 控制台新增「实验与验证」Tab：只读托管 experiments/results/ 真实产物，把场景 A/B 时间线渲染成时序日志、场景 C 数据渲染成柱状图；并补 experiments/README.md 记录三场景方法、真实结果与诚实声明（隐性：三个可展示实验此前只能靠命令行跑，结果散落在终端、无法在统一控制台里展示与复核；产物缺少方法说明与边界声明，旁人看 JSON/日志不知其含义与局限；score=14）
 
 ---
 

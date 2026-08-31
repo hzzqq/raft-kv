@@ -131,10 +131,11 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 |-----------|---------:|--------:|:------:|---------------------:|
 | `cluster` | 3 | 7 | ✅ | Diagnostics, LoadTCPConfig, StartClusterFromConfig, NodeDiagnostics |
 | `demo` | 1 | 4 | ✅ | RunDemoPersistent, RunDemoTCP |
+| `deploycheck` | 1 | 1 | ✅ | DashboardPanel |
 | `diagnostics` | 2 | 3 | ✅ | — |
 | `gateway` | 6 | 18 | ✅ | Flush, LoadGatewayConfig, SetCORS, SetHTTPServer, GroupStatus, GroupView, RaftStatusView |
 | `kvcli` | 16 | 25 | ✅ | MSetCtx, BatchResult, BenchResult, MDelResult, MSetResult |
-| `kvnode` | 1 | 2 | ✅ | — |
+| `kvnode` | 2 | 3 | ✅ | — |
 | `kvraft` | 1 | 4 | ✅ | OpResult |
 | `metrics` | 4 | 8 | ✅ | Desc, SetDesc |
 | `raft` | 4 | 12 | ✅ | Call, MakeSendFnEnd, PartitionServers, RaftStateSize, Send, SetSendFn, String, RpcMsg |
@@ -145,6 +146,6 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 | `util` | 24 | 28 | ✅ | ExpBackoff, MarshalJSON, CbState |
 | `version` | 1 | 1 | ✅ | — |
 
-> 汇总：15 个包，0 个无测试；未引用导出符号 func=25 / type=18 / var=2 / const=0。「未覆盖符号」为软提示，可能含被间接覆盖的结果/视图类型。
+> 汇总：16 个包，0 个无测试；未引用导出符号 func=25 / type=19 / var=2 / const=0。「未覆盖符号」为软提示，可能含被间接覆盖的结果/视图类型。
 
 <!-- test-coverage-table:end -->
