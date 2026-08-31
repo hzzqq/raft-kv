@@ -338,6 +338,7 @@ export GO111MODULE=on
 | `check_secrets.py` | 密钥/凭证泄露扫描：PEM 私钥 / AWS AKIA / AWS SK 字面量（HARD）；明文口令/Slack/GitHub token（WARN） | 硬阻断（凭证泄露） |
 | `check_go_coverage.py` | Go 测试覆盖率门槛：解析 `cover.out`，整体覆盖率低于 [`scripts/coverage.config.json`](scripts/coverage.config.json) 的 `min_total` 即阻断（CI `coverage` job 与 `make cover` 后运行；**不**接入 go-free 常驻门禁，因其依赖 Go 产物） | 硬阻断（覆盖率回退） |
 | `check_leaked_artifacts.py` | 构建/覆盖率临时产物泄漏护栏：扫描根目录 `covtest_*` / `*.out` / `*.test` / `tmp_*`，未忽略泄漏硬失败，并校验 `.gitignore` 含 `covtest_*/` 规则（根因防护），防 `go test -coverprofile` 临时目录被误提交 | 硬阻断 |
+| `check_deploy_invariant.py` | 部署不变量 + 实验回归（**需 Go**，非 go-free）：跑 `go test ./src/deploycheck/`（看板/告警 指标名 + label 维度真实存在，防看板幻觉/拓扑漂移）+ `go test ./experiments/ -run TestScalingRatio`（分片扩展比快回归）；若 `RAFTKV_PERF_GATE=1` 额外跑完整 `perf --assert` 重量级性能回归。接入 `check_all.py` 门禁 | 硬阻断 |
 | `run_selftests.py` | 自动发现并运行全部 `scripts/tests/test_*.py` 校验器自测，消除 3 处硬编码清单漂移（Makefile / ci-local / CI 统一调用） | 硬阻断（CI） |
 | `gen_test_coverage.py --verify` | 校验 [`docs/coverage.md`](docs/coverage.md) 自动生成的「模块↔测试」映射表与实际代码一致（防文档漂移） | 硬阻断 |
 | `scripts/tests/` (单元测试) | 校验器自身回归测试（由 `run_selftests.py` 自动发现全部 `scripts/tests/test_*.py` 运行，`make selftest`），守护「门禁自身」不静默退化 | 硬阻断（CI） |

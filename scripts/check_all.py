@@ -37,6 +37,7 @@ CHECKS = [
     ("scripts/check_secrets.py", [], "密钥/凭证泄露扫描(硬阻断)", False),
     ("scripts/gen_test_coverage.py", ["--verify"], "coverage.md 模块↔测试表与实际一致", False),
     ("scripts/check_leaked_artifacts.py", [], "构建/覆盖率临时产物泄漏护栏", False),
+    ("scripts/check_deploy_invariant.py", [], "部署不变量+实验回归(Go)", False),
 ]
 
 
