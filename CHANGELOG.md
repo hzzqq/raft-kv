@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–154，共 112 轮交付；时间跨度 2026-07-22 ~ 2026-08-31。
+> 覆盖 cycle 39–165，共 118 轮交付；时间跨度 2026-07-19 ~ 2026-08-31。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -20,6 +20,7 @@
 - **[83] `gw_raft_health_metric`** — /metrics 暴露 raft_min_health_score gauge（隐性：raft 健康此前不可被 Prometheus scrape/告警(仅 JSON 端点)；score=15）
 - **[118] `gw_labeled_req_metrics`** — 网关请求指标升级为带标签 CounterVec：http_requests_total{method} + http_responses_total{code,method}（隐性：旧实现用『http_responses_<code>』式独立指标名，缺 method 维度且无法在单指标内切片算错误率/分方法 QPS(R2 隐性可观测缺口)；score=18）
 - **[144] `gateway_connect_mode`** — gateway -connect 纯客户端接入模式 + clusterHealthy 远程降级（直连 ShardMaster 取最新 ConfigNum）（隐性：纯客户端模式无本地副本，原 /readyz 遍历本地 KV 句柄会导致空指针/卡死（R2 远程接入可用性缺口）；score=15）
+- **[165] `histogram_help_honest`** — 网关延迟/响应大小直方图补诚实 HELP（样本环形缓冲语义）（隐性：直方图按样本次数滑窗、非时间滑窗，故障期 p99 可能反而偏低被误读；Grafana 已注明但 /metrics 无 HELP；score=15）
 
 ## kvcli
 
@@ -48,6 +49,7 @@
 - **[80] `raft_status_selfcheck`** — Raft.Status() 只读快照 + diagnostics.RaftCheck 不变量自检（隐性：共识层对运维完全不透明(脑裂/任期翻滚/apply落后无信号)；RaftCheck 此前无单测；score=18）
 - **[150] `exp_partition_split_brain`** — 真网络分裂（脑裂）故障注入原语 + 场景 B：2+3 分区下不双写、愈合后收敛（隐性：原有分区注入只有 Enable(false)（整节点掉线），造不出「少数派节点仍存活且内部互通、旧 leader 仍自认 leader」的真脑裂——而这才是双写风险最大、最需要被证明的场景；score=18）
 - **[151] `exp_perf_shard_scaling`** — 场景 C：分片扩展性性能曲线（1/2/3/5 组吞吐与延迟对比，落盘 JSON + 自绘 SVG）（隐性：写路径复制此前完全依赖 110ms 心跳触发——Start() 只追加日志就返回，真正的 AppendEntries 要等下一次心跳。单次写延迟被硬钉在约 123ms（≈110ms 心跳 + RTT），吞吐上限约 100 ops/sec，且这个瓶颈在既有测试里完全看不出来（测试只断言正确性、不看延迟）；score=20）
+- **[162] `raft_kick_nonblock`** — kickCh 非阻塞并发压力测试（TestStartNeverBlocksUnderContention）（隐性：kickCh 非阻塞只靠结构推断、无并发回归护栏，误改阻塞发送吞吐塌到≈9/s 无人察觉；score=16）
 
 ## shardkv
 
@@ -144,6 +146,8 @@
 - **[139] `go_patterns_fatal`** — check_go_patterns 新增 log.Fatal/os.Exit 库代码 WARN 模式（隐性：库代码(main/测试除外)中 log.Fatal/os.Exit 会直接中止进程,此前未被任何门禁覆盖(R2 隐性错误面)；score=14）
 - **[140] `godoc_pkg_doc`** — godoc 包级文档注释(// Package X)覆盖的软提示（隐性：14 个导出包全部缺 // Package 包级文档,go doc 包概览为空却无人察觉;设为硬失败会打挂 CI 故仅软提示(R2 可观测盲区)；score=14）
 - **[145] `cross_machine_e2e_test`** — OS 进程级跨机实测（10 进程：9 节点 + 1 网关，taskkill 模拟宕机验证少数派容错）；TestNodePerProcessCluster 集成回归（隐性：此前跨机仅单进程 loopback 验证，缺真·多进程边界与宕机容错实测（R2 部署化真验缺口）；score=19）
+- **[160] `deploy_runtime_smoke`** — 真部署路径运行时冒烟验证（多进程集群 + kill leader 观测切换）（隐性：I4 真部署化只做了静态扫描与编排文件，从未真正跑起来验证（compose 配置可能起不来/看板幻觉）；score=18）
+- **[164] `gate_wire_deploy_invariant`** — 把 deploycheck + 实验性能回归接进门禁（隐性：check_all.py 门禁完全没调 deploycheck/experiments，I4 最值钱测试在 CI 裸奔；score=16）
 
 ## other
 
@@ -156,6 +160,7 @@
 - **[149] `exp_leader_fault`** — 可展示容错实验框架（独立 Go 模块，隔离父项目门禁）+ 场景 A leader 故障切换（隐性：项目价值长期停在「健康分 100」与工具链自检，缺「系统确实容错」的可演示证据（实训/面试最值钱部分）；score=16）
 - **[153] `deploy_compose_observability`** — 真部署化：docker-compose 起 3 ShardMaster + 3 ShardKV + gateway 多进程集群，配 Prometheus scrape / 11 条告警规则 / 11 面板 Grafana 看板；并新增 deploycheck 包把部署配置与代码真实指标名绑死为不变量测试（隐性：可观测此前只存在于进程内指标与 JSON 端点，从未在真实多进程形态下被 scrape 与可视化；更危险的是看板/告警极易引用代码里根本不存在的指标名（看板幻觉），面板静默空白却无人发现；score=20）
 - **[154] `console_experiments_tab`** — 控制台新增「实验与验证」Tab：只读托管 experiments/results/ 真实产物，把场景 A/B 时间线渲染成时序日志、场景 C 数据渲染成柱状图；并补 experiments/README.md 记录三场景方法、真实结果与诚实声明（隐性：三个可展示实验此前只能靠命令行跑，结果散落在终端、无法在统一控制台里展示与复核；产物缺少方法说明与边界声明，旁人看 JSON/日志不知其含义与局限；score=14）
+- **[161] `perf_scaling_guard`** — 场景C 性能回归护栏（--assert + TestScalingRatio）（隐性：场景C 扩展比 2.87x 只是文字结论、无回归护栏，心跳节流修复被 revert 后扩展比趋近 1.0x 无人察觉；score=17）
 
 ---
 
