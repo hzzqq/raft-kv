@@ -18,8 +18,13 @@ Go 二进制：
   1. 6 个 kvnode 的 /healthz 全部 200
   2. gateway /readyz 200（集群可读可写）
   3. 经 gateway 做真实 PUT/GET 往返，值必须一致
-  4. /metrics 必须是合法 Prometheus 文本格式（含 HELP/TYPE 与样本行）
-  5. /status 里 3 个副本都在
+  4. gateway /metrics 在 Prometheus 的 Accept 下是合法文本格式（含 HELP/TYPE 与样本行）
+  5. gateway /metrics 按 Accept 协商另一端的 JSON 口径可用
+  6. 6 个节点的 /metrics 也都能被 Prometheus 抓取（对应 prometheus.yml 的 raftkv-nodes job）
+  7. gateway /status 可消费
+  8. 故障演练：kill 一个 ShardKV 副本 → /readyz 仍 200 且读写仍成功（真实 TCP 下 quorum 容错）
+  9. alerts.yml 每条告警引用的指标名，都真实存在于暴露的 /metrics 里——一旦有人把指标名
+     改错（如 histogram 误写成 `_p99` 后缀），该告警会变成永远不触发的死规则，此项即红灯。
   6. 故障演练：kill 掉一个 ShardKV 副本 → /readyz 仍 200 且 PUT/GET 仍成功
      （在真实进程 + 真实 TCP 下再现 quorum 容错，这是 deploy 层首次拿到的证据）
 
@@ -34,6 +39,7 @@ Go 二进制：
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -57,7 +63,23 @@ HTTP_TIMEOUT = 5.0
 
 
 def find_go():
-    for cand in ("/e/go-sdk/go/bin/go.exe", "E:/go-sdk/go/bin/go.exe"):
+    # 与 Makefile 一致：优先用 WorkBuddy 托管的 Go（C:\Users\Administrator\.workbuddy\binaries\go），
+    # 它是本机唯一能正常编译本项目的工具链——E:\go-sdk 与 E:\e\go-sdk 两份安装都带着一份
+    # 损坏的 src/vendor，编译标准库会报 "package X is not in std"。
+    # nt 下必须用盘符绝对路径：Python 会把 "/e/..." 解析成「当前盘根下的 e/...」（E: 盘 →
+    # E:\e\go-sdk\...），正好撞上那份坏的；同时显式传 GOROOT 杜绝推断错位。
+    if os.name == "nt":
+        cands = (
+            "C:/Users/Administrator/.workbuddy/binaries/go/go/bin/go.exe",
+            "E:/go-sdk/go/bin/go.exe",
+        )
+    else:
+        cands = (
+            "/c/Users/Administrator/.workbuddy/binaries/go/go/bin/go",
+            "/e/go-sdk/go/bin/go",
+            "E:/go-sdk/go/bin/go",
+        )
+    for cand in cands:
         if os.path.exists(cand):
             return cand
     return shutil.which("go") or "go"
@@ -68,6 +90,41 @@ def find_go():
 # 因此冒烟必须带上真实 Accept，否则验证的是「浏览器口径」而非「Prometheus 口径」。
 PROM_ACCEPT = ("application/openmetrics-text; version=0.0.1,"
                "text/plain;version=0.0.4;q=0.75,*/*;q=0.1")
+
+# 告警规则指标契约校验用的 PromQL 关键字 / 标签 / 内置指标。
+PROM_FUNCS = {"sum", "min", "max", "avg", "count", "rate", "irate", "increase",
+              "histogram_quantile", "min_over_time", "max_over_time", "avg_over_time",
+              "sum_over_time", "by", "without", "group", "absent", "clamp_max",
+              "clamp_min", "delta", "idelta", "deriv", "stddev", "stdvar", "topk",
+              "bottomk", "count_values"}
+PROM_LABELS = {"code", "job", "node", "method", "le", "quantile", "instance"}
+PROM_BUILTIN = {"up"}  # Prometheus 自动生成，必存在（但我们 /metrics 不输出）
+# 本项目的自定义 Histogram（src/metrics）输出的派生后缀：_p50/_p95/_p99 分位 gauge
+# + _sum/_count（注意：不是标准 Prometheus 的 _bucket，故不能当成 histogram 派生规则）。
+HIST_SUFFIXES = ("_p50", "_p95", "_p99", "_sum", "_count")
+
+
+def _extract_metric_names(body):
+    """从 Prometheus 文本格式里抽取指标名（每行首个 token）。"""
+    names = set()
+    for ln in body.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        m = re.match(r"([a-zA-Z_:][a-zA-Z0-9_:]*)\b", ln)
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+def _metric_exists(tok, real):
+    """指标是否存在：精确匹配，或匹配 histogram 派生后缀（_bucket/_sum/_count）。"""
+    if tok in real:
+        return True
+    for suf in HIST_SUFFIXES:
+        if tok.endswith(suf) and tok[:-len(suf)] in real:
+            return True
+    return False
 
 
 def http(method, url, body=None, headers=None, timeout=HTTP_TIMEOUT):
@@ -107,6 +164,9 @@ class Smoke:
         os.makedirs(self.data_dir, exist_ok=True)
         go = find_go()
         ext = ".exe" if os.name == "nt" else ""
+        # 不显式设 GOROOT：Windows 上若把 GOROOT 写成「正斜杠」路径（C:/.../go），
+        # go 的标准库路径匹配会因正反斜杠不一致而误报 "package X is not in std"。
+        # 让 go 从自身可执行文件路径推断（自动归一为反斜杠），与本机其余构建一致。
         for pkg in ("kvnode", "gateway"):
             out = os.path.join(self.bin_dir, pkg + ext)
             cmd = [go, "build", "-o", out, "./src/" + pkg]
@@ -302,7 +362,43 @@ class Smoke:
         else:
             ok &= self.check("故障演练：找到目标副本", False, "未找到 kvnode-g0-2")
 
+        # 10. alerts.yml 引用的每个指标都真实存在（防告警规则静默失效/死规则）。
+        #     真实抓取 gateway + 6 节点的 /metrics，解析 alerts.yml 每条 expr 的指标名，
+        #     未在暴露集合里出现的即「死指标」——告警永远不触发却无人察觉。
+        real = set()
+        for i in range(3):
+            for off in (SM_HTTP[i], KV_HTTP[i]):
+                st, body = http("GET", f"http://127.0.0.1:{b+off}/metrics",
+                                headers={"Accept": PROM_ACCEPT})
+                real |= _extract_metric_names(body)
+        st, body = http("GET", gw + "/metrics", headers={"Accept": PROM_ACCEPT})
+        real |= _extract_metric_names(body)
+
+        alerts_path = os.path.join(ROOT, "deploy", "alerts.yml")
+        missing = []
+        if os.path.exists(alerts_path):
+            text = open(alerts_path, encoding="utf-8").read()
+            for ln in text.splitlines():
+                if "expr:" not in ln:
+                    continue
+                expr = ln.split("expr:", 1)[1].strip()
+                for tok in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", expr):
+                    if tok in PROM_BUILTIN or tok in PROM_FUNCS or tok in PROM_LABELS:
+                        continue
+                    if not self._looks_metric(tok):
+                        continue
+                    if not _metric_exists(tok, real):
+                        missing.append(f"{tok}  ←  {expr}")
+        missing = sorted(set(missing))
+        ok &= self.check("alerts.yml 引用的指标都真实暴露（无静默失效告警）",
+                         len(missing) == 0,
+                         f"缺失 {len(missing)} 个" + ("" if not missing else "：\n      " + "\n      ".join(missing)))
         return ok
+
+    @staticmethod
+    def _looks_metric(tok):
+        """粗判 token 是否像指标名（非函数/标签/内置）。"""
+        return bool(tok) and tok[0].isalpha() and ("_" in tok or tok in PROM_BUILTIN)
 
     # ---------- 清理 ----------
     def cleanup(self, keep=False):
