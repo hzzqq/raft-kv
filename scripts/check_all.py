@@ -38,6 +38,7 @@ CHECKS = [
     ("scripts/gen_test_coverage.py", ["--verify"], "coverage.md 模块↔测试表与实际一致", False),
     ("scripts/check_leaked_artifacts.py", [], "构建/覆盖率临时产物泄漏护栏", False),
     ("scripts/check_deploy_invariant.py", [], "部署不变量+实验回归(Go)", False),
+    ("scripts/deploy_smoke_local.py", [], "本地真机部署冒烟(真实进程,免docker)", False),
     ("scripts/check_html_js_syntax.py", [], "HTML/JS 内联脚本语法(防控制台整页死脚本回归)", False),
 ]
 

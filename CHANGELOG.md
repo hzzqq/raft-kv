@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–180，共 132 轮交付；时间跨度 2026-07-19 ~ 2026-09-01T20:35:00。
+> 覆盖 cycle 39–181，共 133 轮交付；时间跨度 2026-07-19 ~ 2026-09-01T21:05:00。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -175,6 +175,7 @@
 - **[178] `console_dead_script_fix`** — 修复控制台整页 JS 死脚本 + 实验 Tab 渲染最难路径迁移场景（隐性：R9 提交 20e8aba4 在 fmtDateTime 闭合后残留一个多余 }，使整个 <script> 解析失败、控制台自 2026-08-31 起完全失效；且 I176/I177 新增的最难路径 migration 场景从未在控制台展示（仅列原始文件）；score=21）
 - **[179] `html_js_gate_and_quadruple_migration`** — ①monorepo 控制台加 HTML/JS 内联脚本语法门禁；②真机跑通 deploy/ docker-compose（wsl 黑名单阻塞）；③迁移实验叠 Leave/Join 配置抖动（隐性：I178 根因是 R9 在 index.html 残留一个 '}' 致整页 JS 死、控制台自 2026-08-31 起完全失效；但 monorepo 没有任何 HTML-JS 语法门禁，这类回归此前永远漏网——需把对应加固做成本门禁。同时迁移实验强度仍可从『三重』升到『四重（叠配置抖动）』以覆盖更真实的 ShardMaster 再配置路径。；score=20）
 - **[180] `html_gate_selftest_and_line_map`** — 续推：验证 I179 那道 HTML/JS 门禁是否真的拦得住 I178 那类 bug，并修掉发现的缺口（隐性：I179 加了 HTML 语法门禁却从未验证其有效性——若 regex 失效或目标路径漂移，门禁会『永远全绿却什么都没检查』，这正是 I178『控制台死了没人知道』的重演模式；且实测发现门禁报错只给临时文件行号（__jscheck_xxx.js:730），工程师拿着它在 HTML 里根本定位不到，诊断性近乎为零。；score=19）
+- **[181] `deploy_smoke_local_real_processes`** — 续推：deploy/ 是唯一从未拿到运行时证据的交付物（wsl 黑名单阻塞 docker）（隐性：deploy/ 整套交付物（Dockerfile + docker-compose + prometheus.yml + deploy_smoke.sh）此前**只有 bash -n 语法自检**，从未被真正执行过——部署件到底起不起得来、端点契约对不对、Prometheus 抓不抓得到，全是未知。这是全项目最大的验证空白与风险敞口。；score=22）
 
 ---
 
