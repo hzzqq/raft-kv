@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–182，共 134 轮交付；时间跨度 2026-07-19 ~ 2026-09-01T21:30:00。
+> 覆盖 cycle 39–183，共 135 轮交付；时间跨度 2026-07-19 ~ 2026-09-01T22:30:00。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -177,6 +177,7 @@
 - **[180] `html_gate_selftest_and_line_map`** — 续推：验证 I179 那道 HTML/JS 门禁是否真的拦得住 I178 那类 bug，并修掉发现的缺口（隐性：I179 加了 HTML 语法门禁却从未验证其有效性——若 regex 失效或目标路径漂移，门禁会『永远全绿却什么都没检查』，这正是 I178『控制台死了没人知道』的重演模式；且实测发现门禁报错只给临时文件行号（__jscheck_xxx.js:730），工程师拿着它在 HTML 里根本定位不到，诊断性近乎为零。；score=19）
 - **[181] `deploy_smoke_local_real_processes`** — 续推：deploy/ 是唯一从未拿到运行时证据的交付物（wsl 黑名单阻塞 docker）（隐性：deploy/ 整套交付物（Dockerfile + docker-compose + prometheus.yml + deploy_smoke.sh）此前**只有 bash -n 语法自检**，从未被真正执行过——部署件到底起不起得来、端点契约对不对、Prometheus 抓不抓得到，全是未知。这是全项目最大的验证空白与风险敞口。；score=22）
 - **[182] `alerts_metric_contract`** — 续推：告警规则是部署件验证空白的延伸——alerts.yml 11 条规则引用的指标名若与代码实际暴露的 /metrics 不一致，就会变成永远不触发却无人察觉的死规则（隐性：部署件验证空白的延伸：I181 拿到 deploy 运行时证据后，alerts.yml 这类配置型交付物仍未被验证——指标名是项目自定义约定（非标准 Prometheus），改名或拼错既不会编译报错，Prometheus 也不会报错，只会在故障真发生时静默失效，给人虚假安全感；score=20）
+- **[183] `deploy_gate_i183`** — 续推：I182 只验证了告警指标名，更深的隐性失效仍有敞口——标签匹配器、监控拓扑漂移、故障强度标注落后、quorum 证据不可展示，四项一次性收口（隐性：指标名对了但引用的标签没 emit 仍静默失效；prometheus.yml 与 docker-compose 端口/副本数对不齐会静默无数据（抓盲）；控制台 migration 卡仍写三重，而场景 D 实验早已升四重（含配置抖动 Leave/Join）；quorum 容错证据只活在进程退出后的 stdout，不可审计/不可展示；score=22）
 
 ---
 

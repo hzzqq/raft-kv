@@ -31,20 +31,46 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _find_go():
-    # 优先用 PATH 里的 go；否则退回到本机托管安装的固定路径（git 钩子子进程的
-    # PATH 可能不含 go，导致门禁误判通过——必须显式定位）。
-    for cand in ("go", "/e/go-sdk/go/bin/go.exe"):
-        if shutil.which(cand):
-            return cand
+    # 与 deploy_smoke_local.py 一致：优先 WorkBuddy 托管的 Go（本机唯一能正常编译的
+    # 工具链）。E:\go-sdk 与 E:\e\go-sdk 两份安装 src/vendor 损坏，编译标准库报
+    # "package X is not in std"。nt 下必须用盘符绝对路径，否则 Python 把 "/e/..." 解析成
+    # E:\e\go-sdk\... 那份坏的。
+    if os.name == "nt":
+        cands = (
+            "C:/Users/Administrator/.workbuddy/binaries/go/go/bin/go.exe",
+            "E:/go-sdk/go/bin/go.exe",
+        )
+    else:
+        cands = (
+            "/c/Users/Administrator/.workbuddy/binaries/go/go/bin/go",
+            "/e/go-sdk/go/bin/go",
+            "E:/go-sdk/go/bin/go",
+        )
+    for cand in cands:
         if os.path.exists(cand):
             return cand
-    return "go"
+    return shutil.which("go") or "go"
 
 
 def _run(go, cwd, args, label):
     cmd = [go] + args
+    # 不显式设 GOROOT：在 experiments 这种独立 go.mod 子模块里，显式覆盖 GOROOT 会让 go
+    # 误报 "package X is not in std"。让 go 自行推断。但本机坏安装 E:\e\go-sdk 与本托管 go
+    # 共用默认 GOCACHE，且 root 模块（deploycheck）与 experiments 子模块共用同一 GOCACHE
+    # 时会互相污染 std 缓存触发偶发 not in std——故用独立干净 GOCACHE（.gocache_invariant），
+    # 且不与 deploy_smoke_local.py 的缓存混用，避免 check_all 连跑时跨模块缓存污染。
+    env = dict(os.environ)
+    gc = os.path.join(ROOT, ".gocache_invariant")
+    env["GOCACHE"] = gc
     print(f"==> [部署不变量] {label}: {' '.join(cmd)} (cwd={os.path.relpath(cwd, ROOT)})")
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    for attempt in range(1, 4):
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
+        if proc.returncode == 0:
+            break
+        if attempt < 3:
+            print(f"    [重试 {attempt}/3] {label} 失败（疑似 not in std flake），清空 GOCACHE 重来")
+            shutil.rmtree(gc, ignore_errors=True)
+            os.makedirs(gc, exist_ok=True)
     if proc.stdout:
         for line in proc.stdout.strip().splitlines()[-12:]:
             print("    " + line)

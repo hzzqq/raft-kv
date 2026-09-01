@@ -14,7 +14,7 @@ Go 二进制：
 那套端点契约，并额外做一次真实故障演练——从而在没有 docker 的机器上，依然能
 证明「这套部署件真的起得来、真的能服务、挂一个副本真的还能用」。
 
-检查项：
+检查项（共 12 项，全绿即 deploy 交付物在真实进程 + 真实 TCP 下确认可用）：
   1. 6 个 kvnode 的 /healthz 全部 200
   2. gateway /readyz 200（集群可读可写）
   3. 经 gateway 做真实 PUT/GET 往返，值必须一致
@@ -22,11 +22,16 @@ Go 二进制：
   5. gateway /metrics 按 Accept 协商另一端的 JSON 口径可用
   6. 6 个节点的 /metrics 也都能被 Prometheus 抓取（对应 prometheus.yml 的 raftkv-nodes job）
   7. gateway /status 可消费
-  8. 故障演练：kill 一个 ShardKV 副本 → /readyz 仍 200 且读写仍成功（真实 TCP 下 quorum 容错）
-  9. alerts.yml 每条告警引用的指标名，都真实存在于暴露的 /metrics 里——一旦有人把指标名
-     改错（如 histogram 误写成 `_p99` 后缀），该告警会变成永远不触发的死规则，此项即红灯。
-  6. 故障演练：kill 掉一个 ShardKV 副本 → /readyz 仍 200 且 PUT/GET 仍成功
-     （在真实进程 + 真实 TCP 下再现 quorum 容错，这是 deploy 层首次拿到的证据）
+  8. 故障演练：kill 一个 ShardKV 副本 → /readyz 仍 200（真实 TCP 下 quorum 容错）
+  9. 故障演练：kill 一个 ShardKV 副本 → 读写仍成功（无数据丢失）
+ 10. alerts.yml 指标名契约：每条告警引用的指标名都真实存在——指标名改错即死指标。
+ 11. alerts.yml 标签匹配器契约：每条告警 `{label=...}` 引用的标签都真实 emit——指标名在
+     但标签没 emit，告警会静默失效（比指标名更深一层的死规则）。
+ 12. deploy 监控拓扑一致性：prometheus.yml 抓取的端口/副本数，与 docker-compose.yml 里
+     真实二进制的 -http/-addr 端口、副本数对齐（防监控配置漂移抓盲）。
+
+产物：始终向 deploy/smoke_report.json 写一份可审计/可展示报告（含全量检查项 +
+quorum 容错证据 + 拓扑一致性证据），该文件被 .gitignore 忽略。
 
 用法：
     python3 scripts/deploy_smoke_local.py            # 跑完整冒烟（自动清理进程）
@@ -99,22 +104,67 @@ PROM_FUNCS = {"sum", "min", "max", "avg", "count", "rate", "irate", "increase",
               "bottomk", "count_values"}
 PROM_LABELS = {"code", "job", "node", "method", "le", "quantile", "instance"}
 PROM_BUILTIN = {"up"}  # Prometheus 自动生成，必存在（但我们 /metrics 不输出）
+# Prometheus 抓取层注入的标签：不论代码是否 emit，{job}/ {instance} 恒存在，
+# 故告警 expr 里引用它们作匹配器时不应判为「缺标签」（否则会误报死规则）。
+PROM_INJECTED_LABELS = {"job", "instance"}
 # 本项目的自定义 Histogram（src/metrics）输出的派生后缀：_p50/_p95/_p99 分位 gauge
 # + _sum/_count（注意：不是标准 Prometheus 的 _bucket，故不能当成 histogram 派生规则）。
 HIST_SUFFIXES = ("_p50", "_p95", "_p99", "_sum", "_count")
 
 
-def _extract_metric_names(body):
-    """从 Prometheus 文本格式里抽取指标名（每行首个 token）。"""
+def _extract_metrics_and_labels(body):
+    """从 Prometheus 文本格式里抽取 (指标名集合, {指标: 标签名集合})。"""
     names = set()
+    labels = {}
     for ln in body.splitlines():
         ln = ln.strip()
         if not ln or ln.startswith("#"):
             continue
-        m = re.match(r"([a-zA-Z_:][a-zA-Z0-9_:]*)\b", ln)
-        if m:
-            names.add(m.group(1))
-    return names
+        m = re.match(r"([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?", ln)
+        if not m:
+            continue
+        name = m.group(1)
+        names.add(name)
+        if m.group(2):
+            for kv in m.group(2).split(","):
+                kv = kv.strip()
+                if not kv:
+                    continue
+                km = re.match(r"([a-zA-Z_][a-zA-Z0-9_]*)", kv)
+                if km:
+                    labels.setdefault(name, set()).add(km.group(1))
+    return names, labels
+
+
+def _deploy_topo():
+    """解析 deploy/ 下 docker-compose.yml 与 prometheus.yml 的拓扑，校验监控配置漂移。
+    返回 dict：compose 侧 node_port/node_count/gw_port/gw_count，
+              prometheus 侧 p_node_port/p_node_count/p_gw_port/p_gw_count。"""
+    out = {}
+    compose = os.path.join(ROOT, "deploy", "docker-compose.yml")
+    prom = os.path.join(ROOT, "deploy", "prometheus.yml")
+    if os.path.exists(compose):
+        ct = open(compose, encoding="utf-8").read()
+        node_http = re.findall(r'"-http",\s*":(\d+)"', ct)
+        gw_addr = re.findall(r'"-addr",\s*":(\d+)"', ct)
+        out["node_port"] = int(node_http[0]) if node_http else None
+        out["node_count"] = len(node_http)
+        out["gw_port"] = int(gw_addr[0]) if gw_addr else None
+        out["gw_count"] = len(gw_addr)
+    if os.path.exists(prom):
+        pt = open(prom, encoding="utf-8").read()
+        for blk in re.split(r"job_name:", pt):
+            if blk.lstrip().startswith("raftkv-nodes"):
+                ports = [int(p) for t in re.findall(r"targets:\s*\[([^\]]*)\]", blk)
+                         for p in re.findall(r":(\d+)", t)]
+                out["p_node_port"] = ports[0] if ports else None
+                out["p_node_count"] = len(ports)
+            if blk.lstrip().startswith("raftkv-gateway"):
+                ports = [int(p) for t in re.findall(r"targets:\s*\[([^\]]*)\]", blk)
+                         for p in re.findall(r":(\d+)", t)]
+                out["p_gw_port"] = ports[0] if ports else None
+                out["p_gw_count"] = len(ports)
+    return out
 
 
 def _metric_exists(tok, real):
@@ -164,18 +214,32 @@ class Smoke:
         os.makedirs(self.data_dir, exist_ok=True)
         go = find_go()
         ext = ".exe" if os.name == "nt" else ""
-        # 不显式设 GOROOT：Windows 上若把 GOROOT 写成「正斜杠」路径（C:/.../go），
-        # go 的标准库路径匹配会因正反斜杠不一致而误报 "package X is not in std"。
-        # 让 go 从自身可执行文件路径推断（自动归一为反斜杠），与本机其余构建一致。
-        for pkg in ("kvnode", "gateway"):
-            out = os.path.join(self.bin_dir, pkg + ext)
-            cmd = [go, "build", "-o", out, "./src/" + pkg]
-            p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
-            if p.returncode != 0:
-                print(f"构建 {pkg} 失败：\n{(p.stderr or p.stdout)[-2000:]}")
-                return False
-        self._p(f"✓ 构建完成（go={go}）")
-        return True
+        # 不显式设 GOROOT：Windows 上显式覆盖 GOROOT 会让 go 在子模块（如 experiments
+        # 独立 go.mod）里误报 "package X is not in std"；让 go 从 exe 路径自行推断最稳。
+        # 但本机 go 工具链在解析标准库时偶发 "package X is not in std"（路径明明存在），
+        # 属宿主机 flake。故：①每个脚本用独立干净 GOCACHE（.gocache_smoke）隔离坏安装与
+        # 跨模块污染；②构建失败（尤其 not in std）时清空 GOCACHE 重试，最多 3 次，兜住 flake。
+        env = dict(os.environ)
+        env["GOCACHE"] = os.path.join(ROOT, ".gocache_smoke")
+        pkgs = ("kvnode", "gateway")
+        for attempt in range(1, 4):
+            built = True
+            for pkg in pkgs:
+                out = os.path.join(self.bin_dir, pkg + ext)
+                cmd = [go, "build", "-o", out, "./src/" + pkg]
+                p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, env=env)
+                if p.returncode != 0:
+                    built = False
+                    print(f"构建 {pkg} 失败（尝试 {attempt}/3）：\n"
+                          f"{(p.stderr or p.stdout)[-1500:]}")
+                    break
+            if built:
+                self._p(f"✓ 构建完成（go={go}）")
+                return True
+            if attempt < 3:
+                shutil.rmtree(env["GOCACHE"], ignore_errors=True)
+                os.makedirs(env["GOCACHE"], exist_ok=True)
+        return False
 
     # ---------- 配置 ----------
     def write_config(self):
@@ -362,37 +426,92 @@ class Smoke:
         else:
             ok &= self.check("故障演练：找到目标副本", False, "未找到 kvnode-g0-2")
 
-        # 10. alerts.yml 引用的每个指标都真实存在（防告警规则静默失效/死规则）。
-        #     真实抓取 gateway + 6 节点的 /metrics，解析 alerts.yml 每条 expr 的指标名，
-        #     未在暴露集合里出现的即「死指标」——告警永远不触发却无人察觉。
-        real = set()
+        # 10. alerts.yml 契约：每条告警引用的「指标名」+「{label=...} 匹配器」都真实存在。
+        #     比单纯指标名更深一层——http_responses_total{code=~"5.."} 指标名在、但 code
+        #     标签实际没 emit，告警就会永远不命中（静默失效死规则）。
+        real_names = set()
+        real_labels = {}      # 指标名 -> {真实 emit 的标签名}
         for i in range(3):
             for off in (SM_HTTP[i], KV_HTTP[i]):
                 st, body = http("GET", f"http://127.0.0.1:{b+off}/metrics",
                                 headers={"Accept": PROM_ACCEPT})
-                real |= _extract_metric_names(body)
+                n, l = _extract_metrics_and_labels(body)
+                real_names |= n
+                for k, v in l.items():
+                    real_labels.setdefault(k, set()).update(v)
         st, body = http("GET", gw + "/metrics", headers={"Accept": PROM_ACCEPT})
-        real |= _extract_metric_names(body)
+        n, l = _extract_metrics_and_labels(body)
+        real_names |= n
+        for k, v in l.items():
+            real_labels.setdefault(k, set()).update(v)
 
         alerts_path = os.path.join(ROOT, "deploy", "alerts.yml")
-        missing = []
+        missing_metrics = []
+        missing_labels = []
         if os.path.exists(alerts_path):
             text = open(alerts_path, encoding="utf-8").read()
             for ln in text.splitlines():
                 if "expr:" not in ln:
                     continue
                 expr = ln.split("expr:", 1)[1].strip()
+                # (a) 指标名存在性：未暴露即死指标
                 for tok in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", expr):
                     if tok in PROM_BUILTIN or tok in PROM_FUNCS or tok in PROM_LABELS:
                         continue
                     if not self._looks_metric(tok):
                         continue
-                    if not _metric_exists(tok, real):
-                        missing.append(f"{tok}  ←  {expr}")
-        missing = sorted(set(missing))
-        ok &= self.check("alerts.yml 引用的指标都真实暴露（无静默失效告警）",
-                         len(missing) == 0,
-                         f"缺失 {len(missing)} 个" + ("" if not missing else "：\n      " + "\n      ".join(missing)))
+                    if not _metric_exists(tok, real_names):
+                        missing_metrics.append(f"{tok}  ←  {expr}")
+                # (b) {label=...} 匹配器契约：被引用指标的标签必须真实 emit
+                for m in re.finditer(
+                        r"([a-zA-Z_][a-zA-Z0-9_]*)\s*\{([^}]*)\}", expr):
+                    metr = m.group(1)
+                    if metr in PROM_BUILTIN:    # up 等 Prometheus 内置指标，标签由抓取层注入
+                        continue
+                    for lm in re.finditer(
+                            r"([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:=~|!~|=|!=)", m.group(2)):
+                        label = lm.group(1)
+                        if label in PROM_INJECTED_LABELS:   # job/instance 由 scrape 注入，恒存在
+                            continue
+                        if label not in real_labels.get(metr, set()):
+                            missing_labels.append(f"{metr}{{{label}}}  ←  {expr}")
+        missing_metrics = sorted(set(missing_metrics))
+        missing_labels = sorted(set(missing_labels))
+        ok &= self.check(
+            "alerts.yml 指标名契约（无静默失效死指标）",
+            len(missing_metrics) == 0,
+            f"缺失 {len(missing_metrics)} 个"
+            + ("" if not missing_metrics else "：\n      " + "\n      ".join(missing_metrics)))
+        ok &= self.check(
+            "alerts.yml 标签匹配器契约（引用的标签真实 emit）",
+            len(missing_labels) == 0,
+            f"缺标签 {len(missing_labels)} 个"
+            + ("" if not missing_labels else "：\n      " + "\n      ".join(missing_labels)))
+
+        # 11. deploy 监控拓扑一致性：prometheus.yml 抓取的端口/副本数，必须和
+        #     docker-compose.yml 里真实二进制的 -http/-addr 端口、副本数对齐。任一边
+        #     改了端口或扩了副本而另一边漏改，监控就会抓盲（静默无数据）。
+        topo = _deploy_topo()
+        drift = []
+        if topo.get("p_node_count") != 6:
+            drift.append(f"prometheus nodes 目标数={topo.get('p_node_count')}（应 6）")
+        if topo.get("p_node_port") != 9100:
+            drift.append(f"prometheus nodes 端口={topo.get('p_node_port')}（应 9100）")
+        if topo.get("p_gw_count") != 1:
+            drift.append(f"prometheus gateway 目标数={topo.get('p_gw_count')}（应 1）")
+        if topo.get("p_gw_port") != 8080:
+            drift.append(f"prometheus gateway 端口={topo.get('p_gw_port')}（应 8080）")
+        if topo.get("p_node_port") != topo.get("node_port"):
+            drift.append(f"节点端口漂移：compose={topo.get('node_port')} vs prom={topo.get('p_node_port')}")
+        if topo.get("p_gw_port") != topo.get("gw_port"):
+            drift.append(f"网关端口漂移：compose={topo.get('gw_port')} vs prom={topo.get('p_gw_port')}")
+        if topo.get("p_node_count") != topo.get("node_count"):
+            drift.append(f"节点数漂移：compose={topo.get('node_count')} vs prom={topo.get('p_node_count')}")
+        if topo.get("p_gw_count") != topo.get("gw_count"):
+            drift.append(f"网关数漂移：compose={topo.get('gw_count')} vs prom={topo.get('p_gw_count')}")
+        ok &= self.check("deploy 监控拓扑一致性（prometheus.yml ↔ docker-compose.yml）",
+                         len(drift) == 0,
+                         "对齐" if not drift else "；".join(drift))
         return ok
 
     @staticmethod
@@ -424,6 +543,37 @@ class Smoke:
             self._p(f"  --keep：进程已停，产物保留在 {self.workdir}")
 
 
+def _write_smoke_report(smoke, ok, port_base, quiet=False):
+    """把全量检查项 + quorum 容错/拓扑一致性证据写成 deploy/smoke_report.json。
+
+    该产物是「真实 TCP 下部署确实可用」的可审计/可展示证据，被 .gitignore 忽略
+    （每次跑完重写，不进版本库）。供控制台/CI 直接消费。"""
+    def _all(names):
+        return all(r["ok"] for r in smoke.results if any(n in r["name"] for n in names))
+    report = {
+        "ok": ok,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "port_base": port_base,
+        "passed": sum(1 for r in smoke.results if r["ok"]),
+        "total": len(smoke.results),
+        "checks": smoke.results,
+        "evidence": {
+            "quorum_survived": _all(["kill"]),
+            "alerts_metric_contract_ok": _all(["alerts.yml"]),
+            "topology_consistent": _all(["拓扑"]),
+        },
+    }
+    report_path = os.path.join(ROOT, "deploy", "smoke_report.json")
+    try:
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        if not quiet:
+            print(f"✓ 可展示证据已写入 {report_path}")
+    except Exception as e:  # noqa: BLE001 - 写证据失败不应影响冒烟结论
+        if not quiet:
+            print(f"  ! 写 smoke_report.json 失败：{e}")
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--keep", action="store_true", help="保留产物目录（调试）")
@@ -449,6 +599,7 @@ def main():
                                   "checks": s.results}, ensure_ascii=False))
             return 1
         ok = s.run_checks()
+        _write_smoke_report(s, ok, args.port_base, quiet=quiet)
     finally:
         s.cleanup(keep=args.keep)
 

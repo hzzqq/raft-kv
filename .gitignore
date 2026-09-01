@@ -53,6 +53,10 @@ raft-kv-gateway.log
 # build_local.py 内存下载的本地 Go 工具链与构建缓存（体积大、机器相关，勿提交）
 .go-sdk/
 .gocache/
+# 托管 Go 专用干净构建缓存（与本机坏安装 E:\e\go-sdk 隔离，防 GOCACHE 跨模块污染误报 not in std）。
+# deploy_smoke 与 check_deploy_invariant 各用独立目录，避免 check_all 连跑时互相污染。
+.gocache_smoke/
+.gocache_invariant/
 .gopath/
 .tcp_test_out.log
 .smoke/
@@ -65,3 +69,6 @@ experiments/results/generated_at.json
 experiments/results/perf_shard_scaling.json
 experiments/results/perf_shard_scaling.svg
 experiments/results/scene_*.log
+
+# 本地真实部署冒烟证据（deploy_smoke_local.py 生成，可审计/可展示产物，勿提交）。
+deploy/smoke_report.json
