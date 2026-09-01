@@ -56,3 +56,12 @@ raft-kv-gateway.log
 .gopath/
 .tcp_test_out.log
 .smoke/
+
+# 实验运行时产物（go run -scenario 生成：控制台读取 + -assert 门禁复用）。
+# 由 pre-commit 钩子（check_all → check_deploy_invariant）每次提交重跑重新生成，
+# 属运行时产物，勿提交以免每次提交后工作树被钩子重写而永久 dirty。
+experiments/results/client_view_*.json
+experiments/results/generated_at.json
+experiments/results/perf_shard_scaling.json
+experiments/results/perf_shard_scaling.svg
+experiments/results/scene_*.log
