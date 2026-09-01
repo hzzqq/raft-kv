@@ -4,6 +4,7 @@
 //   go run . -scenario leader     # 场景 A：leader 故障切换
 //   go run . -scenario partition  # 场景 B：网络分区脑裂（3+2 分裂）
 //   go run . -scenario perf       # 场景 C：ShardKV 分片 vs 单组吞吐曲线
+//   go run . -scenario migration  # 场景 D：多组（n_groups>1）分片迁移故障（跨组 rebalance 期间零丢失写）
 //
 // 本目录是独立 Go 模块（go.mod + replace raftkv=>..），不计入 raft-kv 父模块的
 // 测试覆盖门禁，因此新增实验不会动摇父项目已冻结的 100 分。
@@ -21,7 +22,7 @@ import (
 )
 
 func main() {
-	scenario := flag.String("scenario", "leader", "leader | partition | perf")
+	scenario := flag.String("scenario", "leader", "leader | partition | perf | migration")
 	assert := flag.Bool("assert", false, "断言模式：不变量不达标则非零退出（CI 回归护栏；perf 查扩展比，leader/partition 查客户端视角结构化报告 ok）")
 	flag.Parse()
 	resetClock()
@@ -35,6 +36,8 @@ func main() {
 		runPartition()
 	case "perf":
 		runPerf(*assert)
+	case "migration":
+		runMigration()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q (leader|partition|perf)\n", *scenario)
 		os.Exit(2)
@@ -119,6 +122,9 @@ func assertClientViewScenarios(scenario string) {
 	case "partition":
 		// 多数派客户端视角 + 少数派(危险路径)客户端视角，两者都必须 ok。
 		files = []string{"client_view_partition.json", "client_view_minority.json"}
+	case "migration":
+		// 多组跨组迁移 + 副本崩溃期间，已确认写零丢失（I176 新场景）。
+		files = []string{"client_view_migration.json"}
 	default:
 		return // perf 自行 --assert，不在此校验
 	}

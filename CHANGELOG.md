@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–175，共 127 轮交付；时间跨度 2026-07-19 ~ 2026-09-01T12:10:00。
+> 覆盖 cycle 39–176，共 128 轮交付；时间跨度 2026-07-19 ~ 2026-09-01T12:58:00。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -170,6 +170,7 @@
 - **[173] `I173`** — （隐性：；score=）
 - **[174] `client_view_console_and_deploy_smoke`** — （隐性：；score=）
 - **[175] `experiments_assert_gate`** — （隐性：；score=）
+- **[176] `migration_fault_experiment`** — 多组（n_groups>1）分片迁移故障实验（场景 D）+ leader/partition 客户端视角不变量 always-on 门禁（隐性：experiments 此前只用单组，跨组 rebalance 期间正确性盲区从未被演示/门禁覆盖；场景 A/B 最强不变量虽接门禁却仍仅 CI 开启；score=19）
 
 ---
 

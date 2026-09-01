@@ -1,7 +1,7 @@
 {
   "scenario": "partition-majority",
-  "generated_at": "2026-09-01T11:01:33+08:00",
-  "ops": 24,
+  "generated_at": "2026-09-01T13:01:15+08:00",
+  "ops": 25,
   "fails": 0,
   "lost_writes": 0,
   "down_ms": 0,
