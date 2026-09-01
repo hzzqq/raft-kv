@@ -1073,7 +1073,7 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		// RAFTKV_HIST_WINDOW 覆盖（见 gateway main）。内存上限 8192 样本（极端高
 		// QPS 时窗口内超量则丢最旧）——已在 /metrics HELP 与 Grafana 面板注明。
 		Metrics.HistWithHelp("gateway_response_bytes",
-			fmt.Sprintf("网关响应体大小直方图（字节；gzip 开启时为压缩后字节）。分位(p50/p95/p99)来自最近 %.0fs 时间滑窗内样本（窗口外已淘汰，故故障期流量骤降不会虚低）；内存上限 8192 样本（极端高 QPS 时丢最旧）。", metrics.DefaultHistWindow().Seconds())).Record(float64(mw.respBytes))
+			fmt.Sprintf("网关响应体大小直方图（字节；gzip 开启时为压缩后字节）。分位(p50/p95/p99)来自最近 %.0fs 时间滑窗内样本（窗口外已淘汰，故故障期流量骤降不会虚低）；内存上限 8192 样本（极端高 QPS 时丢最旧）；窗口内 0 样本时不导出分位序列（避免 Grafana 误显 0ms）。", metrics.DefaultHistWindow().Seconds())).Record(float64(mw.respBytes))
 		// I61：后端健康熔断观测。按最终状态码更新熔断状态（5xx 累计，非 5xx 重置/恢复）。
 		s.observeBackend(st)
 	}
@@ -1113,7 +1113,7 @@ func (s *Server) recordRequestMetrics(method string, status int, latencyMs float
 		// （宽度默认 60s，可由 RAFTKV_HIST_WINDOW 覆盖），非按观测次数滑窗；故障期
 		// p99 不再因残留历史样本而「虚低」，可直接参考（但仍为单进程观测）。
 		Metrics.HistWithHelp("http_request_latency_ms",
-			fmt.Sprintf("网关请求延迟直方图（毫秒）。分位(p50/p95/p99)来自最近 %.0fs 时间滑窗内样本（窗口外已淘汰，故故障期流量骤降不会虚低，可参考）；内存上限 8192 样本（极端高 QPS 时丢最旧）。", metrics.DefaultHistWindow().Seconds())).Record(latencyMs)
+			fmt.Sprintf("网关请求延迟直方图（毫秒）。分位(p50/p95/p99)来自最近 %.0fs 时间滑窗内样本（窗口外已淘汰，故故障期流量骤降不会虚低，可参考）；内存上限 8192 样本（极端高 QPS 时丢最旧）；窗口内 0 样本时不导出分位序列（避免 Grafana 误显 0ms）。", metrics.DefaultHistWindow().Seconds())).Record(latencyMs)
 }
 
 // handleDebugAccessLog 返回进程内访问日志的最近 N 条（默认 50，可用 ?limit= 覆盖），

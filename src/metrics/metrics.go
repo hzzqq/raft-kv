@@ -604,6 +604,18 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 		if _, err := io.WriteString(w, r.helpLine(name, sn)); err != nil {
 			return err
 		}
+		if h.Count == 0 {
+			// 窗口内 0 样本：分位数无定义，不导出 _p50/_p95/_p99 序列，
+			// 避免 Prometheus/Grafana 误显 "0ms 延迟"（看似健康实为无流量/故障）。
+			// 仅导出观测计数与求和（均为 0），供 "请求量=0" 判定。
+			if _, err := fmt.Fprintf(w,
+				"# TYPE %s_count counter\n%s_count %d\n"+
+					"# TYPE %s_sum gauge\n%s_sum %g\n",
+				sn, sn, h.Count, sn, sn, h.Sum); err != nil {
+				return err
+			}
+			continue
+		}
 		if _, err := fmt.Fprintf(w,
 			"# TYPE %s_count counter\n%s_count %d\n"+
 				"# TYPE %s_sum gauge\n%s_sum %g\n"+

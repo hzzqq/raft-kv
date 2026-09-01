@@ -3,6 +3,7 @@ package metrics
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -106,6 +107,42 @@ func TestHistogramCapBound(t *testing.T) {
 	}
 	if s.Min != 92 || s.Max != 99 {
 		t.Fatalf("cap-bound min/max want 92/99, got %v/%v", s.Min, s.Max)
+	}
+}
+
+// TestHistogramEmptyWindowPrometheus 验证：窗口内 0 样本（空闲/故障期）时，
+// WritePrometheus 不导出 _p50/_p95/_p99 分位序列，避免 Prometheus/Grafana 误显
+// "0ms 延迟"（看似健康实为无流量）；仅导出 _count=0 / _sum=0 供"请求量=0"判定。
+// 有样本时则正常导出分位序列——双向断言锁定行为。
+func TestHistogramEmptyWindowPrometheus(t *testing.T) {
+	r := NewRegistry()
+	h := r.Histogram("gateway_request_latency_ms")
+
+	var buf bytes.Buffer
+	if err := r.WritePrometheus(&buf); err != nil {
+		t.Fatalf("WritePrometheus: %v", err)
+	}
+	out := buf.String()
+	for _, suf := range []string{"_p50", "_p95", "_p99"} {
+		if strings.Contains(out, suf+" ") {
+			t.Fatalf("窗口内 0 样本不应导出 %s 分位序列（会误显 0ms）：\n%s", suf, out)
+		}
+	}
+	if !strings.Contains(out, "gateway_request_latency_ms_count 0") {
+		t.Fatalf("应导出 _count 0：\n%s", out)
+	}
+
+	// 有样本：分位序列应正常导出
+	h.Record(12.3)
+	buf.Reset()
+	if err := r.WritePrometheus(&buf); err != nil {
+		t.Fatalf("WritePrometheus: %v", err)
+	}
+	out = buf.String()
+	for _, suf := range []string{"_p50", "_p95", "_p99"} {
+		if !strings.Contains(out, suf+" ") {
+			t.Fatalf("有样本应导出 %s 分位序列：\n%s", suf, out)
+		}
 	}
 }
 

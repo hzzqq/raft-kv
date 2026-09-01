@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–168，共 120 轮交付；时间跨度 2026-07-19 ~ 2026-09-01T09:30:00。
+> 覆盖 cycle 39–169，共 121 轮交付；时间跨度 2026-07-19 ~ 2026-09-01T09:40:00。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -163,6 +163,7 @@
 - **[161] `perf_scaling_guard`** — 场景C 性能回归护栏（--assert + TestScalingRatio）（隐性：场景C 扩展比 2.87x 只是文字结论、无回归护栏，心跳节流修复被 revert 后扩展比趋近 1.0x 无人察觉；score=17）
 - **[167] `I167`** — （隐性：；score=）
 - **[168] `I168`** — （隐性：；score=）
+- **[169] `I169`** — （隐性：；score=）
 
 ---
 
