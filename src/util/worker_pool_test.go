@@ -40,12 +40,21 @@ func TestWorkerPoolSingleWorker(t *testing.T) {
 
 // TestWorkerPoolTrySubmitFull 验证非阻塞提交在缓冲满时返回 ErrPoolFull，
 // 而非无限阻塞或 panic（R6 可验证收益：背压语义成立）。
+//
+// 旧写法在重负载下偶发失败：单 worker 被阻塞任务占住时，该在途任务可能仍暂存于
+// 缓冲（取决于调度时序），导致"可成功入队数"为 1023 而非 1024。此处用 started
+// 通道等 worker 真正取走阻塞任务（离开缓冲）后再计数，消除该时序竞态，断言精确。
 func TestWorkerPoolTrySubmitFull(t *testing.T) {
 	block := make(chan struct{})
+	started := make(chan struct{})
 	p := NewWorkerPool(1)
 	// 占住唯一 worker，使其无法消费缓冲区。
-	p.Submit(func() { <-block })
-	// 填满有界缓冲区（容量 1024）。
+	p.Submit(func() {
+		close(started) // 通知测试：worker 已取出阻塞任务（离开缓冲、占住 worker）
+		<-block
+	})
+	<-started // 等 worker 真正开始执行阻塞任务，确保缓冲中不再占该在途任务
+	// 此时缓冲 1024 全空闲，可精确填满。
 	for i := 0; i < 1024; i++ {
 		if err := p.TrySubmit(func() {}); err != nil {
 			t.Fatalf("缓冲区未满前应成功入队，第 %d 次提交返回 %v", i, err)
@@ -77,10 +86,18 @@ func TestWorkerPoolSubmitCtxCanceled(t *testing.T) {
 
 // TestWorkerPoolSubmitCtxTimeoutWhileFull 验证「缓冲满 + worker 忙」时 SubmitCtx
 // 会随 ctx 超时退出而非永久阻塞（有界并发 + 背压 + ctx 取消三位一体）。
+//
+// 与 TestWorkerPoolTrySubmitFull 同理：用 started 通道等 worker 取走阻塞任务后再填缓冲，
+// 消除"在途任务占缓冲位"的时序竞态（旧写法在重负载下偶发"填满缓冲区失败"）。
 func TestWorkerPoolSubmitCtxTimeoutWhileFull(t *testing.T) {
 	block := make(chan struct{})
+	started := make(chan struct{})
 	p := NewWorkerPool(1)
-	p.Submit(func() { <-block }) // 占住 worker
+	p.Submit(func() {
+		close(started)
+		<-block
+	}) // 占住 worker
+	<-started // 等 worker 取走阻塞任务，缓冲清空
 	for i := 0; i < 1024; i++ { // 填满缓冲区
 		if err := p.TrySubmit(func() {}); err != nil {
 			t.Fatalf("填满缓冲区失败：%v", err)

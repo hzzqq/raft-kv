@@ -78,8 +78,15 @@ func TestTokenBucketRate(t *testing.T) {
 }
 
 // TestTokenBucketConcurrent 验证：并发取令牌总数不超过容量上限（无超发）。
+//
+// 用冻结时钟（与 TestTokenBucketBurst 一致）隔离"并发安全性"这一被验证属性：
+// 若不冻结，真实时钟下 rate=1000/s 会在并发突发（亚毫秒）期间合法补充令牌，
+// 使成功数略超 50——那是正确 refill 行为，非超发，旧断言误判为失败。
 func TestTokenBucketConcurrent(t *testing.T) {
+	now := time.Unix(0, 0)
 	tb := NewTokenBucket(1000, 50) // 高补充率，容量 50
+	tb.now = func() time.Time { return now }
+	tb.last = now
 	var ok int64
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -95,7 +102,7 @@ func TestTokenBucketConcurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	// 初始只是满桶 50，最多 50 个 goroutine 能取到（补充远慢于瞬间并发）。
+	// 冻结时钟下桶恒定满桶 50，最多 50 个 goroutine 能取到（验证互斥无超发）。
 	if ok > 50 {
 		t.Fatalf("并发不应超发：成功数 %d > 容量 50", ok)
 	}
