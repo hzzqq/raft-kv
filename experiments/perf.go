@@ -61,13 +61,16 @@ func runOneConfig(nGroups int, window time.Duration) perfResult {
 		warm.Put(fmt.Sprintf("warm-%d", i), "w")
 	}
 
+	const warmup = 500 * time.Millisecond
 	var (
 		mu        sync.Mutex
 		lats      []time.Duration
 		ops, errs int
 		wg        sync.WaitGroup
 	)
-	deadline := time.Now().Add(window)
+	// 测量窗口前先跑一段不计入的预热，让调度/GC/leader lease 进入稳态——否则冷启动
+	// 会被算进吞吐，既拉低绝对值又引入抖动（曾导致提交门禁 TestScalingRatio 偶发误红）。
+	deadline := time.Now().Add(warmup + window)
 	t0 := time.Now()
 	for cid := 0; cid < perfClients; cid++ {
 		wg.Add(1)
@@ -77,6 +80,10 @@ func runOneConfig(nGroups int, window time.Duration) perfResult {
 			localLat := make([]time.Duration, 0, 128)
 			localOps, localErr := 0, 0
 			for i := 0; time.Now().Before(deadline); i++ {
+				if time.Since(t0) < warmup { // 预热期不计入测量
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
 				k := fmt.Sprintf("bench-%d-%d", cid, i)
 				s := time.Now()
 				if err := ck.PutE(k, "v"); err != shardkv.OK {
@@ -94,7 +101,7 @@ func runOneConfig(nGroups int, window time.Duration) perfResult {
 		}(cid)
 	}
 	wg.Wait()
-	elapsed := time.Since(t0).Seconds()
+	elapsed := window.Seconds() // 只统计稳态测量窗口，排除预热
 
 	sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
 	pct := func(p float64) float64 {
