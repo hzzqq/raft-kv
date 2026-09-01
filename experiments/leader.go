@@ -43,6 +43,11 @@ func runLeader() {
 	log("kill leader g0-%d（模拟进程崩溃）", l)
 	c.KVs[0][l].Kill()
 
+	// 客户端视角：在故障窗口内持续以真实 client 身份发请求，量化「客户端可见不可用」
+	// 与「丢失写」——这是节点视角（RaftStatus）之外、直接证明容错对用户成立的关键证据。
+	pr := probeClient(ck, 2500*time.Millisecond, 30*time.Millisecond, true)
+	logProbe("leader", pr)
+
 	nl, nst := waitLeader(c, 0, nR, st.Term, 6*time.Second)
 	if nl < 0 {
 		fmt.Println("✗ 故障后 6s 内未选出新 leader")

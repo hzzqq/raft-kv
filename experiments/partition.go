@@ -94,6 +94,11 @@ func runPartition() {
 	}
 	log("✓ 多数派读写正常（during-partition=ok），客户端未感知故障")
 
+	// 客户端视角：分区期间（多数派已选主）持续以真实 client 身份发请求，量化多数派可达
+	// 客户端的可见不可用——节点视角证明「多数派照常服务」，这里补上「用户侧也无感」。
+	pp := probeClient(ck, 1500*time.Millisecond, 50*time.Millisecond, false)
+	logProbe("partition", pp)
+
 	// ---- 不变量 2：少数派连得上但写不进 ----
 	mst := c.KVRaftStatus(g, oldLead)
 	log("少数派旧 leader 自述: role=%v term=%d commit=%d leaderLease=%v",
