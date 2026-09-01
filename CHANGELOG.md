@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–174，共 126 轮交付；时间跨度 2026-07-19 ~ 2026-09-01T11:10:00。
+> 覆盖 cycle 39–175，共 127 轮交付；时间跨度 2026-07-19 ~ 2026-09-01T12:10:00。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -169,6 +169,7 @@
 - **[172] `I172`** — （隐性：；score=）
 - **[173] `I173`** — （隐性：；score=）
 - **[174] `client_view_console_and_deploy_smoke`** — （隐性：；score=）
+- **[175] `experiments_assert_gate`** — （隐性：；score=）
 
 ---
 

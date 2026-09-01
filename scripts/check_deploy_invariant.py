@@ -11,7 +11,9 @@
 运行策略（兼顾提交速度与 CI 严谨）：
   - 默认：跑 deploycheck 测试 + experiments.TestScalingRatio（快，约数秒）。
   - 若环境变量 RAFTKV_PERF_GATE=1（CI 设置）：额外跑完整 perf --assert
-    （1/2/3/5 组全窗口基准，约 15~25s，作为重量级性能回归护栏）。
+    （1/2/3/5 组全窗口基准，约 15~25s，作为重量级性能回归护栏），并跑
+    leader --assert / partition --assert——把场景 A/B 最强正确性保证（无脑裂双写 /
+    零丢失写，I174 落盘的 client_view_*.json 的 ok 字段）变成 CI 强制不变量（I175）。
 
 用法：
     python3 scripts/check_deploy_invariant.py
@@ -70,12 +72,16 @@ def main() -> int:
     ok &= _run(go, exp_dir, ["test", "-run", "TestScalingRatio", "-count=1"],
                "实验 分片扩展比回归 (TestScalingRatio)")
 
-    # 3) 重量级完整性能回归护栏（R2 --assert）：仅 CI 开启，避免拖慢每次提交。
+    # 3) 重量级完整性能回归 + 场景 A/B 客户端视角不变量回归（I175）：仅 CI 开启，避免拖慢每次提交。
     if os.environ.get("RAFTKV_PERF_GATE") == "1":
         ok &= _run(go, exp_dir, ["run", "." , "-scenario", "perf", "-assert"],
                    "实验 完整性能回归 (perf --assert)")
+        ok &= _run(go, exp_dir, ["run", ".", "-scenario", "leader", "-assert"],
+                   "实验 场景A 客户端视角不变量 (leader --assert)")
+        ok &= _run(go, exp_dir, ["run", ".", "-scenario", "partition", "-assert"],
+                   "实验 场景B 客户端视角不变量 (partition --assert)")
     else:
-        print("==> [部署不变量] 跳过完整 perf --assert（默认不跑；CI 设 RAFTKV_PERF_GATE=1 启用）")
+        print("==> [部署不变量] 跳过完整 perf/leader/partition --assert（默认不跑；CI 设 RAFTKV_PERF_GATE=1 启用）")
 
     if not ok:
         print("\n✗ 部署不变量/实验回归门禁未通过。", file=sys.stderr)

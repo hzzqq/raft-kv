@@ -22,7 +22,7 @@ import (
 
 func main() {
 	scenario := flag.String("scenario", "leader", "leader | partition | perf")
-	assert := flag.Bool("assert", false, "perf 场景：扩展比/错误数不达标则非零退出（CI 性能回归护栏）")
+	assert := flag.Bool("assert", false, "断言模式：不变量不达标则非零退出（CI 回归护栏；perf 查扩展比，leader/partition 查客户端视角结构化报告 ok）")
 	flag.Parse()
 	resetClock()
 	// 生成时刻标记：被重定向进 results/scene_*.log，供控制台解析「生成于 <时间>」，
@@ -38,6 +38,12 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q (leader|partition|perf)\n", *scenario)
 		os.Exit(2)
+	}
+	// I175：断言模式——把客户端视角结构化报告（I174 落盘）变成 CI 可强制校验的不变量。
+	// 场景 A/B 此前只在 stdout 打印 ✗ 后 return 0，最强正确性保证（无脑裂 / 零丢失写）
+	// 从未被任何门禁守住；此处复用其 client_view_*.json 的 ok 字段，任一不通过即非零退出。
+	if *assert {
+		assertClientViewScenarios(*scenario)
 	}
 	// R9b 加深：把各产物生成时刻汇总进 results/generated_at.json，供控制台一次性读取
 	// （单一真相源，比逐文件解析更快更稳）。
@@ -96,4 +102,60 @@ func writeArtifactManifest() {
 	if b, merr := json.MarshalIndent(manifest, "", "  "); merr == nil {
 		_ = os.WriteFile(filepath.Join(dir, "generated_at.json"), b, 0o644)
 	}
+}
+
+// assertClientViewScenarios 在断言模式下，校验指定场景落盘的客户端视角结构化报告的
+// 关键不变量（I174 产出，带 ok 字段）。场景 A/B 的最强正确性保证（无脑裂双写 / 零丢失写）
+// 此前只是 stdout 文本，从未被门禁强制；这里把它们变成机器可校验的 exit code。
+//
+// 为什么复用 JSON 而非在场景内直接 os.Exit：场景已把探头结果量化进 client_view_*.json，
+// 断言逻辑与「展示逻辑」共用同一份真值，避免两套口径漂移；且早期失败（如未选出 leader）
+// 会导致 JSON 未落盘 → 文件缺失即判失败，覆盖所有 ✗ 路径。
+func assertClientViewScenarios(scenario string) {
+	var files []string
+	switch scenario {
+	case "leader":
+		files = []string{"client_view_leader.json"}
+	case "partition":
+		// 多数派客户端视角 + 少数派(危险路径)客户端视角，两者都必须 ok。
+		files = []string{"client_view_partition.json", "client_view_minority.json"}
+	default:
+		return // perf 自行 --assert，不在此校验
+	}
+	allOK := true
+	for _, name := range files {
+		if !assertClientViewOK(name) {
+			allOK = false
+		}
+	}
+	if !allOK {
+		os.Exit(1)
+	}
+}
+
+// assertClientViewOK 校验单个客户端视角报告：文件必须存在、可解析、且 ok==true。
+// 少数派的 ok 等价于 split_brain==false（绝未拿到一次成功确认）；多数派/leader 的 ok
+// 等价于已确认写零丢失。任一不通过即打印 ✗ 并返回 false。
+func assertClientViewOK(name string) bool {
+	fp := filepath.Join("results", name)
+	b, err := os.ReadFile(fp)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ [断言] 未找到客户端视角产物 %s（场景未产出结构化报告，或提前失败未落盘）\n", fp)
+		return false
+	}
+	var r struct {
+		Scenario   string `json:"scenario"`
+		Ok         bool   `json:"ok"`
+		SplitBrain bool   `json:"split_brain"`
+	}
+	if err := json.Unmarshal(b, &r); err != nil {
+		fmt.Fprintf(os.Stderr, "✗ [断言] 产物 %s 解析失败: %v\n", fp, err)
+		return false
+	}
+	if !r.Ok {
+		fmt.Fprintf(os.Stderr, "✗ [断言] %s 不变量未通过（ok=false；少数派 split_brain=%v）\n", r.Scenario, r.SplitBrain)
+		return false
+	}
+	fmt.Printf("✓ [断言] %s 客户端视角不变量通过（ok=true）\n", r.Scenario)
+	return true
 }
