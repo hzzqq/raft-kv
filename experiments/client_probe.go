@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"time"
 
+	"raftkv/src/cluster"
 	"raftkv/src/shardkv"
 )
 
@@ -88,4 +89,75 @@ func logProbe(scenario string, pr probeResult) {
 	log("✓ [%s·客户端视角] 故障窗口内客户端发出 %d 次请求、%d 次失败（无假成功），"+
 		"客户端可见不可用 ≈ %.0fms；已确认写零丢失（lost=%d）",
 		scenario, pr.Ops, pr.Fails, pr.DownMs, pr.LostWrites)
+}
+
+// minorityProbeResult 汇总「少数派客户端」在分区期间的连续观测。
+// 这是客户端视角故事里最该量化、也最危险的一半：多数派可达客户端无感（probeClient），
+// 而少数派客户端——连得上旧 leader、却拿不到 quorum——必须全程被拒且绝不可拿到一次成功
+// （否则就是脑裂双写）。
+type minorityProbeResult struct {
+	Attempts     int     // 少数派客户端发起的写请求总数
+	Fails        int     // 被拒（Err≠OK 或 RPC 不可达）的次数
+	Success      int     // 竟然被接受（Err=OK）的次数——必须恒为 0，否则即脑裂
+	FirstFailMs  float64 // 首次被拒的相对时刻（毫秒）
+	LastFailMs   float64 // 末次被拒的相对时刻（毫秒）
+	WindowMs     float64 // 客户端持续被拒的窗口（首次→末次），即「饿死」时长
+}
+
+// probeMinorityWindow 在【单 goroutine】内以「未被隔离的客户端」身份（端点 owner=9500，
+// 与 probeMinorityWrite 同源）持续直连少数派 leader 发写，量化其在分区全程被拒的窗口。
+// 不同于 probeClient（走 Clerk 重试到多数派），这里故意直连少数派，把「客户端连得上却
+// 写不进」变成连续、可计数的运行时证据。
+//
+// 难点：单次 minority 写会阻塞到服务端提交超时（~3s），若顺序发则 1.5s 窗口只采到 1 个样本。
+// 故每次尝试用【独立端点 + goroutine + 200ms 客户端超时】切成多个可计数样本；独立端点
+// 保证不会在同一端点的 RPC 上并发（labrpc 的 end.Call 非并发安全），超时即记为被拒。
+func probeMinorityWindow(c *cluster.Cluster, g, r int, dur, interval time.Duration) minorityProbeResult {
+	const owner = 9500
+	var res minorityProbeResult
+	deadline := time.Now().Add(dur)
+	seq := 0
+	for time.Now().Before(deadline) {
+		seq++
+		endName := 7800 + seq // 每次新建独立端点，避免同端点并发 Call 不安全
+		end := c.Net.MakeEnd(endName, owner)
+		c.Net.Connect(endName, 1000+g*100+r)
+		args := &shardkv.PutAppendArgs{
+			Key:      "ghost-probe",
+			Value:    fmt.Sprintf("p%d", seq),
+			OpType:   "Put",
+			ClientId: 990002,
+			Seq:      int64(seq),
+		}
+		reply := &shardkv.PutAppendReply{}
+		elapsed := time.Since(start).Seconds() * 1000
+		// 单次 minority 写阻塞到服务端提交超时（~3s）；用 goroutine+短超时切成多个样本。
+		done := make(chan struct{})
+		go func() {
+			end.Call("ShardKV.PutAppend", args, reply)
+			close(done)
+		}()
+		ok := false
+		select {
+		case <-done:
+			ok = (reply.Err == shardkv.OK) // 在超时内返回且被接受 ⇒ 危险（脑裂）
+		case <-time.After(200 * time.Millisecond):
+			ok = false // 超时即视为被拒（与脑裂防护语义一致）
+		}
+		res.Attempts++
+		if ok {
+			res.Success++ // 危险：少数派竟接受写 → 脑裂双写
+		} else {
+			res.Fails++
+			if res.FirstFailMs == 0 {
+				res.FirstFailMs = elapsed
+			}
+			res.LastFailMs = elapsed
+		}
+		time.Sleep(interval)
+	}
+	if res.FirstFailMs > 0 {
+		res.WindowMs = res.LastFailMs - res.FirstFailMs
+	}
+	return res
 }

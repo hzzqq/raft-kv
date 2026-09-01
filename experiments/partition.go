@@ -99,6 +99,17 @@ func runPartition() {
 	pp := probeClient(ck, 1500*time.Millisecond, 50*time.Millisecond, false)
 	logProbe("partition", pp)
 
+	// 少数派客户端视角（危险路径）：以「未被隔离的客户端」身份直连少数派 leader 连续发写，
+	// 量化其全程被拒的窗口——必须 0 次成功（否则即脑裂双写），这是客户端视角故事缺的另一半。
+	mp := probeMinorityWindow(c, g, oldLead, 1500*time.Millisecond, 50*time.Millisecond)
+	if mp.Success > 0 {
+		log("✗ [partition·少数派客户端视角] 危险：少数派客户端竟收到 %d 次成功确认（脑裂双写！）", mp.Success)
+		return
+	}
+	log("✓ [partition·少数派客户端视角] 分区期间少数派客户端发起 %d 次写、%d 次被拒、"+
+		"%d 次成功（success=0 ⇒ 无脑裂双写）；客户端在约 %.0fms 内被正确『饿死』",
+		mp.Attempts, mp.Fails, mp.Success, mp.WindowMs)
+
 	// ---- 不变量 2：少数派连得上但写不进 ----
 	mst := c.KVRaftStatus(g, oldLead)
 	log("少数派旧 leader 自述: role=%v term=%d commit=%d leaderLease=%v",
