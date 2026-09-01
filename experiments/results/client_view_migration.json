@@ -1,12 +1,12 @@
 {
   "scenario": "migration",
-  "generated_at": "2026-09-01T12:58:02+08:00",
-  "ops": 125,
+  "generated_at": "2026-09-01T13:40:05+08:00",
+  "ops": 161,
   "fails": 0,
   "lost_writes": 0,
-  "down_ms": 0,
+  "down_ms": 1875,
   "first_fail_ms": 0,
   "first_recover_ms": 0,
-  "conclusion": "跨组迁移+副本崩溃：125 请求/0 失败，丢失写=0（ok=true）",
+  "conclusion": "跨组迁移+副本崩溃+网络分区：161 请求/0 失败/1875ms 分区窗口，丢失写=0（ok=true）",
   "ok": true
 }

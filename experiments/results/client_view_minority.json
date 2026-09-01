@@ -1,12 +1,12 @@
 {
   "scenario": "partition-minority",
-  "generated_at": "2026-09-01T13:01:17+08:00",
+  "generated_at": "2026-09-01T13:39:50+08:00",
   "attempts": 6,
   "fails": 6,
   "success": 0,
-  "first_fail_ms": 4052.4296,
-  "last_fail_ms": 5381.844700000001,
-  "window_ms": 1329.4151000000006,
+  "first_fail_ms": 3824.8415,
+  "last_fail_ms": 5164.3301,
+  "window_ms": 1339.4886000000001,
   "split_brain": false,
   "conclusion": "少数派客户端全程被拒（success=0 ⇒ 无脑裂双写）",
   "ok": true

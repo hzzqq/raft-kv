@@ -1,7 +1,7 @@
 {
   "scenario": "leader-failover",
-  "generated_at": "2026-09-01T13:01:07+08:00",
-  "ops": 44,
+  "generated_at": "2026-09-01T13:39:39+08:00",
+  "ops": 46,
   "fails": 0,
   "lost_writes": 0,
   "down_ms": 0,
