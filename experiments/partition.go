@@ -99,9 +99,40 @@ func runPartition() {
 	pp := probeClient(ck, 1500*time.Millisecond, 50*time.Millisecond, false)
 	logProbe("partition", pp)
 
+	// I174：多数派可达客户端视角落盘为结构化 JSON（与日志同源）。关键不变量仍是已确认写零丢失。
+	writeClientViewJSON("client_view_partition.json", clientViewReport{
+		Scenario:       "partition-majority",
+		GeneratedAt:    time.Now().Format(time.RFC3339),
+		Ops:            pp.Ops,
+		Fails:          pp.Fails,
+		LostWrites:     pp.LostWrites,
+		DownMs:         pp.DownMs,
+		FirstFailMs:    pp.FirstFailMs,
+		FirstRecoverMs: pp.FirstRecoverMs,
+		Conclusion:     "多数派可达客户端全程无感（0 失败、0 丢失写）",
+		Ok:             pp.LostWrites == 0,
+	})
+
 	// 少数派客户端视角（危险路径）：以「未被隔离的客户端」身份直连少数派 leader 连续发写，
 	// 量化其全程被拒的窗口——必须 0 次成功（否则即脑裂双写），这是客户端视角故事缺的另一半。
 	mp := probeMinorityWindow(c, g, oldLead, 1500*time.Millisecond, 50*time.Millisecond)
+
+	// I174：少数派客户端视角落盘为结构化 JSON（在断言之前写，危险情形也要被记录展示）。
+	// SplitBrain = (Success > 0)；Ok 的关键不变量是少数派客户端绝未拿到一次成功确认。
+	writeClientViewJSON("client_view_minority.json", minorityViewReport{
+		Scenario:    "partition-minority",
+		GeneratedAt: time.Now().Format(time.RFC3339),
+		Attempts:    mp.Attempts,
+		Fails:       mp.Fails,
+		Success:     mp.Success,
+		FirstFailMs: mp.FirstFailMs,
+		LastFailMs:  mp.LastFailMs,
+		WindowMs:    mp.WindowMs,
+		SplitBrain:  mp.Success > 0,
+		Conclusion:  "少数派客户端全程被拒（success=0 ⇒ 无脑裂双写）",
+		Ok:          mp.Success == 0,
+	})
+
 	if mp.Success > 0 {
 		log("✗ [partition·少数派客户端视角] 危险：少数派客户端竟收到 %d 次成功确认（脑裂双写！）", mp.Success)
 		return

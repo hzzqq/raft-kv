@@ -1,0 +1,12 @@
+{
+  "scenario": "leader-failover",
+  "generated_at": "2026-09-01T11:01:24+08:00",
+  "ops": 47,
+  "fails": 0,
+  "lost_writes": 0,
+  "down_ms": 0,
+  "first_fail_ms": 0,
+  "first_recover_ms": 0,
+  "conclusion": "客户端以重试屏蔽了故障：0 错误、0 丢失写，对用户透明",
+  "ok": true
+}

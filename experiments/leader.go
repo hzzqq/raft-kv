@@ -48,6 +48,21 @@ func runLeader() {
 	pr := probeClient(ck, 2500*time.Millisecond, 30*time.Millisecond, true)
 	logProbe("leader", pr)
 
+	// I174：把客户端视角结果落盘为结构化 JSON，供控制台「实验与验证」Tab 直接渲染 KPI
+	//（与上方日志同源，但结构化、可复核）。Ok 的关键不变量是已确认写零丢失。
+	writeClientViewJSON("client_view_leader.json", clientViewReport{
+		Scenario:       "leader-failover",
+		GeneratedAt:    time.Now().Format(time.RFC3339),
+		Ops:            pr.Ops,
+		Fails:          pr.Fails,
+		LostWrites:     pr.LostWrites,
+		DownMs:         pr.DownMs,
+		FirstFailMs:    pr.FirstFailMs,
+		FirstRecoverMs: pr.FirstRecoverMs,
+		Conclusion:     leaderClientConclusion(pr),
+		Ok:             pr.LostWrites == 0,
+	})
+
 	nl, nst := waitLeader(c, 0, nR, st.Term, 6*time.Second)
 	if nl < 0 {
 		fmt.Println("✗ 故障后 6s 内未选出新 leader")
@@ -75,4 +90,12 @@ func runLeader() {
 		log("⚠ 新 leader commit=%d 仍落后旧 commit=%d（选举后尚未提交新任期条目）", nst2.CommitIndex, prevCommit)
 	}
 	log("结论：3 副本杀 1，剩余 2 满足多数派(2/3)；新 leader 在选举超时(260–480ms)内选出，旧任期已提交日志经新任期首个条目继承后完整保留、集群恢复可写。")
+}
+
+// leaderClientConclusion 把探头结果压缩成一句人类可读结论（落盘进 JSON + 控制台展示）。
+func leaderClientConclusion(pr probeResult) string {
+	if pr.Fails == 0 {
+		return "客户端以重试屏蔽了故障：0 错误、0 丢失写，对用户透明"
+	}
+	return fmt.Sprintf("客户端可见不可用 ≈ %.0fms，已确认写零丢失（lost=%d）", pr.DownMs, pr.LostWrites)
 }

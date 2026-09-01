@@ -8,7 +8,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"raftkv/src/cluster"
@@ -160,4 +163,52 @@ func probeMinorityWindow(c *cluster.Cluster, g, r int, dur, interval time.Durati
 		res.WindowMs = res.LastFailMs - res.FirstFailMs
 	}
 	return res
+}
+
+// ---- 客户端视角结构化产物（I174）：供控制台「实验与验证」Tab 直接渲染 KPI ----
+//
+// 上面 probeResult / minorityProbeResult 只被 logProbe 打成 stdout 文本行（进 results/scene_*.log）。
+// 为让控制台把「客户端视角容错」渲染成结构化、可复核的 KPI（而不仅是日志文本），这里把探头结果
+// 额外落盘成 results/client_view_*.json。与场景 C 的 perf_shard_scaling.json 同理：带 generated_at
+// 字段，被 experiments/main.go 的 writeArtifactManifest 自动纳入汇总清单，控制台读取其 freshness。
+
+// clientViewReport 多数派可达客户端视角的结构化报告（leader 故障 / 分区多数派两场景共用）。
+type clientViewReport struct {
+	Scenario        string  `json:"scenario"`
+	GeneratedAt     string  `json:"generated_at"`
+	Ops             int     `json:"ops"`
+	Fails           int     `json:"fails"`
+	LostWrites      int     `json:"lost_writes"`
+	DownMs          float64 `json:"down_ms"`
+	FirstFailMs     float64 `json:"first_fail_ms"`
+	FirstRecoverMs  float64 `json:"first_recover_ms"`
+	Conclusion      string  `json:"conclusion"`
+	Ok              bool    `json:"ok"`
+}
+
+// minorityViewReport 少数派客户端视角（危险路径）的结构化报告：重点是 Success 必须恒为 0。
+type minorityViewReport struct {
+	Scenario    string  `json:"scenario"`
+	GeneratedAt string  `json:"generated_at"`
+	Attempts    int     `json:"attempts"`
+	Fails       int     `json:"fails"`
+	Success     int     `json:"success"`
+	FirstFailMs float64 `json:"first_fail_ms"`
+	LastFailMs  float64 `json:"last_fail_ms"`
+	WindowMs    float64 `json:"window_ms"`
+	SplitBrain  bool    `json:"split_brain"`
+	Conclusion  string  `json:"conclusion"`
+	Ok          bool    `json:"ok"`
+}
+
+// writeClientViewJSON 把客户端视角报告落盘为 results/<name>（带缩进，便于人工核对）；
+// 写失败静默忽略（产物是锦上添花，绝不影响实验主流程与正确性断言）。
+func writeClientViewJSON(name string, v interface{}) {
+	dir := "results"
+	_ = os.MkdirAll(dir, 0o755)
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, name), b, 0o644)
 }
