@@ -1067,12 +1067,13 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		s.recordRequestMetrics(r.Method, st, float64(time.Since(start).Microseconds())/1000.0)
 		// #205：响应体大小直方图（线上字节，gzip 开启时为压缩后字节），与延迟直方图
 		// 并列，供 /metrics 观测带宽与大响应分布。纯观测，零行为影响。
-		// 直方图语义诚实化（R7）：p50/p95/p99 来自最近 60s 时间滑窗内的样本（非累计、
+		// 直方图语义诚实化（R7）：p50/p95/p99 来自时间滑窗内的样本（非累计、
 		// 非按观测次数滑窗）。窗口外样本已被淘汰，故故障期流量骤降时不会因残留历史
-		// 样本把分位算「虚低」而被误读成延迟改善。内存上限 8192 样本（极端高 QPS 时
-		// 窗口内超量则丢最旧）——已在 /metrics HELP 与 Grafana 面板注明。
+		// 样本把分位算「虚低」而被误读成延迟改善。滑窗宽度默认 60s，可由
+		// RAFTKV_HIST_WINDOW 覆盖（见 gateway main）。内存上限 8192 样本（极端高
+		// QPS 时窗口内超量则丢最旧）——已在 /metrics HELP 与 Grafana 面板注明。
 		Metrics.HistWithHelp("gateway_response_bytes",
-			"网关响应体大小直方图（字节；gzip 开启时为压缩后字节）。分位(p50/p95/p99)来自最近 60s 时间滑窗内样本（窗口外已淘汰，故故障期流量骤降不会虚低）；内存上限 8192 样本（极端高 QPS 时丢最旧）。").Record(float64(mw.respBytes))
+			fmt.Sprintf("网关响应体大小直方图（字节；gzip 开启时为压缩后字节）。分位(p50/p95/p99)来自最近 %.0fs 时间滑窗内样本（窗口外已淘汰，故故障期流量骤降不会虚低）；内存上限 8192 样本（极端高 QPS 时丢最旧）。", metrics.DefaultHistWindow().Seconds())).Record(float64(mw.respBytes))
 		// I61：后端健康熔断观测。按最终状态码更新熔断状态（5xx 累计，非 5xx 重置/恢复）。
 		s.observeBackend(st)
 	}
@@ -1108,10 +1109,11 @@ func (s *Server) recordAccess(method, path string, status int, d time.Duration, 
 func (s *Server) recordRequestMetrics(method string, status int, latencyMs float64) {
 	Metrics.CounterVec("http_requests_total", "method").WithLabelValues(method).Inc()
 	Metrics.CounterVec("http_responses_total", "code", "method").WithLabelValues(strconv.Itoa(status), method).Inc()
-	// 直方图语义诚实化（R7）：见 gateway_response_bytes 注释——分位按时间滑窗（最近 60s），
-	// 非按观测次数滑窗；故障期 p99 不再因残留历史样本而「虚低」，可直接参考（但仍为单进程观测）。
-	Metrics.HistWithHelp("http_request_latency_ms",
-		"网关请求延迟直方图（毫秒）。分位(p50/p95/p99)来自最近 60s 时间滑窗内样本（窗口外已淘汰，故故障期流量骤降不会虚低，可参考）；内存上限 8192 样本（极端高 QPS 时丢最旧）。").Record(latencyMs)
+		// 直方图语义诚实化（R7）：见 gateway_response_bytes 注释——分位按时间滑窗
+		// （宽度默认 60s，可由 RAFTKV_HIST_WINDOW 覆盖），非按观测次数滑窗；故障期
+		// p99 不再因残留历史样本而「虚低」，可直接参考（但仍为单进程观测）。
+		Metrics.HistWithHelp("http_request_latency_ms",
+			fmt.Sprintf("网关请求延迟直方图（毫秒）。分位(p50/p95/p99)来自最近 %.0fs 时间滑窗内样本（窗口外已淘汰，故故障期流量骤降不会虚低，可参考）；内存上限 8192 样本（极端高 QPS 时丢最旧）。", metrics.DefaultHistWindow().Seconds())).Record(latencyMs)
 }
 
 // handleDebugAccessLog 返回进程内访问日志的最近 N 条（默认 50，可用 ?limit= 覆盖），

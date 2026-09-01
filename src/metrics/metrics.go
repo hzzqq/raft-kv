@@ -80,7 +80,20 @@ type histSample struct {
 const defaultHistCap = 8192
 
 // defaultHistWindow 是默认时间滑窗宽度；分位数只反映最近该时长内的观测。
-const defaultHistWindow = 60 * time.Second
+// 用 var 而非 const，以便进程启动时通过 SetDefaultHistWindow 覆盖（如按业务
+// 观测节奏调大/调小窗口）。已创建的直方图保留各自窗口，不受影响。
+var defaultHistWindow = 60 * time.Second
+
+// SetDefaultHistWindow 覆盖默认时间滑窗宽度（interval<=0 时忽略）。
+// 应在创建任何直方图之前调用（网关在 main 读 RAFTKV_HIST_WINDOW 后调用）。
+func SetDefaultHistWindow(interval time.Duration) {
+	if interval > 0 {
+		defaultHistWindow = interval
+	}
+}
+
+// DefaultHistWindow 返回当前默认时间滑窗宽度（供 HELP 文案动态反映配置值）。
+func DefaultHistWindow() time.Duration { return defaultHistWindow }
 
 // NewHistogram 创建一个直方图；capacity 省略或 <=0 时使用默认容量 8192，
 // 时间滑窗使用默认 60s。

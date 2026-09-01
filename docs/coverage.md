@@ -137,7 +137,7 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 | `kvcli` | 16 | 25 | ✅ | MSetCtx, BatchResult, BenchResult, MDelResult, MSetResult |
 | `kvnode` | 2 | 3 | ✅ | — |
 | `kvraft` | 1 | 4 | ✅ | OpResult |
-| `metrics` | 4 | 8 | ✅ | Desc, SetDesc |
+| `metrics` | 4 | 8 | ✅ | DefaultHistWindow, Desc, SetDefaultHistWindow, SetDesc |
 | `raft` | 4 | 13 | ✅ | Call, MakeSendFnEnd, PartitionServers, RaftStateSize, Send, SetSendFn, String, RpcMsg |
 | `shardkv` | 15 | 24 | ✅ | GetE, PutE, MigrationPlan, MigrationStep |
 | `shardmaster` | 14 | 18 | ✅ | String, ConfigDelta, PlanResult |
@@ -146,6 +146,6 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 | `util` | 24 | 28 | ✅ | ExpBackoff, MarshalJSON, CbState |
 | `version` | 1 | 1 | ✅ | — |
 
-> 汇总：16 个包，0 个无测试；未引用导出符号 func=25 / type=19 / var=2 / const=0。「未覆盖符号」为软提示，可能含被间接覆盖的结果/视图类型。
+> 汇总：16 个包，0 个无测试；未引用导出符号 func=27 / type=19 / var=2 / const=0。「未覆盖符号」为软提示，可能含被间接覆盖的结果/视图类型。
 
 <!-- test-coverage-table:end -->

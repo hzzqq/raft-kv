@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–167，共 119 轮交付；时间跨度 2026-07-19 ~ 2026-08-31T13:25:10。
+> 覆盖 cycle 39–168，共 120 轮交付；时间跨度 2026-07-19 ~ 2026-09-01T09:30:00。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -162,6 +162,7 @@
 - **[154] `console_experiments_tab`** — 控制台新增「实验与验证」Tab：只读托管 experiments/results/ 真实产物，把场景 A/B 时间线渲染成时序日志、场景 C 数据渲染成柱状图；并补 experiments/README.md 记录三场景方法、真实结果与诚实声明（隐性：三个可展示实验此前只能靠命令行跑，结果散落在终端、无法在统一控制台里展示与复核；产物缺少方法说明与边界声明，旁人看 JSON/日志不知其含义与局限；score=14）
 - **[161] `perf_scaling_guard`** — 场景C 性能回归护栏（--assert + TestScalingRatio）（隐性：场景C 扩展比 2.87x 只是文字结论、无回归护栏，心跳节流修复被 revert 后扩展比趋近 1.0x 无人察觉；score=17）
 - **[167] `I167`** — （隐性：；score=）
+- **[168] `I168`** — （隐性：；score=）
 
 ---
 

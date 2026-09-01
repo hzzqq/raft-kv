@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"raftkv/src/cluster"
+	"raftkv/src/metrics"
 )
 
 func main() {
@@ -20,6 +21,16 @@ func main() {
 	tcpCfg := flag.String("tcp-config", "", "跨机部署节点地址清单 JSON（本进程起全部节点，节点间走真实 TCP）")
 	connectCfg := flag.String("connect", "", "纯客户端接入已运行的跨机集群（节点由 kvnode 进程各自承载），值为同一份部署 JSON")
 	flag.Parse()
+
+	// 直方图时间滑窗宽度可配：RAFTKV_HIST_WINDOW（如 "120s"/"5m"），覆盖默认 60s。
+	// 须在创建任何直方图之前设置（直方图在首个请求时惰性创建，晚于此处）。
+	if v := os.Getenv("RAFTKV_HIST_WINDOW"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			metrics.SetDefaultHistWindow(d)
+		} else {
+			fmt.Fprintf(os.Stderr, "warning: RAFTKV_HIST_WINDOW=%q 非法，使用默认 60s: %v\n", v, err)
+		}
+	}
 
 	var c *cluster.Cluster
 	switch {
