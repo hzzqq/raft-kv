@@ -5,8 +5,9 @@
 // 跨组迁移这个真实正确性盲区从未被任何演示 / 门禁覆盖。本场景：
 //  1. 起 2 组 × 3 副本，预热 20 个 key（散落各分片）；
 //  2. 注入组合故障：kill 第 1 组一个副本（剩 2/3 仍 quorum），并在 Churn 中段对第 0 组
-//     注入真网络分裂 [0] | [1,2]（多数派 [1,2] 仍 quorum，避免停滞）——形成
-//     「跨组 rebalance + 一组一副本崩溃 + 一组一副本网络分区」三重并发故障；
+//     注入真网络分裂 [0] | [1,2]（多数派 [1,2] 仍 quorum，避免停滞），同时在中段对第 1 组
+//     注入一次 Leave(1)+Join(1) 配置抖动（临时移除再重新加入、分片回流）——形成
+//     「跨组 rebalance + 一组一副本崩溃 + 一组一副本网络分区 + 配置抖动」四重并发故障；
 //  3. 并发客户端在 Churn 跨组漂移（40 轮、每 120ms 迁一个分片到另一组）期间持续写，
 //     只记录每次被确认（OK）的写；
 //  4. 迁移结束后等配置全推进 + 数据沉降，读回每个 key，断言：
@@ -22,6 +23,7 @@ import (
 
 	"raftkv/src/cluster"
 	"raftkv/src/shardkv"
+	"raftkv/src/shardmaster"
 )
 
 func runMigration() {
@@ -96,10 +98,28 @@ func runMigration() {
 	log("前段 churn 完成；注入第 0 组网络分区 [0] | [1,2]（多数派 [1,2] 仍 quorum）")
 	partStart := time.Now()
 	c.PartitionKV(0, []int{0}, []int{1, 2})
-	c.Churn(15, 120*time.Millisecond, 1)
+
+	// 中段：分区活跃期间，用 Move 式 churn 持续跨组漂移，并在中段（i==7）注入一次
+	// 「Leave(1)+Join(1)」配置抖动——临时把第 1 组（其已有一副本崩溃）移出再重新加入，
+	// 制造 ShardMaster 配置版本 bump 与分片回流。形成
+	// 「跨组 rebalance + 一组一副本崩溃 + 一组一副本网络分区 + 配置抖动」四重并发故障。
+	// Move 的目标组取 i%nG（∈{0,1}），且 Leave/Join 在同一次迭代内成对完成（间隔仅 ~150ms），
+	// 不会让 churn 把分片 Move 到一个长时间不存在的组，避免产生孤儿分片导致收敛过慢。
+	for i := 0; i < 15; i++ {
+		c.Move((i*1)%shardmaster.NShards, i%nG)
+		if i == 7 {
+			c.Leave(1)
+			log("中段注入配置抖动：Leave(1) 临时移除第 1 组（其已有一副本崩溃，rejoin 后剩 2/3 仍 quorum）")
+			time.Sleep(150 * time.Millisecond)
+			c.Join(1)
+			log("中段配置抖动完成：Join(1) 重新加入第 1 组，分片回流")
+		}
+		time.Sleep(120 * time.Millisecond)
+	}
+
 	c.PartitionKV(0) // 愈合第 0 组网络分区，恢复全连通
 	partitionMs := time.Since(partStart).Milliseconds()
-	log("中段 churn（分区活跃 ~%dms）完成；已愈合第 0 组网络分区", partitionMs)
+	log("中段 churn（分区活跃 ~%dms）+ 配置抖动完成；已愈合第 0 组网络分区", partitionMs)
 	c.Churn(10, 120*time.Millisecond, 1)
 	close(stop)
 	wg.Wait()
@@ -136,7 +156,7 @@ func runMigration() {
 		}
 	}
 	if lost == 0 {
-		log("✓ [migration] 跨组迁移 + 副本崩溃 + 网络分区三重故障期间：所有被确认写零丢失（%d 请求 / %d 失败 / 分区窗口 %dms），无脑裂双写",
+		log("✓ [migration] 跨组迁移 + 副本崩溃 + 网络分区 + 配置抖动四重故障期间：所有被确认写零丢失（%d 请求 / %d 失败 / 分区窗口 %dms），无脑裂双写",
 			totalOps, totalFails, partitionMs)
 	}
 
@@ -150,7 +170,7 @@ func runMigration() {
 		Fails:       totalFails,
 		LostWrites:  lost,
 		DownMs:      float64(partitionMs),
-		Conclusion:  fmt.Sprintf("跨组迁移+副本崩溃+网络分区：%d 请求/%d 失败/%dms 分区窗口，丢失写=%d（ok=%v）", totalOps, totalFails, partitionMs, lost, lost == 0),
+		Conclusion:  fmt.Sprintf("跨组迁移+副本崩溃+网络分区+配置抖动：%d 请求/%d 失败/%dms 分区窗口，丢失写=%d（ok=%v）", totalOps, totalFails, partitionMs, lost, lost == 0),
 		Ok:          lost == 0,
 	})
 
@@ -158,7 +178,7 @@ func runMigration() {
 		log("场景 D 结论：⚠ 迁移期间出现 %d 处丢失写（系统 bug 或本次并发边界触发）", lost)
 		return
 	}
-	log("场景 D 结论：2 组 ×3 副本在「跨组 rebalance + 一组一副本崩溃 + 一组一副本网络分区」三重并发故障下，已确认写全部存活、无脑裂双写——ShardKV 最硬路径的正确性被客户端视角实证。")
+	log("场景 D 结论：2 组 ×3 副本在「跨组 rebalance + 一组一副本崩溃 + 一组一副本网络分区 + 配置抖动」四重并发故障下，已确认写全部存活、无脑裂双写——ShardKV 最硬路径的正确性被客户端视角实证。")
 }
 
 // getStable 轮询读一个 key，给分片迁移数据沉降留窗口：迁移刚完成、分片数据尚未

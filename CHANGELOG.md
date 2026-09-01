@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–178，共 130 轮交付；时间跨度 2026-07-19 ~ 2026-09-01T14:20:00。
+> 覆盖 cycle 39–179，共 131 轮交付；时间跨度 2026-07-19 ~ 2026-09-01T19:56:00。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -173,6 +173,7 @@
 - **[176] `migration_fault_experiment`** — 多组（n_groups>1）分片迁移故障实验（场景 D）+ leader/partition 客户端视角不变量 always-on 门禁（隐性：experiments 此前只用单组，跨组 rebalance 期间正确性盲区从未被演示/门禁覆盖；场景 A/B 最强不变量虽接门禁却仍仅 CI 开启；score=19）
 - **[177] `migration_partition_combo`** — 迁移实验（场景 D）叠『迁移期间网络分区』组合故障 + migration 客户端视角不变量 always-on 门禁（隐性：场景 D 已能演示『迁移+副本崩溃』，但 ShardKV 最硬路径仍缺网络分区这一维并发故障；且 migration --assert 在 I176 仍仅 CI 开启，最硬实证回归了也绿；score=19）
 - **[178] `console_dead_script_fix`** — 修复控制台整页 JS 死脚本 + 实验 Tab 渲染最难路径迁移场景（隐性：R9 提交 20e8aba4 在 fmtDateTime 闭合后残留一个多余 }，使整个 <script> 解析失败、控制台自 2026-08-31 起完全失效；且 I176/I177 新增的最难路径 migration 场景从未在控制台展示（仅列原始文件）；score=21）
+- **[179] `html_js_gate_and_quadruple_migration`** — ①monorepo 控制台加 HTML/JS 内联脚本语法门禁；②真机跑通 deploy/ docker-compose（wsl 黑名单阻塞）；③迁移实验叠 Leave/Join 配置抖动（隐性：I178 根因是 R9 在 index.html 残留一个 '}' 致整页 JS 死、控制台自 2026-08-31 起完全失效；但 monorepo 没有任何 HTML-JS 语法门禁，这类回归此前永远漏网——需把对应加固做成本门禁。同时迁移实验强度仍可从『三重』升到『四重（叠配置抖动）』以覆盖更真实的 ShardMaster 再配置路径。；score=20）
 
 ---
 
