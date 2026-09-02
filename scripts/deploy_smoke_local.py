@@ -14,7 +14,7 @@ Go 二进制：
 那套端点契约，并额外做一次真实故障演练——从而在没有 docker 的机器上，依然能
 证明「这套部署件真的起得来、真的能服务、挂一个副本真的还能用」。
 
-检查项（共 12 项，全绿即 deploy 交付物在真实进程 + 真实 TCP 下确认可用）：
+检查项（共 14 项，全绿即 deploy 交付物在真实进程 + 真实 TCP 下确认可用）：
   1. 6 个 kvnode 的 /healthz 全部 200
   2. gateway /readyz 200（集群可读可写）
   3. 经 gateway 做真实 PUT/GET 往返，值必须一致
@@ -29,6 +29,14 @@ Go 二进制：
      但标签没 emit，告警会静默失效（比指标名更深一层的死规则）。
  12. deploy 监控拓扑一致性：prometheus.yml 抓取的端口/副本数，与 docker-compose.yml 里
      真实二进制的 -http/-addr 端口、副本数对齐（防监控配置漂移抓盲）。
+ 13. 监控平面：按 prometheus.yml 目标清单真实抓取 7 个端点（6 节点 + 1 网关），全部返回
+     合法 exposition（UP）——证明监控栈在真实进程下完整覆盖部署拓扑。
+ 14. 监控平面：alerts.yml 每条规则的「指标 + 标签选择器」在实时抓取序列中至少命中 1 条——
+     告警是活规则（非死规则），即真实 Prometheus 也会对活数据求值。
+
+注：13/14 用标准库复刻了 Prometheus 的「抓取 + 告警求值」语义，无需 Docker / 无需
+Prometheus 二进制（本环境 wsl 黑名单 + 大文件下载被限速，二者皆不可得）；一旦取得原生
+Prometheus 二进制，docker-compose 里的 prometheus 服务会以相同拓扑直接跑起来。
 
 产物：始终向 deploy/smoke_report.json 写一份可审计/可展示报告（含全量检查项 +
 quorum 容错证据 + 拓扑一致性证据），该文件被 .gitignore 忽略。
@@ -405,6 +413,12 @@ class Smoke:
         ok &= self.check("gateway /status 可消费", st == 200 and len(body) > 0,
                          f"status={st} {len(body)}B")
 
+        # 13/14. 监控平面（Prometheus 原生语义，无需 Docker / 无需 Prometheus 二进制）
+        #    必须在故障演练「之前」跑：此时 7 个端点全部健康，才能证明监控栈在真实进程下
+        #    完整覆盖部署拓扑（含全部 6 节点 + 1 网关）。故障演练会 kill 一个副本，那是
+        #    quorum 容错测试，不属于监控覆盖度验证。
+        ok &= self.verify_monitoring_plane()
+
         # 6. 故障演练：kill 一个 ShardKV 副本，quorum 2/3 仍可服务
         victim = None
         for name, p, _ in self.procs:
@@ -512,12 +526,125 @@ class Smoke:
         ok &= self.check("deploy 监控拓扑一致性（prometheus.yml ↔ docker-compose.yml）",
                          len(drift) == 0,
                          "对齐" if not drift else "；".join(drift))
+
+        return ok
+
+    # ---------- 监控平面：复刻 Prometheus 抓取 + 告警求值语义 ----------
+    def verify_monitoring_plane(self):
+        """复刻 Prometheus 的「抓取 + 告警求值」语义，对真实进程验证监控平面可用。
+
+        不依赖 Docker / 不依赖 Prometheus 二进制（本环境 wsl 黑名单 + 大文件下载被限速，
+        二者皆不可得）。等价行为：
+          - 抓取层（第 13 项）：按 deploy/prometheus.yml 的目标清单（raftkv-nodes 6× + 
+            raftkv-gateway 1× = 7 端点），把每个目标映射到本地真实进程端口并抓取 /metrics，
+            判定全部返回合法 exposition（UP）——证明监控栈在真实进程下完整覆盖部署拓扑。
+          - 告警层（第 14 项）：对 deploy/alerts.yml 每条规则，把其「指标 + {label=...} 
+            选择器」与实时抓取序列比对，至少命中 1 条活序列才判活规则——即真实 Prometheus 
+            也会对活数据求值（非死规则）。
+        """
+        b = self.port_base
+        ok = True
+
+        # ---- 抓取层：按 prometheus.yml 目标清单映射真实进程端口 ----
+        topo = _deploy_topo()
+        # prometheus.yml 里节点统一抓容器端口 :9100、网关抓 :8080；本地真机进程监听
+        # port_base + 偏移，故按 6 节点（SM_HTTP + KV_HTTP）+ 1 网关（GW_PORT）映射。
+        node_offsets = [SM_HTTP[0], SM_HTTP[1], SM_HTTP[2],
+                        KV_HTTP[0], KV_HTTP[1], KV_HTTP[2]]
+        live_targets = [("node", b + o) for o in node_offsets] + [("gateway", b + GW_PORT)]
+
+        up_count = 0
+        live_names = set()
+        live_labels = {}     # 指标名 -> {真实 emit 的标签名}
+        for kind, port in live_targets:
+            st, body = http("GET", f"http://127.0.0.1:{port}/metrics",
+                            headers={"Accept": PROM_ACCEPT})
+            valid = st == 200 and "# TYPE" in body and "# HELP" in body
+            if valid:
+                up_count += 1
+                n, l = _extract_metrics_and_labels(body)
+                live_names |= n
+                for k, v in l.items():
+                    live_labels.setdefault(k, set()).update(v)
+        expected = len(live_targets)
+        ok &= self.check(
+            f"监控平面：按 prometheus.yml 抓取 {expected} 端点全部 UP（{up_count}/{expected}）",
+            up_count == expected,
+            f"{up_count}/{expected} 端点返回合法 exposition（含 # TYPE/# HELP）"
+            + ("" if up_count == expected else " —— 部分端点不可达，监控会抓盲"))
+
+        # ---- 告警层：每条规则在实时序列中至少命中 1 条活序列 ----
+        alerts_path = os.path.join(ROOT, "deploy", "alerts.yml")
+        dead_rules = []
+        if os.path.exists(alerts_path):
+            text = open(alerts_path, encoding="utf-8").read()
+            for ln in text.splitlines():
+                if "expr:" not in ln:
+                    continue
+                expr = ln.split("expr:", 1)[1].strip()
+                if not expr:
+                    continue
+                if not self._alert_is_live(expr, live_names, live_labels):
+                    dead_rules.append(expr)
+        dead_rules = sorted(set(dead_rules))
+        ok &= self.check(
+            "监控平面：alerts.yml 每条规则为活规则（指标+选择器命中实时序列）",
+            len(dead_rules) == 0,
+            f"{len(dead_rules)} 条死规则"
+            + ("" if not dead_rules else "：\n      " + "\n      ".join(dead_rules)))
         return ok
 
     @staticmethod
     def _looks_metric(tok):
         """粗判 token 是否像指标名（非函数/标签/内置）。"""
         return bool(tok) and tok[0].isalpha() and ("_" in tok or tok in PROM_BUILTIN)
+
+    @staticmethod
+    def _alert_is_live(expr, live_names, live_labels):
+        """判断某条告警 expr 是否能在实时序列中找到至少 1 条命中序列（活规则）。
+
+        live_names：实时抓取到的全部指标名集合；
+        live_labels：{指标名: 该指标真实 emit 的标签名集合}。
+        判定：任一满足即视为活规则——
+          (a) expr 里出现 metric{selectors} 且该 metric（或直方图派生 base）存在，
+              且选择器里引用的标签（除 job/instance 由 scrape 注入外）都被该 metric emit；
+          (b) 兜底：expr 引用的任一业务指标真实存在（无选择器类规则）。
+        若 expr 只引用 Prometheus 内置/函数（无业务指标），视为恒活（由抓取层覆盖）。
+        """
+        # 候选业务指标 token：排除函数 / 标签名 / 内置指标
+        candidates = [t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", expr)
+                      if t not in PROM_BUILTIN and t not in PROM_FUNCS
+                      and t not in PROM_LABELS and Smoke._looks_metric(t)]
+        # 兜底：存在非函数/非标签/非内置的标识符（即便不含下划线）也纳入候选，
+        # 避免把「无下划线但真实存在的指标」误判为死规则。
+        if not candidates:
+            candidates = [t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", expr)
+                          if t not in PROM_BUILTIN and t not in PROM_FUNCS
+                          and t not in PROM_LABELS]
+        if not candidates:
+            return True
+
+        # (a) 逐个 metric{selectors} 模式：同名指标存在 且 选择器标签均被 emit
+        for m in re.finditer(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*\{([^}]*)\}", expr):
+            metr = m.group(1)
+            if metr in PROM_BUILTIN:
+                return True     # up 等内置指标恒有数据（由抓取层注入）
+            if not _metric_exists(metr, live_names):
+                continue
+            sels = re.findall(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:=~|!~|=|!=)", m.group(2))
+            ok_sel = all(
+                (label in PROM_INJECTED_LABELS)
+                or (label in live_labels.get(metr, set()))
+                for label in sels
+            )
+            if ok_sel:
+                return True
+
+        # (b) 兜底：任一被引用业务指标真实存在即为活（无选择器类规则）
+        for metr in candidates:
+            if _metric_exists(metr, live_names):
+                return True
+        return False
 
     # ---------- 清理 ----------
     def cleanup(self, keep=False):

@@ -60,6 +60,8 @@ raft-kv-gateway.log
 .gopath/
 .tcp_test_out.log
 .smoke/
+# 下载缓存（如原生 Prometheus/Grafana 二进制；本环境大文件下载被限速，按需本地缓存、勿提交）。
+.cache/
 
 # 实验运行时产物（go run -scenario 生成：控制台读取 + -assert 门禁复用）。
 # 由 pre-commit 钩子（check_all → check_deploy_invariant）每次提交重跑重新生成，
