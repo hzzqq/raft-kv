@@ -83,3 +83,9 @@ experiments/results/scene_*.log
 
 # 本地真实部署冒烟证据（deploy_smoke_local.py 生成，可审计/可展示产物，勿提交）。
 deploy/smoke_report.json
+deploy_reconfig*.log
+deploy_*.log
+smoke_report.json
+
+# 单测/诊断临时日志（diag_e5*.log 等调试输出，勿提交）
+diag_e5*.log

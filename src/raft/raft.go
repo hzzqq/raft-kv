@@ -7,6 +7,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,16 @@ import (
 // Metrics 是 Raft 组件的可观测性指标（best-effort 进程级聚合）。
 // 网关 / 演示程序可读取 raft.Metrics.Snapshot() 查看领导者变更、日志应用等。
 var Metrics = metrics.NewRegistry()
+
+// raftDebug 选举诊断日志开关：RAFT_DEBUG=1 时由 dbg 输出选举关键路径，便于定位
+// 「kill 一投票副本后无新 leader 选出」类问题（见 deploy_smoke E5）。
+var raftDebug = os.Getenv("RAFT_DEBUG") == "1"
+
+func dbg(format string, args ...interface{}) {
+	if raftDebug {
+		fmt.Printf("[raft-debug] "+format+"\n", args...)
+	}
+}
 
 func init() {
 	// 注册成员变更命令类型（I192），使 gob 在跨进程 AppendEntries / 持久化时能正确
@@ -216,11 +227,19 @@ type Raft struct {
 	matchIndex []int
 
 	// ---- 成员配置（动态重配置，I192）----
-	// cfg 是当前已提交的投票成员集合（rf.peers 的下标）。quorum = len(cfg)/2 + 1。
-	// 初始为全部 peer（或 SetInitialConfig 指定的子集）。成员变更经 ConfChange 日志
-	// 条目提交后由 applier 原子切换。witness 是 cfg 中的一员（参与投票），但其「不持
-	// 状态机 / 永不当选」由本地 isWitness 自我约束，集群层面只需追踪投票集合即可。
+	// cfg 用于 quorum 计票与选举的成员集合（rf.peers 的下标）。其更新时机刻意不对称：
+	//   · follower 在 AppendEntries 追加到 ConfChange 条目时**立即**切到 C_new——这样旧
+	//     leader 提交 C_new 后崩溃、存活 follower 也能以 C_new 凑齐 quorum 选主（E5 死锁根因）；
+	//   · leader 在 ProposeConfChange 时**不**立即切换，而是沿用旧配置把 C_new 条目本身
+	//     提交（Ongaro §6 安全变体，TestWitnessDynamicJoinLeave 依赖），待 applier 提交后才切；
+	//   · applier 提交 ConfChange 时切到 C_new（与 follower 追加时一致，保证收敛）。
+	// 即：follower 选举用「日志最新配置」，leader 提交用「旧配置」，二者在条目提交后收敛。
+	// committedCfg 是「已提交」的投票成员集合，仅由 applier 在提交配置条目时切换，用于
+	// 持久化与对外观测（VoterConfig）——绝不反映未提交配置，避免重启复活未生效的成员变更。
+	// quorum = len(cfg)/2 + 1（计票用 cfg）；cfg 与 committedCfg 在配置条目提交后收敛到同一值。
 	cfg []int
+	// committedCfg 已提交的投票配置，仅 applier 提交配置条目时更新；persist/VoterConfig 用。
+	committedCfg []int
 	// pendingConf 标记 leader 已提议一个尚未提交的成员变更；期间禁止再提议新的变更，
 	// 以保证单服变更安全性（新旧配置多数派必重叠，不会脑裂）。
 	pendingConf bool
@@ -288,7 +307,9 @@ func (rf *Raft) persist() {
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.commitIndex)
-	e.Encode(rf.cfg) // 投票配置：重启后直接恢复，无需重放日志即可正确计 quorum
+	// 持久化「已提交」配置 committedCfg：绝不序列化未提交的最新配置（rf.cfg 在 leader
+	// 提议变更后即指向未提交配置），否则重启可能复活未生效的成员变更、破坏单服变更安全性。
+	e.Encode(rf.committedCfg) // 已提交投票配置：重启后直接恢复，无需重放日志即可正确计 quorum
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -320,6 +341,7 @@ func (rf *Raft) readPersist(data []byte) {
 	var cfg []int
 	if d.Decode(&cfg) == nil && len(cfg) > 0 {
 		rf.cfg = cfg
+		rf.committedCfg = append([]int(nil), cfg...)
 	}
 }
 
@@ -511,14 +533,18 @@ func (rf *Raft) SetInitialConfig(voters []int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.cfg = append([]int(nil), voters...)
+	rf.committedCfg = append([]int(nil), voters...)
 	rf.persist()
 }
 
 // VoterConfig 返回当前已提交的投票成员集合快照（测试/运维观测用）。
+// 注意：返回 committedCfg（已提交配置），而非 rf.cfg（日志最新配置）。两者仅在成员
+// 变更「已提议未提交」的短暂窗口内不同；对外观测/计票应反映已生效配置，避免把未提交
+// 的未生效成员变更误报为当前集群配置。
 func (rf *Raft) VoterConfig() []int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return append([]int(nil), rf.cfg...)
+	return append([]int(nil), rf.committedCfg...)
 }
 
 // HasPendingConf 返回 leader 是否有在途、尚未提交的成员变更。
@@ -544,6 +570,14 @@ func (rf *Raft) ProposeConfChange(newVoters []int) (int, bool) {
 	}
 	idx := rf.lastLogIndex() + 1
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: ConfChange{NewVoters: append([]int(nil), newVoters...)}})
+	// 注意：leader 这里**不**立即把 rf.cfg 切到 C_new（改用「提交后才生效」语义）。原因：
+	// 单服变更里 leader 要在「旧配置」quorum 下提交 C_new 条目本身（Ongaro §6 的安全
+	// 变体，I192 单测 TestWitnessDynamicJoinLeave 依赖——移除 witness 后存活数据副本
+	// 不足新配置 quorum，必须由仍在旧配置里的 witness 一票把 C_new 提交）。follower 则
+	// 在 AppendEntries 追加 C_new 时立即切换 rf.cfg（见下方），以便旧 leader 提交 C_new 后
+	// 崩溃、存活 follower 也能以 C_new 凑齐 quorum 选主（E5 死锁根因）。二者分工：leader
+	// 提交用旧配置、follower 选举用最新配置。
+	dbg("me=%d propose ConfChange idx=%d term=%d newVoters=%v", rf.me, idx, rf.currentTerm, newVoters)
 	rf.pendingConf = true
 	rf.persist()
 	// 立刻唤醒一次复制（非阻塞，缓冲 1 自动合批）。
@@ -604,6 +638,8 @@ func (rf *Raft) startElection() {
 
 	rf.resetElectionTimer()
 
+	dbg("me=%d startElection preTerm=%d cfg=%v lastIdx=%d lastTerm=%d", me, preTerm, rf.cfg, lastIdx, lastTerm)
+
 	preVotes := 1 // 自己默认算一票
 	var pmu sync.Mutex
 	for i := range rf.peers {
@@ -628,8 +664,10 @@ func (rf *Raft) startElection() {
 			}
 			rf.mu.Unlock()
 			if !reply.VoteGranted {
+				dbg("me=%d PreVote from=%d term=%d -> NOT granted", me, i, preTerm)
 				return
 			}
+			dbg("me=%d PreVote from=%d term=%d -> granted (preVotes=%d)", me, i, preTerm, preVotes)
 			// 只统计当前投票配置内的成员（I192）：被移除的节点票权不再计入 quorum。
 			if !rf.inCfg(i) {
 				return
@@ -650,6 +688,7 @@ func (rf *Raft) startElection() {
 // preVoteWon 守卫保证同一轮预投票只转化一次正式选举。
 func (rf *Raft) doRealElection(preTerm int, lastIdx, lastTerm, me int) {
 	rf.mu.Lock()
+	dbg("me=%d doRealElection preTerm=%d curTerm=%d cfg=%v", me, preTerm, rf.currentTerm, rf.cfg)
 	// 仅当本节点任期仍等于"预投票意向任期 - 1"时方可推进；否则说明期间出现了
 	// 更高任期（其他节点已成 leader），放弃本次选举，避免重复/冲突的正式选举。
 	if rf.currentTerm != preTerm-1 || rf.preVoteWon {
@@ -840,6 +879,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = grant
+	dbg("me=%d Vote from=%d term=%d -> granted=%v votedFor=%d curTerm=%d upToDate=%v",
+		rf.me, args.CandidateId, args.Term, grant, rf.votedFor, rf.currentTerm, upToDate)
 }
 
 // RequestPreVote 处理 Pre-Vote（预投票）请求。与 RequestVote 的关键区别：不持久化
@@ -1071,7 +1112,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
-	// 2) 追加新日志（处理冲突）
+	// 2) 追加新日志（处理冲突）：以 leader 为准，本地从 pos 起的全部条目作废并覆盖。
+	// 即便任期相同也覆盖——follower 与 leader 在同一索引出现不同条目（日志分叉）时，
+	// 必须信任 leader，否则成员变更等关键条目无法按 leader 意图收敛（I192 复现的根因：
+	// 副本短暂自任 leader 写了分叉日志，follower 因同任期不截断而永久卡在陈旧配置）。
 	newIdx := args.PrevLogIndex
 	changed := false
 	for _, entry := range args.Entries {
@@ -1080,13 +1124,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			continue
 		}
 		pos := newIdx - rf.lastIncludedIndex - 1
-		if pos < len(rf.log) && rf.log[pos].Term != entry.Term {
-			rf.log = rf.log[:pos] // 截断冲突部分
+		if pos < len(rf.log) {
+			rf.log = rf.log[:pos] // 截断分叉部分（含当前位置），下面用 leader 条目覆盖
 			changed = true
 		}
-		if pos >= len(rf.log) {
-			rf.log = append(rf.log, entry)
-			changed = true
+		rf.log = append(rf.log, entry)
+		changed = true
+		if cc, ok := entry.Command.(ConfChange); ok {
+			// 单服变更：新配置一入日志即生效（Ongaro §6.4），用于选举/quorum 计票，
+			// 不等到提交。否则旧 leader 提交配置后崩溃、本节点仍持旧配置，将无法凑齐
+			// quorum 选出新 leader（I192 死锁）。状态机侧仍由 applier 在提交后切换。
+			rf.cfg = append([]int(nil), cc.NewVoters...)
 		}
 	}
 	// 仅当日志真正发生变化时才持久化；心跳（无新条目）无需重写整个状态。
@@ -1102,6 +1150,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.commitIndex = last
 		}
+		dbg("me=%d commit advance: LeaderCommit=%d -> commitIndex=%d lastLog=%d", rf.me, args.LeaderCommit, rf.commitIndex, last)
 		rf.applyCond.Broadcast()
 	}
 	reply.Success = true
@@ -1274,13 +1323,15 @@ func (rf *Raft) applier() {
 			cmd := rf.log[pos].Command
 			// 成员变更条目是 raft 内部命令（I192）：不投递给上层状态机，仅原子切换
 			// 投票配置 cfg。pendingConf 同步清零，允许 leader 提议下一次变更。
-			if cc, ok := cmd.(ConfChange); ok {
-				rf.cfg = append([]int(nil), cc.NewVoters...)
-				rf.pendingConf = false
-				rf.persist()
-				rf.mu.Unlock()
-				continue
-			}
+	if cc, ok := cmd.(ConfChange); ok {
+		dbg("me=%d apply ConfChange idx=%d NewVoters=%v", rf.me, idx, cc.NewVoters)
+		rf.cfg = append([]int(nil), cc.NewVoters...)
+		rf.committedCfg = append([]int(nil), cc.NewVoters...) // 已提交配置随 applier 切换
+		rf.pendingConf = false
+		rf.persist()
+		rf.mu.Unlock()
+		continue
+	}
 			msg = ApplyMsg{
 				CommandValid: true,
 				Command:      cmd,
@@ -1354,6 +1405,7 @@ func makeRaft(peers []*ClientEnd, me int, persister Persister, applyCh chan Appl
 	for i := range peers {
 		rf.cfg[i] = i
 	}
+	rf.committedCfg = append([]int(nil), rf.cfg...) // 初始已提交配置与 cfg 一致
 
 	rf.readPersist(persister.ReadRaftState())
 	if snap := persister.ReadSnapshot(); snap != nil {

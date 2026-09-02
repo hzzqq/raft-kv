@@ -409,25 +409,36 @@ class Smoke:
     def put_retry(self, url, body, n=6, pause=0.2):
         """PUT 带重试：容忍集群 bootstrap / 故障窗口期的瞬时 503（网关熔断）或 leader
         切换抖动。仅当连续 n 次都失败才返回最后的非 200——把「瞬时不可用」与「真不可写」
-        区分开，避免混沌压测把正确行为误判为失败。"""
+        区分开，避免混沌压测把正确行为误判为失败。
+
+        网关熔断开启（503 circuit breaker open）时冷却窗固定 10s，重试得快也没用——
+        识别到熔断开启就直接睡过冷却窗（11s）再试，避免把重试额度耗在 OPEN 窗口内
+        （否则会误判为「真不可写」而非「瞬时熔断」）。"""
         last = 0
         for _ in range(n):
-            st, _ = http("PUT", url, body=body)
+            st, bdy = http("PUT", url, body=body)
             if st == 200:
                 return 200
             last = st
-            time.sleep(pause)
+            if st == 503 and "circuit breaker open" in (bdy or ""):
+                time.sleep(11.0)
+            else:
+                time.sleep(pause)
         return last
 
     def get_retry(self, url, n=6, pause=0.2):
-        """GET 带重试：用于混沌压测后的读回断言，容忍故障沉降期的瞬时 503。返回 (status, body)。"""
+        """GET 带重试：用于混沌压测后的读回断言，容忍故障沉降期的瞬时 503。返回 (status, body)。
+        同样对网关熔断开启做 11s 冷却窗等待。"""
         last_st, last_body = 0, ""
         for _ in range(n):
             st, body = http("GET", url)
             if st == 200:
                 return 200, body
             last_st, last_body = st, body
-            time.sleep(pause)
+            if st == 503 and "circuit breaker open" in (body or ""):
+                time.sleep(11.0)
+            else:
+                time.sleep(pause)
         return last_st, last_body
 
     def wait_readyz(self, gw, timeout=12.0, pause=0.3):
@@ -441,6 +452,106 @@ class Smoke:
             last = st
             time.sleep(pause)
         return last
+
+    # ---------- I192 动态重配置（Join/Leave）运维端点辅助 ----------
+    def read_voters(self, port):
+        """GET /admin/reconfigure 读取某节点所属 raft 组当前投票成员集合。"""
+        st, body = http("GET", f"http://127.0.0.1:{port}/admin/reconfigure")
+        if st == 200:
+            try:
+                d = json.loads(body)
+                return d.get("voters", None)
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+
+    def wait_leader(self, kv_ports, timeout=20.0, pause=0.5):
+        """轮询各 KV 节点 /status，直到某个节点 RaftRole==Leader。返回该节点 diag 端口，
+        超时返回 None。用于重配置前确保组 leader 已浮现（kill 副本/重启后选举需要时间）。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for port in kv_ports:
+                st, body = http("GET", f"http://127.0.0.1:{port}/status")
+                if st == 200 and '"RaftRole":"Leader"' in body:
+                    return port
+            time.sleep(pause)
+        return None
+
+    def wait_group_leaders(self, kv_ports, n_groups=1, timeout=25.0, pause=0.5):
+        """轮询各 KV 节点 /status，直到至少 n_groups 个不同节点处于 Leader 角色
+        （多组集群每组一个 leader）。用于多组预热前确保各 raft 组已选主——选主经 diag
+        端口探测，不经网关，故不会触发网关熔断。返回 True/False。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            leaders = 0
+            for port in kv_ports:
+                st, body = http("GET", f"http://127.0.0.1:{port}/status")
+                if st == 200 and '"RaftRole":"Leader"' in body:
+                    leaders += 1
+            if leaders >= n_groups:
+                return True
+            time.sleep(pause)
+        return False
+
+    def reconfigure(self, voters, kv_ports, rounds=20, pause=0.5):
+        """热提议一次成员变更：多轮尝试，每轮依次 POST /admin/reconfigure 到各 KV 节点
+        diag 端口，直到某个组 leader 接受并返回 200（非 leader 返回 409）。多轮重试吸收
+        「kill 副本/重启后 leader 尚未选出」的选举窗口，避免把正确时序误判为失败。
+        返回 (ok, resp_json)。"""
+        last = None
+        for _ in range(rounds):
+            for port in kv_ports:
+                st, body = http("POST", f"http://127.0.0.1:{port}/admin/reconfigure",
+                                body=json.dumps({"voters": voters}))
+                if st == 200:
+                    try:
+                        return True, json.loads(body)
+                    except Exception:  # noqa: BLE001
+                        return True, {"ok": True, "raw": body}
+                last = (st, body)
+            time.sleep(pause)
+        return False, {"ok": False, "last": last}
+
+    def restart_kvnode(self, label, node_name, http_port):
+        """重启一个被杀的 KV 节点：等待其旧进程（按 label 定位）退出、从 procs 移除，
+        再用同一配置以 node_name 重启（注意 label 形如 kvnode-g0-1，而 kvnode -name
+        须为节点名 g0-1，二者不同——此前误把 label 当 -name 导致进程拒启动）。
+
+        用于 I192 热降级/热恢复演练中「kill 投票副本 → 重启以重新组 quorum → Join witness」。
+        重启后轮询 /healthz 确认新进程已监听；若超时未起，dump 其日志便于定位（端口占用/崩溃）。
+        """
+        for i, (lab, p, logf) in enumerate(self.procs):
+            if lab == label:
+                try:
+                    p.wait(timeout=10)
+                except Exception:  # noqa: BLE001
+                    p.kill()
+                try:
+                    logf.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.procs.pop(i)
+                break
+        self.launch("kvnode", label,
+                    ["-config", self.cfg_path, "-name", node_name,
+                     "-http", f"127.0.0.1:{http_port}"])
+        # 确认新进程已监听（给 OS 释放旧端口 + 进程初始化留时间）
+        up = False
+        for _ in range(40):
+            st, _ = http("GET", f"http://127.0.0.1:{http_port}/healthz")
+            if st == 200:
+                up = True
+                break
+            time.sleep(0.5)
+        if not up:
+            logp = os.path.join(self.log_dir, f"{name}.log")
+            try:
+                with open(logp, encoding="utf-8", errors="replace") as f:
+                    tail = f.read().strip().splitlines()[-20:]
+            except OSError:
+                tail = ["(无日志)"]
+            self._p(f"  ! 重启 {name} 后未在 20s 内监听 {http_port}；日志末 20 行：\n"
+                    + "\n".join("    " + ln for ln in tail))
 
     def run_checks(self):
         b = self.port_base
@@ -867,6 +978,12 @@ class Smoke:
         kvadmin = os.path.join(self.bin_dir, "kvadmin" + ext)
         if not os.path.exists(kvadmin):
             return self.check("多组迁移混沌压测", False, "kvadmin 二进制不存在（构建失败？）")
+
+        # ---- 0. 预热前等各 raft 组选主（经 diag 端口探测，不经网关，不触发熔断）----
+        # 否则首批写会因「无主/未分片」连发 5xx 把网关熔断打开（阈值 5 连发即开，冷却 10s），
+        # 进而污染整段混沌压测（预热丢 key → init_val 不全 → 零丢失断言误判）。
+        mg_kv_ports = [b + 31 + g * 3 + i for g in range(2) for i in range(3)]
+        self.wait_group_leaders(mg_kv_ports, n_groups=2)
 
         # ---- 1. 预热 20 key ----
         n_keys = 20
@@ -1394,6 +1511,141 @@ class Smoke:
                          lost == 0, f"丢失={lost} " + ",".join(detail))
         return ok
 
+    def verify_witness_reconfig(self):
+        """第 18 项（I192）操作性闭环：经真实 HTTP 运维端点 /admin/reconfigure 热增删
+        witness，证「2 副本组可在不重启下升级成抗单数据副本故障、再降级回省存储 2 副本」。
+
+        初始拓扑 2 投票(g0-0,g0-1) + 1 witness(g0-w0)，witness 默认即投票（与 I189 基线一致）。
+        E1 初始 VoterConfig==[0,1,2]；E2 Leave(witness)→[0,1]，kill 一投票副本→quorum=2 不可达、
+           写失败（红态，证 Leave 生效）；E3 重启该投票副本→重新组 quorum→Join(witness)→[0,1,2]，
+           kill 一投票副本→witness 补 quorum→写成功（绿态，证 Join 恢复）；E4 重启一节点后
+           VoterConfig 仍 [0,1,2]（cfg 持久化，运维耐久）。全部经真实 TCP + 真实 HTTP 端点。
+        """
+        ok = True
+        b = self.port_base
+        gw = f"http://127.0.0.1:{b+GW_PORT}"
+        kv_ports = [b + 31, b + 32, b + 33]  # g0-0 / g0-1 / g0-w0 的 -http diag 端口
+
+        # 预热 5 key，确认初始可服务
+        warmed = 0
+        for i in range(5):
+            st, _ = http("PUT", gw + "/kv/rc%d" % i, body="rcinit-%d" % i)
+            if st == 200:
+                warmed += 1
+        ok &= self.check("Witness 重配置：预热 5 key 经 gateway 写入（初始 2 投票+1 witness）",
+                         warmed == 5, f"{warmed}/5")
+
+        # E1：初始投票配置应为 [0,1,2]（witness 默认即投票，与 I189 基线一致）
+        v0 = self.read_voters(b + 31) or self.read_voters(b + 32) or self.read_voters(b + 33)
+        ok &= self.check("Witness 重配置：初始 VoterConfig == [0,1,2]（witness 在投票集合内）",
+                         sorted(v0 or []) == [0, 1, 2], f"voters={v0}")
+
+        # E2：热 Leave（移除 witness）→ 投票集合应变为 [0,1]
+        self.wait_leader(kv_ports)  # 确保组 leader 已浮现再提议
+        ok2, r2 = self.reconfigure([0, 1], kv_ports)
+        v2 = (r2.get("voters") if isinstance(r2, dict) else None)
+        ok &= self.check("Witness 重配置：POST /admin/reconfigure Leave(witness) 被 leader 接受并生效",
+                         ok2 and sorted(v2 or []) == [0, 1],
+                         f"resp={r2}")
+        # kill 一个投票副本 g0-1，剩 g0-0(投票) + g0-w0(witness 已非投票) → quorum=2 不可达
+        victim = None
+        for name, p, _ in self.procs:
+            if name == "kvnode-g0-1":
+                victim = (name, p)
+                break
+        if victim:
+            victim[1].kill()
+            self._p("  → 已 kill g0-1（投票副本）；Leave 后仅剩 g0-0 一投票副本")
+            time.sleep(3.0)
+            put_fail = True
+            for _ in range(10):
+                st, _ = http("PUT", gw + "/kv/rc-after-leave", body="x")
+                if st == 200:
+                    put_fail = False
+                    break
+                time.sleep(0.5)
+            ok &= self.check(
+                "Witness 重配置：Leave 后 kill 一投票副本→写不可达（quorum=2 不可达，红态实证）",
+                put_fail, f"put_fail={put_fail}")
+        else:
+            ok &= self.check("Witness 重配置：找到投票副本 g0-1", False, "未找到 kvnode-g0-1")
+
+        # E3：重启 g0-1 → 重新组 quorum（[0,1]）→ 热 Join(witness) 恢复 [0,1,2]
+        self.restart_kvnode("kvnode-g0-1", "g0-1", b + 32)
+        self.wait_readyz(gw, timeout=20.0)
+        v3a = self.read_voters(b + 31) or self.read_voters(b + 32) or self.read_voters(b + 33)
+        ok &= self.check(
+            "Witness 重配置：重启投票副本后 VoterConfig 持久化 == [0,1]（Leave 已落盘）",
+            sorted(v3a or []) == [0, 1], f"voters={v3a}")
+        self.wait_leader(kv_ports)  # 重启投票副本后选举需时间，等 leader 浮现再提议
+        ok3, r3 = self.reconfigure([0, 1, 2], kv_ports)
+        v3 = (r3.get("voters") if isinstance(r3, dict) else None)
+        if not ok3:
+            # 诊断：dump 各 KV 节点角色，定位「无 leader」根因
+            diag = []
+            for p in kv_ports:
+                st, body = http("GET", f"http://127.0.0.1:{p}/status")
+                diag.append(f"port{p}:{st}:{body[:160]}")
+            self._p("  ! Join 失败诊断：" + " | ".join(diag))
+        ok &= self.check("Witness 重配置：POST /admin/reconfigure Join(witness) 被 leader 接受并生效",
+                         ok3 and sorted(v3 or []) == [0, 1, 2], f"resp={r3}")
+        # 诊断：Join 后立即 dump 三节点 cfg / role / commit，确认 Join 是否真落到 g0-1（核心分歧点）
+        if ok3:
+            self._p("  → Join 后三节点状态快照：")
+            for p in (b + 31, b + 32, b + 33):
+                st, bdy = http("GET", f"http://127.0.0.1:{p}/status", timeout=5)
+                self._p(f"    port{p}:{st}:{(bdy or '')[:300]}")
+        # Join 后 kill 一投票副本 g0-0，剩 g0-1(投票)+g0-w0(witness 重新投票)=2 → quorum=2 可达
+        victim0 = None
+        for name, p, _ in self.procs:
+            if name == "kvnode-g0-0":
+                victim0 = (name, p)
+                break
+        if victim0:
+            victim0[1].kill()
+            self._p("  → 已 kill g0-0（投票副本）；Join 后剩 g0-1 + g0-w0(witness) 两票")
+            # 等集群重新选主 + 网关熔断恢复（kill 副本会瞬时触发网关熔断，需留出冷却窗）
+            self.wait_readyz(gw, timeout=20.0)
+            self.wait_leader(kv_ports)
+            # 用长客户端超时（40s）探一次真实 PUT，区分「瞬时慢」与「真不提交」——
+            # 若 5s 短超时只是不够、实际 40s 内能提交，则属测试时序问题；若 40s 仍不提交，
+            # 则暴露 witness 是否真的能为 commit 补 quorum（设计本意：line 195-196）。
+            st_long, body_long = http("PUT", gw + "/kv/rc-after-join", body="alive", timeout=40)
+            if st_long != 200:
+                diag = []
+                for p in (b + 31, b + 32, b + 33):
+                    st, bdy = http("GET", f"http://127.0.0.1:{p}/status", timeout=5)
+                    diag.append(f"port{p}:{st}:{(bdy or '')[:320]}")
+                self._p("  ! E5 诊断(剩余节点 raft 状态)：" + " | ".join(diag))
+                self._p(f"  ! E5 PUT 真实响应：st={st_long} body={body_long!r}")
+                for label in ("kvnode-g0-1", "kvnode-g0-w0"):
+                    lp = os.path.join(self.log_dir, label + ".log")
+                    if os.path.exists(lp):
+                        self._p(f"  --- {label} 日志末 35 行 ---")
+                        try:
+                            with open(lp, encoding="utf-8", errors="replace") as _f:
+                                for _ln in _f.read().splitlines()[-35:]:
+                                    self._p("    " + _ln)
+                        except Exception:  # noqa: BLE001
+                            pass
+            put_ok = st_long if st_long == 200 else self.put_retry(gw + "/kv/rc-after-join", "alive", n=10, pause=1.0)
+            st_g, got_g = self.get_retry(gw + "/kv/rc-after-join", n=12)
+            ok &= self.check(
+                "Witness 重配置：Join 后 kill 一投票副本仍能写（witness 补 quorum 恢复绿态）",
+                put_ok == 200 and st_g == 200 and got_g.strip() == "alive",
+                f"put={put_ok} get={st_g} value={got_g.strip()!r}")
+        else:
+            ok &= self.check("Witness 重配置：找到投票副本 g0-0", False, "未找到 kvnode-g0-0")
+
+        # E4：耐久性——重启一节点后 VoterConfig 仍 [0,1,2]（cfg 持久化，运维可重复操作）
+        self.restart_kvnode("kvnode-g0-0", "g0-0", b + 31)
+        self.wait_readyz(gw, timeout=20.0)
+        v4 = self.read_voters(b + 31) or self.read_voters(b + 32) or self.read_voters(b + 33)
+        ok &= self.check(
+            "Witness 重配置：运维端触发 Join/Leave 后配置跨重启持久化（== [0,1,2]）",
+            sorted(v4 or []) == [0, 1, 2], f"voters={v4}")
+        return ok
+
     # ---------- 清理 ----------
     def cleanup(self, keep=False):
         for name, p, logf in self.procs:
@@ -1492,6 +1744,8 @@ def _run_one_witness(bin_dir, quiet, port_base, witness, mode="benefit"):
         ok = w.verify_witness_self_crash()
     elif mode == "snapshot_churn":
         ok = w.verify_witness_snapshot_churn()
+    elif mode == "reconfig":
+        ok = w.verify_witness_reconfig()
     elif witness:
         ok = w.verify_witness_benefit()
     else:
@@ -1503,13 +1757,18 @@ def _run_one_witness(bin_dir, quiet, port_base, witness, mode="benefit"):
 def run_witness_phase(bin_dir, quiet=False, port_base=19300):
     """第 18 项（I189）可独立运行的「Witness 副本容错收益」阶段。
 
-    由三个独立子阶段组成（各自独立临时目录 + 独立 data_dir，端口基一致 19300）：
+    由四个独立子阶段组成（各自独立临时目录 + 独立 data_dir，端口基一致 19300）：
       A. 2 投票 + 1 witness：kill 一个投票副本后仍可读写（quorum 由 witness 补足）；
       B. 纯 2 投票对照组：kill 一个投票副本后不可写（红态实证，去掉 witness 即转红）；
       C. 2 投票 + 1 witness：kill witness 自身后仍可读写（witness 纯冗余非脆弱点）+ 重启追平。
       D. 2 投票 + 1 witness：witness 宕机期灌 400 写强制 leader 频繁快照（日志压缩越过
          witness 冻结点），重启只能靠 InstallSnapshot（仅元数据）追平——验证存储减半型
          witness 在快照抖动下的追赶路径（设计落地的最后一根支柱）。
+      E. 2 投票 + 1 witness（I192 操作性闭环）：经真实 HTTP 运维端点 /admin/reconfigure
+         热 Leave(witness)→kill 一投票副本写不可达（红态）→ 重启该副本重新组 quorum →
+         热 Join(witness)→ 再 kill 一投票副本仍可由 witness 补 quorum 写成功（绿态）；
+         配置跨节点重启持久化。证「2 副本组可不重启地升级成抗单数据副本故障、再降级回
+         省存储 2 副本」，补全 I192 的运维最后一公里。
     把 I189 的 witness 语义从 raft 层单测（raft_witness_test.go）+ in-process 实验
     （experiments/witness.go）推进到**部署件真实多进程**证据：证明「2 存储副本 + 1 witness
     达 3 副本容错」在真实 TCP 部署下成立，且去掉 witness 即转红（检查非空绿）。
@@ -1518,7 +1777,8 @@ def run_witness_phase(bin_dir, quiet=False, port_base=19300):
     okB, resB = _run_one_witness(bin_dir, quiet, port_base, False, "control")
     okC, resC = _run_one_witness(bin_dir, quiet, port_base, True, "self_crash")
     okD, resD = _run_one_witness(bin_dir, quiet, port_base, True, "snapshot_churn")
-    return okA and okB and okC and okD, resA + resB + resC + resD
+    okE, resE = _run_one_witness(bin_dir, quiet, port_base, True, "reconfig")
+    return okA and okB and okC and okD and okE, resA + resB + resC + resD + resE
 
 
 def _write_smoke_report(smoke, ok, port_base, quiet=False):

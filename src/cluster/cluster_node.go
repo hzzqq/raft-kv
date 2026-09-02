@@ -97,6 +97,33 @@ func (n *TCPNode) Diagnostics() NodeDiagnostics {
 	return d
 }
 
+// ProposeConfChange 对本节点所属的 raft 组提议一次成员（投票配置）变更（Ongaro §6
+// 单服变更，I192）。仅当本节点是该组 leader 时生效，返回 (条目索引, 是否 leader)。
+// 运维端点 /admin/reconfigure 调用它来**热增删 witness / 副本**而不重启集群：非 leader
+// 节点返回 false，调用方应重定向到组 leader 重试。
+func (n *TCPNode) ProposeConfChange(voters []int) (int, bool) {
+	switch {
+	case n.kv != nil:
+		return n.kv.Raft().ProposeConfChange(voters)
+	case n.sm != nil:
+		return n.sm.Raft().ProposeConfChange(voters)
+	default:
+		return -1, false
+	}
+}
+
+// VoterConfig 返回本节点所属 raft 组当前已提交的投票成员集合快照（运维观测用，I192）。
+func (n *TCPNode) VoterConfig() []int {
+	switch {
+	case n.kv != nil:
+		return n.kv.Raft().VoterConfig()
+	case n.sm != nil:
+		return n.sm.Raft().VoterConfig()
+	default:
+		return nil
+	}
+}
+
 // parseNodeName 解析节点名："m<j>" → (true, j, -1, -1)；"g<g>-<r>" → (false, -1, g, r)。
 func parseNodeName(name string) (isSM bool, j, g, r int, err error) {
 	if len(name) > 1 && name[0] == 'm' {

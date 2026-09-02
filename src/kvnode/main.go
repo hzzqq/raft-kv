@@ -17,7 +17,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
+	"time"
 
 	"raftkv/src/cluster"
 )
@@ -107,6 +109,75 @@ func diagHandler(node *cluster.TCPNode) http.Handler {
 		}
 		fmt.Fprintf(w, "name=%s kind=%s config=%d\nraft : %s\nshard: %s\n",
 			d.Name, d.Kind, d.ConfigNum, raftDesc, shardDesc)
+	})
+	// 运维只读端点（I192）：返回本节点所属 raft 组当前已提交的投票成员集合，
+	// 供人工巡检 / 自动化断言观测「witness 当前是否在投票集合内」。
+	mux.HandleFunc("GET /admin/reconfigure", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"voters": node.VoterConfig(),
+		})
+	})
+	// 运维端点（I192 操作性闭环）：对本节点所属 raft 组热提议一次成员变更。
+	// 仅组 leader 接受；非 leader 返回 409，调用方应重定向到 leader 重试。
+	// 成功后等待 ConfChange 日志条目提交并切换 rf.cfg（applier 生效），再回包。
+	mux.HandleFunc("POST /admin/reconfigure", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Voters []int `json:"voters"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Voters) == 0 {
+			http.Error(w, `bad body: expect {"voters":[...]}`, http.StatusBadRequest)
+			return
+		}
+		idx, ok := node.ProposeConfChange(body.Voters)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if !ok {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":    false,
+				"error": "not leader or pending conf change; retry on group leader",
+			})
+			return
+		}
+		// 等待配置实际提交生效（applier 原子切换 rf.cfg）。
+		target := append([]int(nil), body.Voters...)
+		sort.Ints(target)
+		deadline := time.Now().Add(5 * time.Second)
+		applied := false
+		for time.Now().Before(deadline) {
+			got := node.VoterConfig()
+			g := append([]int(nil), got...)
+			sort.Ints(g)
+			if len(g) == len(target) {
+				match := true
+				for i := range target {
+					if g[i] != target[i] {
+						match = false
+						break
+					}
+				}
+				if match {
+					applied = true
+					break
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if !applied {
+			w.WriteHeader(http.StatusRequestTimeout)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":     false,
+				"error":  "config not applied within timeout",
+				"index":  idx,
+				"voters": node.VoterConfig(),
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":     true,
+			"index":  idx,
+			"voters": node.VoterConfig(),
+		})
 	})
 	return mux
 }

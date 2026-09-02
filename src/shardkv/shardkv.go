@@ -1824,3 +1824,7 @@ func (kv *ShardKV) ShardDebug() ShardDebug {
 func (kv *ShardKV) RaftStatus() raft.RaftStatus {
 	return kv.rf.Status()
 }
+
+// Raft 返回本 ShardKV 节点所属 raft 组的句柄（运维端点 /admin/reconfigure 用于热增删
+// witness / 副本，见 I192 操作性闭环）。仅暴露只读/提议接口，不暴露内部状态机写入。
+func (kv *ShardKV) Raft() *raft.Raft { return kv.rf }
