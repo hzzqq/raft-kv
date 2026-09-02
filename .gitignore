@@ -57,6 +57,15 @@ raft-kv-gateway.log
 # deploy_smoke 与 check_deploy_invariant 各用独立目录，避免 check_all 连跑时互相污染。
 .gocache_smoke/
 .gocache_invariant/
+# deploy_smoke Witness 阶段专用干净构建缓存（与 .gocache_smoke 同性质，体积大、机器相关）。
+.gocache_witness/
+# 部署冒烟 / 门禁本地运行日志（调试产物，勿提交；真实结论进 check_all / CHANGELOG）。
+*.smoke.log
+witness_smoke*.log
+inv.log
+checkall.log
+gencl.log
+coverage_drift_debug.txt
 .gopath/
 .tcp_test_out.log
 .smoke/

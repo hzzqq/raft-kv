@@ -44,13 +44,14 @@ Go 二进制：
      无脑裂双写、降级 quorum 仍可读写。这是部署路径此前唯一从未覆盖的正确性盲区
      （experiments 只在 in-process 测过多组，部署件本身从没被验证能跑多组）。
  18. Witness 副本容错收益（I189）：另起一个真实「2 投票副本 + 1 witness」组
-     （3 ShardMaster + 2 KV 投票副本 + 1 KV witness + 1 Gateway，真实 TCP），
-     写入后 kill 一个投票副本，断言仍能选主并完成 PUT/GET（quorum 由 witness 补足——
-     仅 2 份存储即达 3 副本容错）；对照组起「纯 2 投票副本」组（无 witness），kill 一个后
-     断言不可写（quorum=2 不可达），从而**红态实证**「去掉 witness 容错即转红」——
-     证明该检查非空绿。witness 永不持有状态机数据（存储减半），仅投票补 quorum，
-     故 kill 后仍可服务而纯 2 副本 kill 1 即全瘫。本项把 I189 的「存储减半型 witness」
-     语义从 raft 层单测 + in-process 实验，推进到**部署件真实进程**证据。
+     （3 ShardMaster + 2 KV 投票副本 + 1 KV witness + 1 Gateway，真实 TCP），三个子阶段：
+     (A) kill 一个投票副本，断言仍能选主并完成 PUT/GET（quorum 由 witness 补足——仅 2 份
+     存储即达 3 副本容错）；(B) 对照组「纯 2 投票副本」（无 witness），kill 一个后断言不可写
+     （quorum=2 不可达），**红态实证**「去掉 witness 容错即转红」；(C) kill witness 自身，
+     断言 2 投票副本仍可读写（witness 纯冗余非脆弱点）+ 重启 witness 后追上 leader 日志
+     （/status commit 推进）并零丢失。witness 永不持有状态机数据（存储减半），仅投票补
+     quorum。本项把 I189 的「存储减半型 witness」语义从 raft 层单测 + in-process 实验，
+     推进到**部署件真实多进程**证据（覆盖 witness 自身崩溃这一对称故障模式）。
 
 注：13/14 用标准库复刻了 Prometheus 的「抓取 + 告警求值」语义，无需 Docker / 无需
 Prometheus 二进制（本环境 wsl 黑名单 + 大文件下载被限速，二者皆不可得）；一旦取得原生
@@ -380,6 +381,27 @@ class Smoke:
         self._p(f"  [{'ok' if ok else 'FAIL'}] {name}"
                 + (f" — {detail}" if detail else ""))
         return ok
+
+    def node_commit_index(self, port):
+        """读取某 kvnode 的当前 commitIndex，兼容两种响应格式：
+
+        - kvnode 根路径 `GET /` 返回文本摘要 `raft : role=Follower term=1 commit=12 ...`
+          （这是人工巡检用的文本格式，含字面 `commit=%d`）；
+        - `GET /status` 返回 JSON Diagnostics（字段 `CommitIndex` / `commitIndex`）。
+        witness 是普通 raft 节点，两种格式都会暴露其 commitIndex。优先文本、回退 JSON。
+        """
+        st, body = http("GET", f"http://127.0.0.1:{port}/")
+        if st == 200:
+            m = re.search(r"commit=(\d+)", body)
+            if m:
+                return int(m.group(1))
+        st, body = http("GET", f"http://127.0.0.1:{port}/status")
+        if st == 200:
+            # JSON 里 raft 块的 commitIndex（go 字段名 CommitIndex；标准 json tag 走小写）
+            m = re.search(r"\"[Cc]ommitIndex\"\s*:\s*(\d+)", body)
+            if m:
+                return int(m.group(1))
+        return -1
 
     def run_checks(self):
         b = self.port_base
@@ -1129,6 +1151,85 @@ class Smoke:
             f"put_ok={put_ok}（期望不可写：证明 witness 是容错差异点）")
         return ok
 
+    def verify_witness_self_crash(self):
+        """第 18 项（I189）补强：崩溃 witness 自身（而非投票副本），证明它是纯冗余且能重加入追平。
+
+        与 verify_witness_benefit 对称：那里 kill 投票副本、witness 补 quorum；这里 kill witness
+        本身——剩 2 投票副本 = quorum 2，系统仍完全可读写（witness 是纯粹可选的冗余，不是脆弱点）。
+        随后重启 witness 进程（复用 data_dir 落盘状态），断言它追上 leader 日志（commit 推进）
+        并重新参与后续共识——证明 witness 不是死重，而是会随集群成长持续复制日志。
+        """
+        ok = True
+        b = self.port_base
+        gw = f"http://127.0.0.1:{b+GW_PORT}"
+
+        warmed = 0
+        for i in range(5):
+            k = f"ws{i}"
+            st, _ = http("PUT", gw + "/kv/" + k, body=f"wsinit-{i}")
+            if st == 200:
+                warmed += 1
+        ok &= self.check("Witness 自身崩溃：预热 5 key 经 gateway 写入", warmed == 5, f"{warmed}/5")
+
+        # kill 的是 witness 本身（g0-w0），不是投票副本
+        victim = None
+        for name, p, _ in self.procs:
+            if name == "kvnode-g0-w0":
+                victim = (name, p)
+                break
+        if not victim:
+            return self.check("Witness 自身崩溃：找到 witness g0-w0", False, "未找到 kvnode-g0-w0")
+        victim[1].kill()
+        self._p("  → 已 kill g0-w0（witness 本身）；剩 g0-0 + g0-1 两投票副本 = quorum 2")
+        time.sleep(3.0)
+
+        # 剩 2 投票副本仍 quorum 2 → 仍可读写（witness 纯冗余）
+        st, _ = http("PUT", gw + "/kv/ws-after-witness-kill", body="alive")
+        st2, got2 = http("GET", gw + "/kv/ws-after-witness-kill")
+        ok &= self.check(
+            "Witness 自身崩溃后仍可读写（2 投票副本 = quorum 2，witness 纯冗余非脆弱点）",
+            st == 200 and st2 == 200 and got2.strip() == "alive",
+            f"put={st} get={st2} value={got2.strip()!r}")
+
+        # 重启 witness（复用 data_dir），应追上 leader 日志。
+        # 先等被 kill 进程释放端口（Windows TIME_WAIT），避免重绑失败。
+        time.sleep(2.0)
+        self.launch("kvnode", "kvnode-g0-w0",
+                    ["-config", self.cfg_path, "-name", "g0-w0",
+                     "-http", f"127.0.0.1:{b+33}"])
+        self._p("  → 已重启 g0-w0（witness）；等待其重新监听并追上 leader 日志")
+        # 等 witness /healthz 可达（进程已起、端口已绑），最多 ~8s
+        up = False
+        for _ in range(16):
+            st, _ = http("GET", f"http://127.0.0.1:{b+33}/healthz")
+            if st == 200:
+                up = True
+                break
+            time.sleep(0.5)
+        # 触发一次新写，再轮询 witness commit 是否推进（证明追平到新写入）
+        http("PUT", gw + "/kv/ws-rejoin-write", body="rejoined")
+        c0 = self.node_commit_index(b + 33) if up else -1
+        caught = False
+        for _ in range(20):
+            cur = self.node_commit_index(b + 33)
+            if cur > c0:
+                caught = True
+                break
+            time.sleep(0.5)
+        ok &= self.check(
+            "Witness 重加入后追上 leader 日志（commit 推进）",
+            caught, f"重启后可达={up} 重启时 commit={c0}")
+
+        # 重加入后已确认写零丢失
+        lost = 0
+        for i in range(5):
+            k = f"ws{i}"
+            st, got = http("GET", gw + "/kv/" + k)
+            if st != 200 or got.strip() != f"wsinit-{i}":
+                lost += 1
+        ok &= self.check("Witness 重加入后已确认写零丢失", lost == 0, f"丢失={lost}")
+        return ok
+
     # ---------- 清理 ----------
     def cleanup(self, keep=False):
         for name, p, logf in self.procs:
@@ -1186,11 +1287,13 @@ def run_multigroup_phase(bin_dir, quiet=False, port_base=19200):
     return ok, mg.results
 
 
-def _run_one_witness(bin_dir, quiet, port_base, witness):
-    """起一个独立临时目录的真实 Witness 集群（witness=True 或 False），跑对应检查后清理。
+def _run_one_witness(bin_dir, quiet, port_base, witness, mode="benefit"):
+    """起一个独立临时目录的真实 Witness 集群，跑对应检查后清理。
 
     每个子阶段用各自独立的 tempdir + 独立 data_dir（避免跨阶段 raft 状态落盘污染），
-    阶段间进程已完全关停、端口释放，故可复用同一端口基 19300。返回 (ok, results)。
+    阶段间进程已完全关停、端口释放，故可复用同一端口基 19300。
+    mode: "benefit"（kill 投票副本仍可读写）/ "control"（纯 2 投票对照组，kill 后不可写）/
+          "self_crash"（kill witness 自身仍可读写 + 重加入追平）。返回 (ok, results)。
     """
     wd = tempfile.mkdtemp(prefix="raftkv_witness_")
     w = Smoke(port_base, wd, quiet=quiet)
@@ -1203,14 +1306,21 @@ def _run_one_witness(bin_dir, quiet, port_base, witness):
         if os.path.exists(src):
             shutil.copy(src, os.path.join(w.bin_dir, pkg + ext))
     if not quiet:
-        kind = "2 投票 + 1 witness" if witness else "纯 2 投票（无 witness）"
+        if mode == "self_crash":
+            kind = "2 投票 + 1 witness（崩溃 witness 自身 + 重加入追平）"
+        elif witness:
+            kind = "2 投票 + 1 witness"
+        else:
+            kind = "纯 2 投票（无 witness）"
         print(f"\n=== I189 Witness 阶段（端口基 {port_base}，{kind}）===")
     w.write_config_witness(witness=witness)
     w.start_all_witness()
     if not w.wait_ready_witness():
         w.cleanup()
         return False, w.results
-    if witness:
+    if mode == "self_crash":
+        ok = w.verify_witness_self_crash()
+    elif witness:
         ok = w.verify_witness_benefit()
     else:
         ok = w.verify_control_unavailable()
@@ -1221,16 +1331,18 @@ def _run_one_witness(bin_dir, quiet, port_base, witness):
 def run_witness_phase(bin_dir, quiet=False, port_base=19300):
     """第 18 项（I189）可独立运行的「Witness 副本容错收益」阶段。
 
-    由两个独立子阶段组成（各自独立临时目录 + 独立 data_dir，端口基一致 19300）：
+    由三个独立子阶段组成（各自独立临时目录 + 独立 data_dir，端口基一致 19300）：
       A. 2 投票 + 1 witness：kill 一个投票副本后仍可读写（quorum 由 witness 补足）；
-      B. 纯 2 投票对照组：kill 一个投票副本后不可写（红态实证，去掉 witness 即转红）。
+      B. 纯 2 投票对照组：kill 一个投票副本后不可写（红态实证，去掉 witness 即转红）；
+      C. 2 投票 + 1 witness：kill witness 自身后仍可读写（witness 纯冗余非脆弱点）+ 重启追平。
     把 I189 的 witness 语义从 raft 层单测（raft_witness_test.go）+ in-process 实验
     （experiments/witness.go）推进到**部署件真实多进程**证据：证明「2 存储副本 + 1 witness
     达 3 副本容错」在真实 TCP 部署下成立，且去掉 witness 即转红（检查非空绿）。
     """
-    okA, resA = _run_one_witness(bin_dir, quiet, port_base, True)
-    okB, resB = _run_one_witness(bin_dir, quiet, port_base, False)
-    return okA and okB, resA + resB
+    okA, resA = _run_one_witness(bin_dir, quiet, port_base, True, "benefit")
+    okB, resB = _run_one_witness(bin_dir, quiet, port_base, False, "control")
+    okC, resC = _run_one_witness(bin_dir, quiet, port_base, True, "self_crash")
+    return okA and okB and okC, resA + resB + resC
 
 
 def _write_smoke_report(smoke, ok, port_base, quiet=False):
