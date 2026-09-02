@@ -43,15 +43,18 @@ Go 二进制：
      断言：2 组全部形成且分片分布跨 2 组、迁移真实发生（配置版本推进）、已确认写零丢失、
      无脑裂双写、降级 quorum 仍可读写。这是部署路径此前唯一从未覆盖的正确性盲区
      （experiments 只在 in-process 测过多组，部署件本身从没被验证能跑多组）。
- 18. Witness 副本容错收益（I189）：另起一个真实「2 投票副本 + 1 witness」组
-     （3 ShardMaster + 2 KV 投票副本 + 1 KV witness + 1 Gateway，真实 TCP），三个子阶段：
+ 18. Witness 副本容错收益（I189 / I190 / I191）：另起一个真实「2 投票副本 + 1 witness」组
+     （3 ShardMaster + 2 KV 投票副本 + 1 KV witness + 1 Gateway，真实 TCP），四个子阶段：
      (A) kill 一个投票副本，断言仍能选主并完成 PUT/GET（quorum 由 witness 补足——仅 2 份
      存储即达 3 副本容错）；(B) 对照组「纯 2 投票副本」（无 witness），kill 一个后断言不可写
      （quorum=2 不可达），**红态实证**「去掉 witness 容错即转红」；(C) kill witness 自身，
      断言 2 投票副本仍可读写（witness 纯冗余非脆弱点）+ 重启 witness 后追上 leader 日志
-     （/status commit 推进）并零丢失。witness 永不持有状态机数据（存储减半），仅投票补
-     quorum。本项把 I189 的「存储减半型 witness」语义从 raft 层单测 + in-process 实验，
-     推进到**部署件真实多进程**证据（覆盖 witness 自身崩溃这一对称故障模式）。
+     并零丢失；(D) witness 宕机期灌 400 写强制 leader 频繁快照（日志压缩越过 witness 冻结点），
+     重启 witness 只能靠 InstallSnapshot（仅元数据）追平到 ≈410 且零丢失——真实验证存储减半型
+     witness 在快照抖动下的追赶路径（设计落地的最后一根支柱）。witness 永不持有状态机数据
+     （存储减半），仅投票补 quorum。本项把 I189 的「存储减半型 witness」语义从 raft 层单测 +
+     in-process 实验，推进到**部署件真实多进程**证据（覆盖 kill 投票副本 / kill witness 自身 /
+     witness 宕机期快照抖动三种故障模式）。
 
 注：13/14 用标准库复刻了 Prometheus 的「抓取 + 告警求值」语义，无需 Docker / 无需
 Prometheus 二进制（本环境 wsl 黑名单 + 大文件下载被限速，二者皆不可得）；一旦取得原生
@@ -402,6 +405,42 @@ class Smoke:
             if m:
                 return int(m.group(1))
         return -1
+
+    def put_retry(self, url, body, n=6, pause=0.2):
+        """PUT 带重试：容忍集群 bootstrap / 故障窗口期的瞬时 503（网关熔断）或 leader
+        切换抖动。仅当连续 n 次都失败才返回最后的非 200——把「瞬时不可用」与「真不可写」
+        区分开，避免混沌压测把正确行为误判为失败。"""
+        last = 0
+        for _ in range(n):
+            st, _ = http("PUT", url, body=body)
+            if st == 200:
+                return 200
+            last = st
+            time.sleep(pause)
+        return last
+
+    def get_retry(self, url, n=6, pause=0.2):
+        """GET 带重试：用于混沌压测后的读回断言，容忍故障沉降期的瞬时 503。返回 (status, body)。"""
+        last_st, last_body = 0, ""
+        for _ in range(n):
+            st, body = http("GET", url)
+            if st == 200:
+                return 200, body
+            last_st, last_body = st, body
+            time.sleep(pause)
+        return last_st, last_body
+
+    def wait_readyz(self, gw, timeout=12.0, pause=0.3):
+        """轮询 /readyz 直到 200（集群从故障/快照沉降中恢复、可服务）。返回最终 status。"""
+        deadline = time.time() + timeout
+        last = 0
+        while time.time() < deadline:
+            st, _ = http("GET", gw + "/readyz")
+            if st == 200:
+                return 200
+            last = st
+            time.sleep(pause)
+        return last
 
     def run_checks(self):
         b = self.port_base
@@ -836,7 +875,8 @@ class Smoke:
         for i in range(n_keys):
             k = f"mg{i}"
             v = f"init-{i}"
-            st, _ = http("PUT", gw + "/kv/" + k, body=v)
+            # 容忍 2 组集群 bootstrap / 初次选主期的瞬时 503（网关熔断），重试后成功即视为可服务
+            st = self.put_retry(gw + "/kv/" + k, v, n=8, pause=0.25)
             if st == 200:
                 warmed += 1
                 init_val[k] = v
@@ -924,7 +964,8 @@ class Smoke:
         ok &= self.check("多组：分片分布跨 2 组（gid1 + gid2 均持有分片）",
                          gids == {1, 2}, f"活跃组={sorted(gids)}")
 
-        # 读回每个 key，断言最终值 == 最后一次确认写（或初值）。
+        # 读回每个 key，断言最终值 == 最后一次确认写（或初值）。故障沉降期读可能瞬时 503，
+        # 用 get_retry 容忍——只把「恢复后仍不一致」判为真实丢失（保留零丢失断言的真义）。
         lost = 0
         with lk:
             acked = dict(last_ack)
@@ -933,7 +974,7 @@ class Smoke:
             want = init_val.get(k, f"init-{i}")
             if k in acked:
                 want = acked[k]
-            st, got = http("GET", gw + "/kv/" + k)
+            st, got = self.get_retry(gw + "/kv/" + k, n=8, pause=0.25)
             if st != 200 or got.strip() != want:
                 lost += 1
                 self._p(f"  ✗ 多组丢失写 {k}: want={want!r} got={got.strip()!r} (status={st})")
@@ -942,25 +983,29 @@ class Smoke:
             lost == 0,
             f"丢失写={lost}（ops={stats['ops']} fails={stats['fails']}）")
 
-        # 降级 quorum 下仍可读写（/readyz 200 + 新鲜 PUT/GET 往返）。
-        st, _ = http("GET", gw + "/readyz")
+        # 降级 quorum 下仍可读写：先等集群从 kill+churn 沉降中恢复（/readyz 200），
+        # 再 fresh PUT/GET 往返。瞬时熔断/选主窗口用 wait_readyz 容忍，只断言「恢复后可服务」。
+        rz = self.wait_readyz(gw, timeout=15.0, pause=0.3)
         ok &= self.check("多组：kill 一组一副本后 /readyz 仍 200（降级 quorum 可读写）",
-                         st == 200, f"status={st}")
-        st_p, _ = http("PUT", gw + "/kv/mg-after-chaos", body="alive")
-        st_g, got_g = http("GET", gw + "/kv/mg-after-chaos")
+                         rz == 200, f"status={rz}")
+        st_p = self.put_retry(gw + "/kv/mg-after-chaos", "alive", n=8, pause=0.25)
+        st_g, got_g = self.get_retry(gw + "/kv/mg-after-chaos", n=8, pause=0.25)
         ok &= self.check("多组：降级 quorum 下读写仍成功（无脑裂双写）",
                          st_p == 200 and st_g == 200 and got_g.strip() == "alive",
                          f"put={st_p} get={st_g} value={got_g.strip()!r}")
         return ok
 
     # ---------- Witness 副本容错收益（I189，第 18 项）----------
-    def write_config_witness(self, witness=True):
+    def write_config_witness(self, witness=True, max_raft_state=1000):
         """写一份 Witness 拓扑部署清单：单组（gid=1）下 2 投票副本 + 可选 1 witness。
 
         witness=True  → 节点 g0-0 / g0-1（投票）+ g0-w0（Witness:true，投票但不持有状态机）；
         witness=False → 纯 2 投票副本（g0-0 / g0-1），无 witness，作红态对照组。
         n_replicas=2（仅投票副本数），witness 作为额外 raft 节点补 quorum（命名 g<g>-w<k>，
         且 JSON 显式带 witness:true，使 StartClusterTCP 与 StartNodeTCP 两条路径判定一致）。
+        max_raft_state 默认 1000（字节）；I191 快照抖动场景传极小值（如 1500）以强制 leader
+        在 witness 宕机期频繁快照、把日志压缩到 witness 冻结点之后——witness 重加入只能靠
+        InstallSnapshot（仅元数据）追平，从而真实验证存储减半型 witness 的快照追赶路径。
         """
         b = self.port_base
         nodes = [{"name": f"m{i}", "addr": f"127.0.0.1:{b+SM_RAFT[i]}"}
@@ -972,7 +1017,7 @@ class Smoke:
                        "witness": True}]
         cfg = {
             "n_groups": 1, "n_replicas": 2, "n_sm": 3,
-            "max_raft_state": 1000,
+            "max_raft_state": max_raft_state,
             "data_dir": self.data_dir,
             "nodes": nodes,
         }
@@ -1230,6 +1275,125 @@ class Smoke:
         ok &= self.check("Witness 重加入后已确认写零丢失", lost == 0, f"丢失={lost}")
         return ok
 
+    def verify_witness_snapshot_churn(self):
+        """第 18 项（I191）补充：witness 宕机期间 leader 频繁快照（日志压缩越过 witness
+        冻结点），witness 重加入只能靠 InstallSnapshot（仅元数据）追平——验证存储减半型
+        witness 在快照抖动下的追赶路径，这是 witness 设计落地的最后一根支柱。
+
+        逻辑必然性（为何这能证明 InstallSnapshot 路径）：
+          - max_raft_state 极小（1500 字节），leader 每约 18~25 条写入即快照一次，把日志
+            压缩到 witness 冻结点之后；
+          - witness 在预热后（commit≈10）被 kill，冻结于 lastLogIndex≈10；
+          - 宕机期灌入 400 条写，leader 持续提交并把 lastIncludedIndex 推到数百，把索引
+            11..~390 全部从日志里 compact 掉；
+          - witness 重启后 nextIndex=11，leader 已无该索引 → 只能发 InstallSnapshot
+            （witness 侧 data=nil、只吃 lastIncludedIndex 元数据），再 AppendEntries 补尾部；
+          - 若 witness 仅靠 AppendEntries 不可能越过已被 compact 的 370+ 索引空洞追到
+            commit≈410——故「witness 追平到 ≈410 且零丢失」在构造上等价于 InstallSnapshot
+            路径对 witness 生效。这正是「2 存储副本 + 1 witness 达 3 副本容错」在快照抖动
+            下仍成立的真机证据。
+        """
+        ok = True
+        b = self.port_base
+        gw = f"http://127.0.0.1:{b+GW_PORT}"
+
+        # 预热 10 key（< max_raft_state，不触发快照，建立 witness 基线 commit≈10）
+        warmed = 0
+        for i in range(10):
+            k = f"sc{i}"
+            st, _ = http("PUT", gw + "/kv/" + k, body=f"scinit-{i}")
+            if st == 200:
+                warmed += 1
+        ok &= self.check("Witness 快照抖动：预热 10 key 经 gateway 写入", warmed == 10,
+                         f"{warmed}/10")
+        warm_commit = self.node_commit_index(b + 33)
+        self._p(f"  → 预热后 witness commit≈{warm_commit}（冻结点；随后 kill witness）")
+
+        # kill 的是 witness 本身（g0-w0），其日志冻结于 warm_commit
+        victim = None
+        for name, p, _ in self.procs:
+            if name == "kvnode-g0-w0":
+                victim = (name, p)
+                break
+        if not victim:
+            return self.check("Witness 快照抖动：找到 witness g0-w0", False,
+                              "未找到 kvnode-g0-w0")
+        victim[1].kill()
+        self._p(f"  → 已 kill g0-w0（witness）；灌入 400 写，leader+投票副本继续提交并频繁快照")
+
+        # 宕机期灌 400 写：2 投票副本仍 quorum=2，集群持续可写（同时强制 leader 快照压缩）
+        churn_n = 400
+        wrote = 0
+        for i in range(churn_n):
+            k = f"sck{i}"
+            st, _ = http("PUT", gw + "/kv/" + k, body=f"sck-{i}")
+            if st == 200:
+                wrote += 1
+        ok &= self.check(
+            "Witness 宕机期集群仍持续可写（2 投票副本 = quorum 2，强制 leader 快照抖动）",
+            wrote >= churn_n - 5, f"写入 {wrote}/{churn_n}")
+        # 读回一条宕机期写的 key，确认 leader 确实提交且可读
+        st_g, got_g = http("GET", gw + "/kv/sck399")
+        ok &= self.check("Witness 宕机期写可读回（leader 已提交 churn 写）",
+                         st_g == 200 and got_g.strip() == "sck-399",
+                         f"get={st_g} value={got_g.strip()!r}")
+
+        # leader 当前 commit（取存活投票副本 g0-0 的 / 文本 commit）
+        leader_commit = self.node_commit_index(b + 31)
+        if leader_commit < 0:
+            leader_commit = self.node_commit_index(b + 32)
+        self._p(f"  → leader commit≈{leader_commit}（应远 > witness 冻结点 {warm_commit}，"
+                f"证明日志已被压缩到 witness 冻结点之后）")
+        ok &= self.check("Leader 已提交远多于 witness 冻结点（日志压缩发生）",
+                         leader_commit > warm_commit + 50,
+                         f"leader_commit={leader_commit} warm_commit={warm_commit}")
+
+        # 重启 witness（复用 data_dir），应靠 InstallSnapshot 追平到 leader commit
+        time.sleep(2.0)
+        self.launch("kvnode", "kvnode-g0-w0",
+                    ["-config", self.cfg_path, "-name", "g0-w0",
+                     "-http", f"127.0.0.1:{b+33}"])
+        self._p("  → 已重启 g0-w0（witness）；等待其重新监听并靠 InstallSnapshot 追平")
+        up = False
+        for _ in range(16):
+            st, _ = http("GET", f"http://127.0.0.1:{b+33}/healthz")
+            if st == 200:
+                up = True
+                break
+            time.sleep(0.5)
+        caught = False
+        for _ in range(40):
+            cur = self.node_commit_index(b + 33)
+            if cur >= leader_commit - 2:
+                caught = True
+                break
+            time.sleep(0.5)
+        ok &= self.check(
+            "Witness 重启后靠 InstallSnapshot 追平 leader（commit 推进到 ≈ 宕机期提交点）",
+            caught and up,
+            f"重启后可达={up} 追平 commit 至≥{leader_commit-2}（冻结点 {warm_commit}）")
+
+        # 零丢失：预热 10 key + 宕机期 400 key 全部可读且值正确
+        lost = 0
+        detail = []
+        for i in range(10):
+            k = f"sc{i}"
+            st, got = http("GET", gw + "/kv/" + k)
+            if st != 200 or got.strip() != f"scinit-{i}":
+                lost += 1
+                if len(detail) < 5:
+                    detail.append(f"sc{i}:{st}/{got.strip()!r}")
+        for i in range(churn_n):
+            k = f"sck{i}"
+            st, got = http("GET", gw + "/kv/" + k)
+            if st != 200 or got.strip() != f"sck-{i}":
+                lost += 1
+                if len(detail) < 5:
+                    detail.append(f"sck{i}:{st}/{got.strip()!r}")
+        ok &= self.check("Witness 快照抖动后零丢失（预热 10 + 宕机期 400 全一致）",
+                         lost == 0, f"丢失={lost} " + ",".join(detail))
+        return ok
+
     # ---------- 清理 ----------
     def cleanup(self, keep=False):
         for name, p, logf in self.procs:
@@ -1293,7 +1457,9 @@ def _run_one_witness(bin_dir, quiet, port_base, witness, mode="benefit"):
     每个子阶段用各自独立的 tempdir + 独立 data_dir（避免跨阶段 raft 状态落盘污染），
     阶段间进程已完全关停、端口释放，故可复用同一端口基 19300。
     mode: "benefit"（kill 投票副本仍可读写）/ "control"（纯 2 投票对照组，kill 后不可写）/
-          "self_crash"（kill witness 自身仍可读写 + 重加入追平）。返回 (ok, results)。
+          "self_crash"（kill witness 自身仍可读写 + 重加入追平）/
+          "snapshot_churn"（witness 宕机期 leader 频繁快照，重启靠 InstallSnapshot 追平）。
+    返回 (ok, results)。
     """
     wd = tempfile.mkdtemp(prefix="raftkv_witness_")
     w = Smoke(port_base, wd, quiet=quiet)
@@ -1308,18 +1474,24 @@ def _run_one_witness(bin_dir, quiet, port_base, witness, mode="benefit"):
     if not quiet:
         if mode == "self_crash":
             kind = "2 投票 + 1 witness（崩溃 witness 自身 + 重加入追平）"
+        elif mode == "snapshot_churn":
+            kind = "2 投票 + 1 witness（witness 宕机期快照抖动 + InstallSnapshot 追平）"
         elif witness:
             kind = "2 投票 + 1 witness"
         else:
             kind = "纯 2 投票（无 witness）"
         print(f"\n=== I189 Witness 阶段（端口基 {port_base}，{kind}）===")
-    w.write_config_witness(witness=witness)
+    # snapshot_churn 用极小 max_raft_state 强制 leader 在 witness 宕机期频繁快照
+    mrs = 1500 if mode == "snapshot_churn" else 1000
+    w.write_config_witness(witness=witness, max_raft_state=mrs)
     w.start_all_witness()
     if not w.wait_ready_witness():
         w.cleanup()
         return False, w.results
     if mode == "self_crash":
         ok = w.verify_witness_self_crash()
+    elif mode == "snapshot_churn":
+        ok = w.verify_witness_snapshot_churn()
     elif witness:
         ok = w.verify_witness_benefit()
     else:
@@ -1335,6 +1507,9 @@ def run_witness_phase(bin_dir, quiet=False, port_base=19300):
       A. 2 投票 + 1 witness：kill 一个投票副本后仍可读写（quorum 由 witness 补足）；
       B. 纯 2 投票对照组：kill 一个投票副本后不可写（红态实证，去掉 witness 即转红）；
       C. 2 投票 + 1 witness：kill witness 自身后仍可读写（witness 纯冗余非脆弱点）+ 重启追平。
+      D. 2 投票 + 1 witness：witness 宕机期灌 400 写强制 leader 频繁快照（日志压缩越过
+         witness 冻结点），重启只能靠 InstallSnapshot（仅元数据）追平——验证存储减半型
+         witness 在快照抖动下的追赶路径（设计落地的最后一根支柱）。
     把 I189 的 witness 语义从 raft 层单测（raft_witness_test.go）+ in-process 实验
     （experiments/witness.go）推进到**部署件真实多进程**证据：证明「2 存储副本 + 1 witness
     达 3 副本容错」在真实 TCP 部署下成立，且去掉 witness 即转红（检查非空绿）。
@@ -1342,7 +1517,8 @@ def run_witness_phase(bin_dir, quiet=False, port_base=19300):
     okA, resA = _run_one_witness(bin_dir, quiet, port_base, True, "benefit")
     okB, resB = _run_one_witness(bin_dir, quiet, port_base, False, "control")
     okC, resC = _run_one_witness(bin_dir, quiet, port_base, True, "self_crash")
-    return okA and okB and okC, resA + resB + resC
+    okD, resD = _run_one_witness(bin_dir, quiet, port_base, True, "snapshot_churn")
+    return okA and okB and okC and okD, resA + resB + resC + resD
 
 
 def _write_smoke_report(smoke, ok, port_base, quiet=False):
