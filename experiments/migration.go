@@ -6,8 +6,9 @@
 //  1. 起 2 组 × 3 副本，预热 20 个 key（散落各分片）；
 //  2. 注入组合故障：kill 第 1 组一个副本（剩 2/3 仍 quorum），并在 Churn 中段对第 0 组
 //     注入真网络分裂 [0] | [1,2]（多数派 [1,2] 仍 quorum，避免停滞），同时在中段对第 1 组
-//     注入一次 Leave(1)+Join(1) 配置抖动（临时移除再重新加入、分片回流）——形成
-//     「跨组 rebalance + 一组一副本崩溃 + 一组一副本网络分区 + 配置抖动」四重并发故障；
+//     注入一次 Leave(1)+Join(1) 配置抖动（临时移除再重新加入、分片回流），并在分区中段
+//     做「愈合→再分裂」振荡（双波分裂），把单波分区升级为双波分区故障——形成
+//     「跨组 rebalance + 一组一副本崩溃 + 一组一副本网络分区 + 配置抖动 + 分区振荡」五重并发故障；
 //  3. 并发客户端在 Churn 跨组漂移（40 轮、每 120ms 迁一个分片到另一组）期间持续写，
 //     只记录每次被确认（OK）的写；
 //  4. 迁移结束后等配置全推进 + 数据沉降，读回每个 key，断言：
@@ -93,7 +94,7 @@ func runMigration() {
 	// 触发跨组 churn：每 120ms 把下一号分片迁到另一组，制造可控的多组并发迁移。
 	// 为模拟「迁移期间叠加网络分区」的最硬组合故障，把单次 churn 拆成三段，中段注入
 	// 第 0 组的真网络分裂（[0] 与 [1,2] 不互通，多数派 [1,2] 仍 quorum，迁移不停滞），
-	// 形成「跨组 rebalance + 第 1 组一副本崩溃 + 第 0 组一副本网络分区」三重并发故障。
+	// 形成「跨组 rebalance + 第 1 组一副本崩溃 + 第 0 组一副本网络分区」基础三重并发故障。
 	c.Churn(15, 120*time.Millisecond, 1)
 	log("前段 churn 完成；注入第 0 组网络分区 [0] | [1,2]（多数派 [1,2] 仍 quorum）")
 	partStart := time.Now()
@@ -103,8 +104,12 @@ func runMigration() {
 	// 「Leave(1)+Join(1)」配置抖动——临时把第 1 组（其已有一副本崩溃）移出再重新加入，
 	// 制造 ShardMaster 配置版本 bump 与分片回流。形成
 	// 「跨组 rebalance + 一组一副本崩溃 + 一组一副本网络分区 + 配置抖动」四重并发故障。
+	// 进一步在 i==11 做「分区愈合→立即再分裂」振荡：组 0 经历第二次 [0]|[1,2] 分裂，
+	// 强制二次 leader 重选 + 二次配置再收敛——把单波分区升级为双波分区故障（五重并发故障）。
 	// Move 的目标组取 i%nG（∈{0,1}），且 Leave/Join 在同一次迭代内成对完成（间隔仅 ~150ms），
 	// 不会让 churn 把分片 Move 到一个长时间不存在的组，避免产生孤儿分片导致收敛过慢。
+	splitWaves := 1
+	totalPartMs := int64(0)
 	for i := 0; i < 15; i++ {
 		c.Move((i*1)%shardmaster.NShards, i%nG)
 		if i == 7 {
@@ -114,12 +119,23 @@ func runMigration() {
 			c.Join(1)
 			log("中段配置抖动完成：Join(1) 重新加入第 1 组，分片回流")
 		}
+		if i == 11 && splitWaves == 1 {
+			// 愈合第一波，立即再分裂（分区振荡）：组 0 第二次 [0]|[1,2] 分裂，
+			// 多数派 [1,2] 仍 quorum，但系统被迫二次重选 leader + 二次推进配置。
+			c.PartitionKV(0)
+			totalPartMs += time.Since(partStart).Milliseconds()
+			c.PartitionKV(0, []int{0}, []int{1, 2})
+			partStart = time.Now()
+			splitWaves = 2
+			log("第一波分区愈合后立即再分裂（分区振荡）：组0 第二次 [0]|[1,2]，强制二次 leader 重选 + 配置再收敛")
+		}
 		time.Sleep(120 * time.Millisecond)
 	}
 
-	c.PartitionKV(0) // 愈合第 0 组网络分区，恢复全连通
-	partitionMs := time.Since(partStart).Milliseconds()
-	log("中段 churn（分区活跃 ~%dms）+ 配置抖动完成；已愈合第 0 组网络分区", partitionMs)
+	c.PartitionKV(0) // 最终愈合第 0 组网络分区，恢复全连通
+	totalPartMs += time.Since(partStart).Milliseconds()
+	partitionMs := totalPartMs
+	log("中段 churn（分区活跃 ~%dms，含双波分裂振荡）+ 配置抖动完成；已愈合第 0 组网络分区", partitionMs)
 	c.Churn(10, 120*time.Millisecond, 1)
 	close(stop)
 	wg.Wait()
@@ -156,7 +172,7 @@ func runMigration() {
 		}
 	}
 	if lost == 0 {
-		log("✓ [migration] 跨组迁移 + 副本崩溃 + 网络分区 + 配置抖动四重故障期间：所有被确认写零丢失（%d 请求 / %d 失败 / 分区窗口 %dms），无脑裂双写",
+		log("✓ [migration] 跨组迁移 + 副本崩溃 + 网络分区 + 配置抖动 + 分区振荡（双波分裂）五重并发故障期间：所有被确认写零丢失（%d 请求 / %d 失败 / 分区窗口 %dms），无脑裂双写",
 			totalOps, totalFails, partitionMs)
 	}
 
@@ -170,7 +186,7 @@ func runMigration() {
 		Fails:       totalFails,
 		LostWrites:  lost,
 		DownMs:      float64(partitionMs),
-		Conclusion:  fmt.Sprintf("跨组迁移+副本崩溃+网络分区+配置抖动：%d 请求/%d 失败/%dms 分区窗口，丢失写=%d（ok=%v）", totalOps, totalFails, partitionMs, lost, lost == 0),
+		Conclusion:  fmt.Sprintf("跨组迁移+副本崩溃+网络分区+配置抖动+分区振荡(双波)：%d 请求/%d 失败/%dms 分区窗口，丢失写=%d（ok=%v）", totalOps, totalFails, partitionMs, lost, lost == 0),
 		Ok:          lost == 0,
 	})
 
