@@ -148,9 +148,18 @@ func buildEndFactory(addrs []TCPNodeAddr) (func(string) *raft.ClientEnd, *[]*tra
 // StartNodeTCP 在本进程启动地址清单中名为 name 的**单个**节点并开始对外服务。
 // cfg.DataDir 非空则该节点状态落盘（崩溃后同目录重启即恢复）。
 func StartNodeTCP(cfg ClusterTCPConfig, name string) (*TCPNode, error) {
-	isSM, j, g, r, err := parseNodeName(name)
-	if err != nil {
-		return nil, err
+	// witness 节点名 "g<g>-w<k>" 不参与普通 parseNodeName（会失败），先判定。
+	isWitnessNode := false
+	isSM, j, g, r := false, -1, -1, -1
+	if wg, _, ok := parseWitnessName(name); ok {
+		isWitnessNode = true
+		g = wg
+	} else {
+		var perr error
+		isSM, j, g, r, perr = parseNodeName(name)
+		if perr != nil {
+			return nil, perr
+		}
 	}
 	var addr string
 	for _, a := range cfg.Nodes {
@@ -206,15 +215,34 @@ func StartNodeTCP(cfg ClusterTCPConfig, name string) (*TCPNode, error) {
 			}
 		}
 	} else {
-		if g >= cfg.NGroups || r >= cfg.NReplicas {
-			return nil, fmt.Errorf("StartNodeTCP: %s 超出 n_groups=%d/n_replicas=%d", name, cfg.NGroups, cfg.NReplicas)
+		if g >= cfg.NGroups {
+			return nil, fmt.Errorf("StartNodeTCP: %s 超出 n_groups=%d", name, cfg.NGroups)
 		}
-		peers := make([]*raft.ClientEnd, cfg.NReplicas)
-		for r2 := 0; r2 < cfg.NReplicas; r2++ {
-			peers[r2] = makeEnd(fmt.Sprintf("g%d-%d", g, r2))
+		if !isWitnessNode && r >= cfg.NReplicas {
+			return nil, fmt.Errorf("StartNodeTCP: %s 超出 n_replicas=%d", name, cfg.NReplicas)
+		}
+		// 构造本组 raft peers：投票副本 + witness（顺序同 StartClusterTCP / groupPeerNames）。
+		names := groupPeerNames(cfg, g)
+		idx := -1
+		for i, nm := range names {
+			if nm == name {
+				idx = i
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("StartNodeTCP: 配置缺少本组节点 %q", name)
+		}
+		peers := make([]*raft.ClientEnd, len(names))
+		for i, nm := range names {
+			peers[i] = makeEnd(nm)
 		}
 		applyCh := make(chan raft.ApplyMsg, 4000)
-		rf := raft.Make(peers, r, pf("kv", g, r), applyCh)
+		var rf *raft.Raft
+		if isWitnessNode {
+			rf = raft.MakeWitness(peers, idx, pf("kv", g, idx), applyCh)
+		} else {
+			rf = raft.Make(peers, idx, pf("kv", g, idx), applyCh)
+		}
 		kv := shardkv.MakeShardKV(g+1, smNames, makeEnd, rf, applyCh, cfg.MaxRaftState)
 		node.kv = kv
 		kind = "kv"

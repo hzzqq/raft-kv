@@ -22,7 +22,7 @@ import (
 )
 
 func main() {
-	scenario := flag.String("scenario", "leader", "leader | partition | perf | migration")
+	scenario := flag.String("scenario", "leader", "leader | partition | perf | migration | witness")
 	assert := flag.Bool("assert", false, "断言模式：不变量不达标则非零退出（CI 回归护栏；perf 查扩展比，leader/partition 查客户端视角结构化报告 ok）")
 	flag.Parse()
 	resetClock()
@@ -38,8 +38,10 @@ func main() {
 		runPerf(*assert)
 	case "migration":
 		runMigration()
+	case "witness":
+		runWitness()
 	default:
-		fmt.Fprintf(os.Stderr, "unknown scenario %q (leader|partition|perf)\n", *scenario)
+		fmt.Fprintf(os.Stderr, "unknown scenario %q (leader|partition|perf|migration|witness)\n", *scenario)
 		os.Exit(2)
 	}
 	// I175：断言模式——把客户端视角结构化报告（I174 落盘）变成 CI 可强制校验的不变量。
@@ -125,6 +127,9 @@ func assertClientViewScenarios(scenario string) {
 	case "migration":
 		// 多组跨组迁移 + 副本崩溃期间，已确认写零丢失（I176 新场景）。
 		files = []string{"client_view_migration.json"}
+	case "witness":
+		// Witness 副本：2 投票+1 witness kill 1 投票后零丢失写、witness 全程未参选。
+		files = []string{"client_view_witness.json"}
 	default:
 		return // perf 自行 --assert，不在此校验
 	}

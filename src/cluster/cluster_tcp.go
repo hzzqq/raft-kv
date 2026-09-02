@@ -49,6 +49,10 @@ func gobDecode(data []byte, v interface{}) error {
 type TCPNodeAddr struct {
 	Name string `json:"name"` // 与内存模式一致：ShardMaster 为 "m<j>"，ShardKV 为 "g<g>-<r>"
 	Addr string `json:"addr"` // host:port，节点将在此监听真实 TCP
+	// Witness 标记本节点为 Witness（见证者）副本（I189）：持日志、参与投票与提交
+	// quorum，但不持有状态机数据、永不当选。仅 ShardKV 组节点可置 true；ShardMaster
+	// 节点不允许（SM 需全量状态机）。名字约定 g<g>-w<k>（见 parseWitnessName）。
+	Witness bool `json:"witness,omitempty"`
 }
 
 // ClusterTCPConfig 是跨机部署的节点地址清单（可序列化到 JSON 文件，供 gateway/demo 加载）。
@@ -117,6 +121,8 @@ func StartClusterTCP(nGroups, nReplicas, nSM, maxraftstate int, pf PersisterFact
 		nReplicas:    nReplicas,
 		nSM:          nSM,
 		maxraftstate: maxraftstate,
+		nodeServers:  make(map[string]*transport.Server),
+		nodeRafts:   make(map[string]*raft.Raft),
 	}
 	c.make_end = func(name string) *raft.ClientEnd {
 		addr, ok := addrMap[name]
@@ -149,6 +155,7 @@ func StartClusterTCP(nGroups, nReplicas, nSM, maxraftstate int, pf PersisterFact
 		sm := shardmaster.Make(peers, j, p)
 		c.SM = append(c.SM, sm)
 		name := fmt.Sprintf("m%d", j)
+		c.nodeRafts[name] = sm.Raft()
 		jj := j
 		handler := func(method string, args, reply interface{}) {
 			switch method {
@@ -166,37 +173,76 @@ func StartClusterTCP(nGroups, nReplicas, nSM, maxraftstate int, pf PersisterFact
 				panic(fmt.Sprintf("sm%d unexpected method %s", jj, method))
 			}
 		}
-		srv, err := serveNode(name, "sm", handler, addrMap[name])
-		if err != nil {
-			return nil, err
-		}
-		c.tcpServers = append(c.tcpServers, srv)
+			srv, err := serveNode(name, "sm", handler, addrMap[name])
+			if err != nil {
+				return nil, err
+			}
+			c.tcpServers = append(c.tcpServers, srv)
+			c.nodeServers[name] = srv
 	}
 
 	// ---- ShardKV 各 group ----
+	// I189：每个 group 的 raft 节点 = 投票副本 g<g>-<r>（0..nReplicas-1）+ 可选的
+	// witness 副本 g<g>-w<k>。witness 同样进入 raft peers（参与投票与提交 quorum、
+	// 复制完整日志），但**不进入 serving 集合 c.Groups[g]**——gateway 据此永不把
+	// 读/写/分片流量导向 witness（witness 状态机恒为空，导向它会返回空数据）。
 	for g := 0; g < nGroups; g++ {
+		// 收集本组全部 raft 节点，顺序固定：投票者在前、witness 在后；两个 Start*
+		// 路径（StartClusterTCP / StartNodeTCP）都按此顺序确定各节点的 raft 索引。
+		type gnode struct {
+			name      string
+			isWitness bool
+			idx       int
+		}
+		var gnodes []gnode
+		for r := 0; r < nReplicas; r++ {
+			gnodes = append(gnodes, gnode{name: fmt.Sprintf("g%d-%d", g, r), idx: r})
+		}
+		wk := 0
+		for _, a := range addrs {
+			if !a.Witness {
+				continue
+			}
+			if wg, _, ok := parseWitnessName(a.Name); ok && wg == g {
+				gnodes = append(gnodes, gnode{name: a.Name, isWitness: true, idx: nReplicas + wk})
+				wk++
+			}
+		}
+		peers := make([]*raft.ClientEnd, len(gnodes))
+		for i, n := range gnodes {
+			peers[i] = c.make_end(n.name)
+		}
+		applyChs := make([]chan raft.ApplyMsg, len(gnodes))
+		rfs := make([]*raft.Raft, len(gnodes))
+		for i, n := range gnodes {
+			applyChs[i] = make(chan raft.ApplyMsg, 4000)
+			p := pf("kv", g, i)
+			if n.isWitness {
+				rfs[i] = raft.MakeWitness(peers, n.idx, p, applyChs[i])
+			} else {
+				rfs[i] = raft.Make(peers, n.idx, p, applyChs[i])
+			}
+		}
+		// 仅投票副本进入 serving 集合与 nameToID（witness 永不路由、仅参与共识；
+		// witness 仍登记 nameToID 以便实验层 Crash/Partition 能定向操控它）。
 		for r := 0; r < nReplicas; r++ {
 			name := fmt.Sprintf("g%d-%d", g, r)
 			c.nameToID[name] = 1000 + g*100 + r
 			c.Groups[g] = append(c.Groups[g], name)
-
-			peers := make([]*raft.ClientEnd, nReplicas)
-			for r2 := 0; r2 < nReplicas; r2++ {
-				peers[r2] = c.make_end(fmt.Sprintf("g%d-%d", g, r2))
-			}
-			applyCh := make(chan raft.ApplyMsg, 4000)
-			p := pf("kv", g, r)
-			rf := raft.Make(peers, r, p, applyCh)
-			kv := shardkv.MakeShardKV(g+1, c.SMNames, c.make_end, rf, applyCh, maxraftstate)
+		}
+		for i, n := range gnodes {
+			c.nameToID[n.name] = 2000 + g*100 + n.idx
+			rf := rfs[i]
+			kv := shardkv.MakeShardKV(g+1, c.SMNames, c.make_end, rf, applyChs[i], maxraftstate)
 			c.KVs[g] = append(c.KVs[g], kv)
+			c.nodeRafts[n.name] = rf
 
-			gg, rr := g, r
 			handler := func(method string, args, reply interface{}) {
 				switch method {
 				case "RequestVote":
 					rf.RequestVote(args.(*raft.RequestVoteArgs), reply.(*raft.RequestVoteReply))
-				case "RequestPreVote":
-					rf.RequestPreVote(args.(*raft.RequestPreVoteArgs), reply.(*raft.RequestPreVoteReply))
+			case "RequestPreVote":
+				rf.RequestPreVote(args.(*raft.RequestPreVoteArgs), reply.(*raft.RequestPreVoteReply))
 				case "AppendEntries":
 					rf.AppendEntries(args.(*raft.AppendEntriesArgs), reply.(*raft.AppendEntriesReply))
 				case "InstallSnapshot":
@@ -212,19 +258,81 @@ func StartClusterTCP(nGroups, nReplicas, nSM, maxraftstate int, pf PersisterFact
 				case "ShardKV.GetShard":
 					kv.GetShard(args.(*shardkv.GetShardArgs), reply.(*shardkv.GetShardReply))
 				default:
-					panic(fmt.Sprintf("g%d-%d unexpected method %s", gg, rr, method))
+					panic(fmt.Sprintf("%s unexpected method %s", n.name, method))
 				}
 			}
-			srv, err := serveNode(name, "kv", handler, addrMap[name])
+			srv, err := serveNode(n.name, "kv", handler, addrMap[n.name])
 			if err != nil {
 				return nil, err
 			}
 			c.tcpServers = append(c.tcpServers, srv)
+			c.nodeServers[n.name] = srv
 		}
 	}
 	return c, nil
 }
 
+
+// parseWitnessName 解析 witness 节点名 "g<g>-w<k>" → (g, k, true)；否则 (0,0,false)。
+// 与投票副本 "g<g>-<r>" 区分：Sscanf("g%d-w%d") 对 "g0-1" 会因期待 "-w" 而失败，
+// 故两者命名空间互不冲突。
+func parseWitnessName(name string) (g, k int, ok bool) {
+	if len(name) >= 5 && name[0] == 'g' {
+		var gg, kk int
+		if _, e := fmt.Sscanf(name, "g%d-w%d", &gg, &kk); e == nil {
+			return gg, kk, true
+		}
+	}
+	return 0, 0, false
+}
+
+// groupPeerNames 返回某 group 的全部 raft 节点名（投票副本在前、witness 在后），顺序
+// 与 StartClusterTCP / StartNodeTCP 完全一致——保证各节点在 raft peers 中的索引位相同
+// （投票副本占 0..nReplicas-1，witness 占 nReplicas..）。witness 命名为 g<g>-w<k>。
+func groupPeerNames(cfg ClusterTCPConfig, g int) []string {
+	var names []string
+	for r := 0; r < cfg.NReplicas; r++ {
+		names = append(names, fmt.Sprintf("g%d-%d", g, r))
+	}
+	for _, a := range cfg.Nodes {
+		if a.Witness {
+			if wg, _, ok := parseWitnessName(a.Name); ok && wg == g {
+				names = append(names, a.Name)
+			}
+		}
+	}
+	return names
+}
+
+// CrashNode 关停名为 name 的真实 TCP 节点（等价于崩溃 / 网络隔离），用于端到端容错证据。
+// 仅关闭其对外服务；同进程内 raft goroutine 仍在跑但不可达，与「节点宕机」语义一致。
+// 返回 false 表示该节点本就不存在或已宕。
+// CrashNode 精准关停单个真实节点，等价于该节点进程崩溃/网络隔离：同时停止
+// 入向 TCP 服务端 + 底层 raft goroutine（Kill）。仅关停入向服务端不够——raft 的
+// 出向心跳仍由本进程内 goroutine 持续发送，对端收得到心跳就不会触发选举，
+// 会变成"假崩溃"，witness/容错证据将假绿。
+func (c *Cluster) CrashNode(name string) bool {
+	c.mu.Lock()
+	srv, okS := c.nodeServers[name]
+	rf, okR := c.nodeRafts[name]
+	if okS {
+		delete(c.nodeServers, name)
+	}
+	if okR {
+		delete(c.nodeRafts, name)
+	}
+	c.mu.Unlock()
+	if !okS && !okR {
+		return false
+	}
+	if okS {
+		srv.Stop()
+	}
+	if okR {
+		rf.Kill()
+	}
+	return true
+}
 // serveNode 在 addr 上起一个 transport.Server，注册该节点的 RPC 方法分发，后台 Serve。
 func serveNode(name, kind string, handler func(string, interface{}, interface{}), addr string) (*transport.Server, error) {
 	lis, err := net.Listen("tcp", addr)

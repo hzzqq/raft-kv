@@ -153,6 +153,14 @@ func (sm *ShardMaster) Kill() {
 // RaftRPC 把网络层转发的 Raft 内部 RPC（RequestVote/AppendEntries/InstallSnapshot）
 // 派发给底层 rf。测试框架用同一个 server id 同时承载"配置服务 RPC"与"Raft RPC"，
 // 因此 handler 需要把两者都分发到正确接收方。
+// Raft 返回 ShardMaster 底层的 raft 节点句柄（供集群层在 CrashNode 时精准 Kill，
+// 等价于真实节点崩溃——关停入向服务端的同时必须停掉 raft goroutine，否则出向心跳
+// 仍由本进程持续发送，对端收不到故障、不会触发选举）。
+func (sm *ShardMaster) Raft() *raft.Raft { return sm.rf }
+
+// RaftRPC 把一条共识层 RPC（RequestVote/RequestPreVote/AppendEntries/InstallSnapshot/
+// TimeoutNow）分发到本 ShardMaster 的底层 raft 节点句柄，供跨机传输层（transport.Server）
+// 复用同一套路由——与 ShardKV 的 handler 对称。方法名即 raft 方法名，参数由调用方断言。
 func (sm *ShardMaster) RaftRPC(method string, args, reply interface{}) {
 	switch method {
 	case "RequestVote":

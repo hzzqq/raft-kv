@@ -112,6 +112,8 @@ def main() -> int:
                "实验 场景B 客户端视角不变量 (partition --assert)")
     ok &= _run(go, exp_dir, ["run", ".", "-scenario", "migration", "-assert"],
                "实验 场景D 多组迁移故障不变量 (migration --assert)")
+    ok &= _run(go, exp_dir, ["run", ".", "-scenario", "witness", "-assert"],
+               "实验 场景E Witness 副本容错不变量 (witness --assert)")
 
     # 4) 重量级完整性能回归（I176）：仅 CI 开启，避免拖慢每次提交。
     #    perf 全窗口基准（~15~25s）是重路径，正确性已由 A/B/D 覆盖，性能回归放 CI 更经济。

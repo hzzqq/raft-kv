@@ -39,6 +39,13 @@ type Cluster struct {
 	// 跨机模式（StartClusterTCP）专用：真实 TCP 服务端与客户端连接，供 Cleanup 关闭。
 	tcpServers []*transport.Server
 	tcpConns   []*transport.ClientConn
+	// nodeServers 按节点名索引 TCP 服务端，供 CrashNode 精准关停单个真实节点
+	// （等价于崩溃/网络隔离，用于 witness 容错等端到端证据）。
+	nodeServers map[string]*transport.Server
+	// nodeRafts 按节点名索引底层 raft 节点，CrashNode 须同时 Kill 之——否则仅关停
+	// 入向服务端、出向心跳仍由本进程内 raft goroutine 持续发送，对端永远收得到心跳、
+	// 不会触发选举（等价"假崩溃"，witness 容错证据会假绿）。
+	nodeRafts map[string]*raft.Raft
 
 	// 远程客户端模式（ConnectTCP）专用：本进程无任何节点句柄，只有出向连接。
 	// remote=true 时 Cleanup 只关连接；ConfigNum/WaitConfig 改走 ShardMaster 远程查询。

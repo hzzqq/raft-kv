@@ -168,6 +168,19 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 	role        Role
+	// isWitness 标记本副本是 Witness（见证者）副本（I189）。
+	//
+	// Witness 持有一份完整的 Raft 日志并参与投票，但**不持有状态机数据**：
+	//  - 接收并持久化全部日志条目（故选举时 up-to-date 判断与日志安全性完全不变）；
+	//  - 正常响应 RequestVote / RequestPreVote（这份票权正是它的全部价值）；
+	//  - 不向 applyCh 投递任何消息（状态机恒为空，省下一份全量数据存储）；
+	//  - 永不发起选举、拒绝 TimeoutNow（无数据，让它当 leader 会对外服务空状态机）。
+	//
+	// 收益：用 1 份「只存日志」的廉价副本补上投票权。典型部署 2 数据副本 + 1 witness
+	// （3 节点 quorum=2）：任一数据副本宕机后，剩 1 数据 + 1 witness 仍达 quorum，
+	// 集群仍可选主、提交写入、对外服务；而纯 2 数据副本（quorum=2）宕一即完全不可用。
+	// 即：以 2 份数据存储的代价，换来 3 副本的容错能力。
+	isWitness bool
 	// leaderId 记录本节点当前认知的 leader 编号（仅 follower/candidate 视角有意义；
 	// leader 自身在 Status() 中按 role 直接回报 me）。收到合法 AppendEntries 时更新，
 	// 退位时清零，供运维/诊断在脑裂、任期翻滚时快速判断「我在跟谁」。
@@ -741,7 +754,13 @@ func (rf *Raft) RequestPreVote(args *RequestPreVoteArgs, reply *RequestPreVoteRe
 func (rf *Raft) TimeoutNow(args *TimeoutNowArgs, reply *TimeoutNowReply) {
 	rf.mu.Lock()
 	reply.Term = rf.currentTerm
+	isWitness := rf.isWitness
 	rf.mu.Unlock()
+	// Witness 拒绝领导权转移（I189）：它不持有状态机，接管后会把组内数据读成空。
+	// 与 ticker 里的「不发起选举」是同一条不变式的两个入口——witness 只投票，不当选。
+	if isWitness {
+		return
+	}
 	// 跨过选举超时，立即发起选举（Pre-Vote → 正式选举）。
 	rf.startElection()
 }
@@ -1051,7 +1070,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.LastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
-	rf.condInstallSnapshotLocked(args.LastIncludedTerm, args.LastIncludedIndex, args.Data)
+	// Witness 只吃快照元数据、不存状态机数据（I189）：日志压缩点
+	// （lastIncludedIndex/Term）必须同步推进，否则后续日志索引会错乱、也无法正确
+	// 参与选举时的 up-to-date 比较；但 Data（状态机全量）一分不存，因为它从不 apply。
+	data := args.Data
+	if rf.isWitness {
+		data = nil
+	}
+	rf.condInstallSnapshotLocked(args.LastIncludedTerm, args.LastIncludedIndex, data)
 }
 
 // ============================== 后台循环 ==============================
@@ -1062,12 +1088,14 @@ func (rf *Raft) ticker() {
 		case <-rf.killCh:
 			return
 		case <-rf.electionTimer.C:
+			// Witness 不发起选举（I189）：它不持有状态机数据，一旦当选就会对外
+			// 服务一个空状态机（读恒为空、分片恒缺失），等同于数据丢失。它只以
+			// 投票者身份参与共识——把票投给日志够新的全量副本。
 			rf.mu.Lock()
-			if rf.role != Leader {
-				rf.mu.Unlock()
+			shouldElect := rf.role != Leader && !rf.isWitness
+			rf.mu.Unlock()
+			if shouldElect {
 				rf.startElection()
-			} else {
-				rf.mu.Unlock()
 			}
 			rf.resetElectionTimer()
 		case <-rf.heartbeatTimer.C:
@@ -1130,14 +1158,45 @@ func (rf *Raft) applier() {
 			}
 			Metrics.Counter("log_applied").Inc()
 		}
+		witness := rf.isWitness
 		rf.mu.Unlock()
+		if witness {
+			// Witness 不持有状态机（I189）：lastApplied 已在上面正常推进（保证
+			// 快照/日志压缩的一致记账），但**绝不向上层状态机投递**。上层收不到
+			// 任何 apply 消息，状态机恒为空——这正是「省下一份全量数据」的落点，
+			// 同时也让上层 Get 的分片归属守卫天然把 witness 挡在服务路径之外。
+			continue
+		}
 		rf.applyCh <- msg
 	}
 }
 
 // ============================== Make ==============================
 
+// Make 创建一个普通的（全量数据）Raft 副本：参与选举、复制日志、apply 到状态机。
 func Make(peers []*ClientEnd, me int, persister Persister, applyCh chan ApplyMsg) *Raft {
+	return makeRaft(peers, me, persister, applyCh, false)
+}
+
+// MakeWitness 创建一个 Witness（见证者）副本（I189）：持有完整日志并参与投票，
+// 但不持有状态机数据、永不成为 leader。
+//
+// 与 Make 的唯一差异是 isWitness 标志；它决定三条行为分支：ticker 不发起选举、
+// applier 不向 applyCh 投递、InstallSnapshot 只吃元数据不吃状态机数据。其余
+// （日志复制、投票、持久化、提交推进）与普通副本完全一致——这正是 witness 能
+// 在不损失 Raft 安全性的前提下「补票权」的原因：日志仍落盘在多数派上。
+//
+// 典型用法：2 个全量副本 + 1 个 witness 组成一个 3 节点组（quorum=2）。任一全量副本
+// 宕机后，剩 1 全量 + 1 witness 仍达 quorum，集群仍可选主并提交写入（数据仍在存活的
+// 那个全量副本上，不丢）；而纯 2 副本组宕一即彻底不可用。
+func MakeWitness(peers []*ClientEnd, me int, persister Persister, applyCh chan ApplyMsg) *Raft {
+	return makeRaft(peers, me, persister, applyCh, true)
+}
+
+// makeRaft 是 Make / MakeWitness 的公共构造体。**isWitness 必须在启动 ticker 与
+// applier 两个 goroutine 之前写入**：这两个 goroutine 会读取该标志决定行为分支，
+// 若在它们启动后再赋值则构成数据竞争（-race 会报，且行为不确定）。
+func makeRaft(peers []*ClientEnd, me int, persister Persister, applyCh chan ApplyMsg, isWitness bool) *Raft {
 	rf := &Raft{
 		peers:             peers,
 		persister:         persister,
@@ -1155,6 +1214,7 @@ func Make(peers []*ClientEnd, me int, persister Persister, applyCh chan ApplyMsg
 		heartbeatTimer:    time.NewTimer(HeartbeatInterval),
 		killCh:            make(chan struct{}),
 		kickCh:            make(chan struct{}, 1),
+		isWitness:         isWitness,
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
 
@@ -1162,11 +1222,26 @@ func Make(peers []*ClientEnd, me int, persister Persister, applyCh chan ApplyMsg
 	if snap := persister.ReadSnapshot(); snap != nil {
 		rf.snapshot = snap
 	}
+	// Witness 不持有状态机，即使持久化里有历史快照数据也丢弃——它只需要日志与
+	// 任期/提交点来正确参与投票。保留快照数据只会白占存储，且与「不 apply」的
+	// 语义冲突（applier 对 witness 从不投递，这份数据永远不会被消费）。
+	if isWitness {
+		rf.snapshot = nil
+	}
 
 	go rf.ticker()
 	go rf.applier()
 
 	return rf
+}
+
+// IsWitness 返回本副本是否为 Witness（见证者）副本：持日志与投票权，但不持有
+// 状态机数据、永不成为 leader。供上层（ShardKV/运维端点）据此拒绝把读或分片迁移
+// 流量导向 witness。
+func (rf *Raft) IsWitness() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.isWitness
 }
 
 // 便于调试的字符串化

@@ -14,7 +14,7 @@ Go 二进制：
 那套端点契约，并额外做一次真实故障演练——从而在没有 docker 的机器上，依然能
 证明「这套部署件真的起得来、真的能服务、挂一个副本真的还能用」。
 
-检查项（共 17 项，全绿即 deploy 交付物在真实进程 + 真实 TCP 下确认可用）：
+检查项（共 18 项，全绿即 deploy 交付物在真实进程 + 真实 TCP 下确认可用）：
   1. 6 个 kvnode 的 /healthz 全部 200
   2. gateway /readyz 200（集群可读可写）
   3. 经 gateway 做真实 PUT/GET 往返，值必须一致
@@ -43,6 +43,14 @@ Go 二进制：
      断言：2 组全部形成且分片分布跨 2 组、迁移真实发生（配置版本推进）、已确认写零丢失、
      无脑裂双写、降级 quorum 仍可读写。这是部署路径此前唯一从未覆盖的正确性盲区
      （experiments 只在 in-process 测过多组，部署件本身从没被验证能跑多组）。
+ 18. Witness 副本容错收益（I189）：另起一个真实「2 投票副本 + 1 witness」组
+     （3 ShardMaster + 2 KV 投票副本 + 1 KV witness + 1 Gateway，真实 TCP），
+     写入后 kill 一个投票副本，断言仍能选主并完成 PUT/GET（quorum 由 witness 补足——
+     仅 2 份存储即达 3 副本容错）；对照组起「纯 2 投票副本」组（无 witness），kill 一个后
+     断言不可写（quorum=2 不可达），从而**红态实证**「去掉 witness 容错即转红」——
+     证明该检查非空绿。witness 永不持有状态机数据（存储减半），仅投票补 quorum，
+     故 kill 后仍可服务而纯 2 副本 kill 1 即全瘫。本项把 I189 的「存储减半型 witness」
+     语义从 raft 层单测 + in-process 实验，推进到**部署件真实进程**证据。
 
 注：13/14 用标准库复刻了 Prometheus 的「抓取 + 告警求值」语义，无需 Docker / 无需
 Prometheus 二进制（本环境 wsl 黑名单 + 大文件下载被限速，二者皆不可得）；一旦取得原生
@@ -923,6 +931,204 @@ class Smoke:
                          f"put={st_p} get={st_g} value={got_g.strip()!r}")
         return ok
 
+    # ---------- Witness 副本容错收益（I189，第 18 项）----------
+    def write_config_witness(self, witness=True):
+        """写一份 Witness 拓扑部署清单：单组（gid=1）下 2 投票副本 + 可选 1 witness。
+
+        witness=True  → 节点 g0-0 / g0-1（投票）+ g0-w0（Witness:true，投票但不持有状态机）；
+        witness=False → 纯 2 投票副本（g0-0 / g0-1），无 witness，作红态对照组。
+        n_replicas=2（仅投票副本数），witness 作为额外 raft 节点补 quorum（命名 g<g>-w<k>，
+        且 JSON 显式带 witness:true，使 StartClusterTCP 与 StartNodeTCP 两条路径判定一致）。
+        """
+        b = self.port_base
+        nodes = [{"name": f"m{i}", "addr": f"127.0.0.1:{b+SM_RAFT[i]}"}
+                 for i in range(3)]
+        nodes += [{"name": "g0-0", "addr": f"127.0.0.1:{b+11}"}]
+        nodes += [{"name": "g0-1", "addr": f"127.0.0.1:{b+12}"}]
+        if witness:
+            nodes += [{"name": "g0-w0", "addr": f"127.0.0.1:{b+13}",
+                       "witness": True}]
+        cfg = {
+            "n_groups": 1, "n_replicas": 2, "n_sm": 3,
+            "max_raft_state": 1000,
+            "data_dir": self.data_dir,
+            "nodes": nodes,
+        }
+        with open(self.cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        self._p(f"✓ Witness 部署清单已生成：{self.cfg_path}（witness={witness}）")
+
+    def _has_witness(self):
+        try:
+            cfg = json.load(open(self.cfg_path, encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return False
+        return any(bool(n.get("witness")) for n in cfg.get("nodes", []))
+
+    def start_all_witness(self):
+        """起 Witness 拓扑真实集群：3 SM + 2 KV 投票副本（+ 1 KV witness，若配置含）+
+        1 Gateway，全部真实 TCP 进程。复用与单组冒烟一致的端口偏移（KV raft 11/12/13、
+        KV http 31/32/33、gateway 50）。"""
+        b = self.port_base
+        for i in range(3):
+            self.launch("kvnode", f"kvnode-m{i}",
+                        ["-config", self.cfg_path, "-name", f"m{i}",
+                         "-http", f"127.0.0.1:{b+SM_HTTP[i]}"])
+        self.launch("kvnode", "kvnode-g0-0",
+                    ["-config", self.cfg_path, "-name", "g0-0",
+                     "-http", f"127.0.0.1:{b+31}"])
+        self.launch("kvnode", "kvnode-g0-1",
+                    ["-config", self.cfg_path, "-name", "g0-1",
+                     "-http", f"127.0.0.1:{b+32}"])
+        if self._has_witness():
+            self.launch("kvnode", "kvnode-g0-w0",
+                        ["-config", self.cfg_path, "-name", "g0-w0",
+                         "-http", f"127.0.0.1:{b+33}"])
+        self.launch("gateway", "gateway",
+                    ["-connect", self.cfg_path,
+                     "-addr", f"127.0.0.1:{b+GW_PORT}"],
+                    env_extra={"RAFTKV_CLIENT_RATE": "100000",
+                               "RAFTKV_CLIENT_BURST": "10000"})
+        n_kv = 3 if self._has_witness() else 2
+        self._p(f"✓ Witness 集群已启动（3 ShardMaster + {n_kv} ShardKV + 1 Gateway，"
+                f"真实 TCP）")
+
+    def wait_ready_witness(self):
+        b = self.port_base
+        node_ports = [(f"sm{i}", b + SM_HTTP[i]) for i in range(3)]
+        node_ports += [("g0-0", b + 31), ("g0-1", b + 32)]
+        if self._has_witness():
+            node_ports += [("g0-w0", b + 33)]
+        gw = f"http://127.0.0.1:{b+GW_PORT}"
+        n_nodes = len(node_ports)
+        deadline = time.time() + READY_TIMEOUT
+        last = ""
+        while time.time() < deadline:
+            if all(p.poll() is None for (_, p, _) in self.procs):
+                bad = []
+                for label, port in node_ports:
+                    st, _ = http("GET", f"http://127.0.0.1:{port}/healthz")
+                    if st != 200:
+                        bad.append(f"{label}:{st}")
+                st, _ = http("GET", gw + "/readyz")
+                if st != 200:
+                    bad.append(f"gateway-readyz:{st}")
+                if not bad:
+                    self._p(f"✓ Witness 集群就绪（{n_nodes} 节点 /healthz 200 + "
+                            f"/readyz 200），用时 {READY_TIMEOUT-(deadline-time.time()):.1f}s")
+                    return True
+                last = "未就绪: " + ", ".join(bad)
+            else:
+                dead = [n for (n, p, _) in self.procs if p.poll() is not None]
+                last = "进程提前退出: " + ", ".join(dead)
+                break
+            time.sleep(1.0)
+        self._p(f"✗ Witness 等待就绪超时：{last}")
+        self.dump_logs()
+        return False
+
+    def verify_witness_benefit(self):
+        """第 18 项（I189）主检查：2 投票 + 1 witness 下，kill 一个投票副本后系统仍可用。
+
+        quorum = 多数(3) = 2；witness 投票计入 quorum 但不持有状态机。kill 一个投票副本后，
+        剩 1 投票 + 1 witness = 2 票 → quorum 仍达，leader 可继续提交 → PUT/GET 成功。
+        若把 witness 去掉（对照组）则 quorum 不可达 → 不可写。本检查即证明 I189 的
+        「存储减半型 witness」在部署件真实进程下确实带来容错收益。
+        """
+        ok = True
+        b = self.port_base
+        gw = f"http://127.0.0.1:{b+GW_PORT}"
+
+        # 预热 10 key
+        warmed = 0
+        for i in range(10):
+            k = f"w{i}"
+            st, _ = http("PUT", gw + "/kv/" + k, body=f"winit-{i}")
+            if st == 200:
+                warmed += 1
+        ok &= self.check("Witness：预热 10 key 经 gateway 写入（2 投票 + 1 witness 可服务）",
+                         warmed == 10, f"{warmed}/10")
+
+        # kill 一个投票副本（g0-1），剩 g0-0(投票) + g0-w0(witness)
+        victim = None
+        for name, p, _ in self.procs:
+            if name == "kvnode-g0-1":
+                victim = (name, p)
+                break
+        if not victim:
+            return self.check("Witness：找到投票副本 g0-1", False, "未找到 kvnode-g0-1")
+        victim[1].kill()
+        self._p("  → 已 kill g0-1（投票副本），剩 g0-0(投票) + g0-w0(witness)")
+
+        # 故障窗口重试 PUT：witness 补 quorum → 应成功
+        time.sleep(3.0)
+        put_ok = False
+        for _ in range(15):
+            st, _ = http("PUT", gw + "/kv/w-after-kill", body="alive")
+            if st == 200:
+                put_ok = True
+                break
+            time.sleep(0.5)
+        st2, got2 = http("GET", gw + "/kv/w-after-kill")
+        ok &= self.check(
+            "Witness：kill 一个投票副本后仍可选主并 PUT/GET（quorum 由 witness 补足）",
+            put_ok and st2 == 200 and got2.strip() == "alive",
+            f"put={put_ok} get={st2} value={got2.strip()!r}")
+
+        # 故障窗口已确认写零丢失
+        lost = 0
+        for i in range(10):
+            k = f"w{i}"
+            st, got = http("GET", gw + "/kv/" + k)
+            if st != 200 or got.strip() != f"winit-{i}":
+                lost += 1
+        ok &= self.check("Witness：故障窗口已确认写零丢失",
+                         lost == 0, f"丢失={lost}")
+        return ok
+
+    def verify_control_unavailable(self):
+        """第 18 项（I189）红态对照组：纯 2 投票副本（无 witness）下，kill 一个后不可写。
+
+        与 verify_witness_benefit 同拓扑但去掉 witness：quorum = 多数(2) = 2，kill 一个
+        投票副本后仅剩 1 节点 < quorum → 提交永远停滞 → PUT 不可达。本检查断言系统正确
+        转入不可用（put 不返回 200），从而**红态实证**：把 witness 拿掉，第 18 项主检查
+        即转红——证明它不是空绿，witness 确实是容错差异点。
+        """
+        ok = True
+        b = self.port_base
+        gw = f"http://127.0.0.1:{b+GW_PORT}"
+
+        warmed = 0
+        for i in range(5):
+            k = f"c{i}"
+            st, _ = http("PUT", gw + "/kv/" + k, body=f"cinit-{i}")
+            if st == 200:
+                warmed += 1
+        ok &= self.check("Witness 对照组：预热 5 key 经 gateway 写入（纯 2 投票可服务）",
+                         warmed == 5, f"{warmed}/5")
+
+        # kill 一个投票副本（g0-1），剩 g0-0 单点 → quorum=2 不可达
+        victim = None
+        for name, p, _ in self.procs:
+            if name == "kvnode-g0-1":
+                victim = (name, p)
+                break
+        if not victim:
+            return self.check("Witness 对照组：找到投票副本 g0-1", False, "未找到 kvnode-g0-1")
+        victim[1].kill()
+        self._p("  → 已 kill g0-1（投票副本），剩 g0-0 单点（无 witness 补 quorum）")
+
+        # 故障后单次 PUT：应不可达（HTTP_TIMEOUT 内返回非 200，或超时）。
+        # 断言「不可写」成立 = 红态实证：去掉 witness 容错即转红。
+        time.sleep(3.0)
+        st, _ = http("PUT", gw + "/kv/c-after-kill", body="should-fail")
+        put_ok = (st == 200)
+        ok &= self.check(
+            "Witness 对照组：kill 一个投票副本后不可写（无 witness 补 quorum → 红态实证）",
+            not put_ok,
+            f"put_ok={put_ok}（期望不可写：证明 witness 是容错差异点）")
+        return ok
+
     # ---------- 清理 ----------
     def cleanup(self, keep=False):
         for name, p, logf in self.procs:
@@ -980,6 +1186,53 @@ def run_multigroup_phase(bin_dir, quiet=False, port_base=19200):
     return ok, mg.results
 
 
+def _run_one_witness(bin_dir, quiet, port_base, witness):
+    """起一个独立临时目录的真实 Witness 集群（witness=True 或 False），跑对应检查后清理。
+
+    每个子阶段用各自独立的 tempdir + 独立 data_dir（避免跨阶段 raft 状态落盘污染），
+    阶段间进程已完全关停、端口释放，故可复用同一端口基 19300。返回 (ok, results)。
+    """
+    wd = tempfile.mkdtemp(prefix="raftkv_witness_")
+    w = Smoke(port_base, wd, quiet=quiet)
+    ext = ".exe" if os.name == "nt" else ""
+    os.makedirs(w.bin_dir, exist_ok=True)
+    os.makedirs(w.log_dir, exist_ok=True)
+    os.makedirs(w.data_dir, exist_ok=True)
+    for pkg in ("kvnode", "gateway", "kvcli", "kvadmin"):
+        src = os.path.join(bin_dir, pkg + ext)
+        if os.path.exists(src):
+            shutil.copy(src, os.path.join(w.bin_dir, pkg + ext))
+    if not quiet:
+        kind = "2 投票 + 1 witness" if witness else "纯 2 投票（无 witness）"
+        print(f"\n=== I189 Witness 阶段（端口基 {port_base}，{kind}）===")
+    w.write_config_witness(witness=witness)
+    w.start_all_witness()
+    if not w.wait_ready_witness():
+        w.cleanup()
+        return False, w.results
+    if witness:
+        ok = w.verify_witness_benefit()
+    else:
+        ok = w.verify_control_unavailable()
+    w.cleanup()
+    return ok, w.results
+
+
+def run_witness_phase(bin_dir, quiet=False, port_base=19300):
+    """第 18 项（I189）可独立运行的「Witness 副本容错收益」阶段。
+
+    由两个独立子阶段组成（各自独立临时目录 + 独立 data_dir，端口基一致 19300）：
+      A. 2 投票 + 1 witness：kill 一个投票副本后仍可读写（quorum 由 witness 补足）；
+      B. 纯 2 投票对照组：kill 一个投票副本后不可写（红态实证，去掉 witness 即转红）。
+    把 I189 的 witness 语义从 raft 层单测（raft_witness_test.go）+ in-process 实验
+    （experiments/witness.go）推进到**部署件真实多进程**证据：证明「2 存储副本 + 1 witness
+    达 3 副本容错」在真实 TCP 部署下成立，且去掉 witness 即转红（检查非空绿）。
+    """
+    okA, resA = _run_one_witness(bin_dir, quiet, port_base, True)
+    okB, resB = _run_one_witness(bin_dir, quiet, port_base, False)
+    return okA and okB, resA + resB
+
+
 def _write_smoke_report(smoke, ok, port_base, quiet=False):
     """把全量检查项 + quorum 容错/拓扑一致性证据写成 deploy/smoke_report.json。
 
@@ -1001,6 +1254,7 @@ def _write_smoke_report(smoke, ok, port_base, quiet=False):
             "dashboard_contract_ok": _all(["Grafana"]),
             "loadgen_ok": _all(["压测"]),
             "multigroup_ok": _all(["多组"]),
+            "witness_ok": _all(["Witness"]),
         },
     }
     report_path = os.path.join(ROOT, "deploy", "smoke_report.json")
@@ -1043,7 +1297,11 @@ def main():
         # 故在单组 cleanup 之前跑——复用单组已构建的二进制，且两集群可安全共存）。
         ok_mg, mg_results = run_multigroup_phase(s.bin_dir, quiet=quiet)
         s.results.extend(mg_results)   # 合并到统一报告
-        ok = ok_single and ok_mg
+        # I189：Witness 副本容错收益阶段（独立 2 投票 + 1 witness 真实集群，端口基 19300
+        # 与单组 19100 / 多组 19200 互不冲突，复用已构建二进制，两集群可安全共存）。
+        ok_witness, witness_results = run_witness_phase(s.bin_dir, quiet=quiet)
+        s.results.extend(witness_results)
+        ok = ok_single and ok_mg and ok_witness
         s.cleanup()   # 两阶段都跑完再统一收口（多组阶段已自清理其进程）
         _write_smoke_report(s, ok, args.port_base, quiet=quiet)
     finally:

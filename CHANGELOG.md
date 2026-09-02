@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–188，共 140 轮交付；时间跨度 2026-07-19 ~ 2026-09-02T17:30:00。
+> 覆盖 cycle 39–189，共 141 轮交付；时间跨度 2026-07-19 ~ 2026-09-02T19:14:10+0800。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -183,6 +183,7 @@
 - **[186] `deploy_dashboard_loadgen_i186`** — 老板指令「继续自驱下一轮，可选方向都做」：①Grafana dashboard 指标名做活契约校验（防看板幻觉）②loadgen 真实压测路径进冒烟（从单次 PUT/GET 升级为批量并发负载）（隐性：冒烟 12→14 项只覆盖了 alerts 死规则与拓扑漂移，但看板 JSON 里的幻觉指标（面板恒空无人知）与真实并发负载下的端到端行为仍是盲区；且 loadgen 一进去就撞上网关限流不可调的部署级缺口；score=19）
 - **[187] `report_i186c`** — 老板指令「继续自驱下一轮，可选方向都做」第三方向：Raft KV 实训报告（学生黄子州 231042Y133）未完成且临近硬截止（隐性：报告是最容易一直拖的「软交付」，但它是实训主线验收的硬门槛；不写就等于整个实训白做。素材已在仓库（14/14 冒烟、16/16、五重故障 29 请求 0 丢失、压测 500×8 零错误、覆盖率 74.2%、138 轮迭代）可直接复用；score=18）
 - **[188] `multigroup_chaos_i188`** — 老板指令「继续自驱 I188（多组迁移混沌压测 / Witness 副本）」：选多组迁移混沌压测主方向——直接闭环报告 8.3 自陈的「压测主要针对单组」已知缺口（隐性：部署路径一直缺 ShardMaster 管理面外部触发（Join/Move/Leave），多组只能在 in-process experiments 测试桩里验证，部署件本身从没被证明能跑多组；且单组冒烟掩盖了「分片跨组在线迁移 + 配置抖动 + 副本崩溃」叠加下的零丢失写保证；score=19）
+- **[189] `witness_i189`** — 老板指令「I189（Witness 副本，更大的架构特性），实训报告 docx 不用写了」：实现 CockroachDB 风格存储减半型 witness（持完整日志、参与投票与提交 quorum，但永不成为 leader、永不 apply 进状态机），并把它从 raft 层单测推进到部署件真实多进程证据。（隐性：①部署路径此前根本没有 witness 概念——StartClusterTCP 用 TCPNodeAddr.Witness 字段判定、StartNodeTCP 用 g<g>-w<k> 名字判定，两条路径必须同时一致否则 witness 会被静默当普通副本；②CrashNode 此前只停入向服务端、不停 raft goroutine，等价「假崩溃」——对端收不到故障不触发选举，容错证据会假绿（I189 抓到并修复，惠及其他所有崩溃类测试）；③纯 2 副本 kill 1 即全瘫，而 2 投票+1 witness 用 2 份存储达 3 副本容错——这一收益此前只在 in-process experiments 验证过，部署件本身从未被证明能跑 witness。；score=19）
 
 ---
 
