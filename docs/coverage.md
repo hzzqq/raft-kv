@@ -139,7 +139,7 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 | `kvnode` | 2 | 3 | ✅ | — |
 | `kvraft` | 1 | 4 | ✅ | OpResult |
 | `metrics` | 4 | 8 | ✅ | DefaultHistWindow, Desc, SetDefaultHistWindow, SetDesc |
-| `raft` | 4 | 14 | ✅ | Call, IsWitness, MakeSendFnEnd, PartitionServers, RaftStateSize, Send, SetSendFn, String …(+1) |
+| `raft` | 4 | 15 | ✅ | Call, HasPendingConf, IsWitness, MakeSendFnEnd, PartitionServers, RaftStateSize, Send, SetSendFn …(+2) |
 | `shardkv` | 15 | 24 | ✅ | GetE, PutE, MigrationPlan, MigrationStep |
 | `shardmaster` | 14 | 18 | ✅ | String, ConfigDelta, PlanResult |
 | `statusfmt` | 1 | 4 | ✅ | — |
@@ -147,6 +147,6 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 | `util` | 24 | 28 | ✅ | ExpBackoff, MarshalJSON, CbState |
 | `version` | 1 | 1 | ✅ | — |
 
-> 汇总：17 个包，1 个无测试；未引用导出符号 func=29 / type=19 / var=2 / const=0。「未覆盖符号」为软提示，可能含被间接覆盖的结果/视图类型。
+> 汇总：17 个包，1 个无测试；未引用导出符号 func=30 / type=19 / var=2 / const=0。「未覆盖符号」为软提示，可能含被间接覆盖的结果/视图类型。
 
 <!-- test-coverage-table:end -->

@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–191，共 143 轮交付；时间跨度 2026-07-19 ~ 2026-09-02T19:38:30+0800。
+> 覆盖 cycle 39–192，共 144 轮交付；时间跨度 2026-07-19 ~ 2026-09-02T22:30:00+0800。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -186,6 +186,7 @@
 - **[189] `witness_i189`** — 老板指令「I189（Witness 副本，更大的架构特性），实训报告 docx 不用写了」：实现 CockroachDB 风格存储减半型 witness（持完整日志、参与投票与提交 quorum，但永不成为 leader、永不 apply 进状态机），并把它从 raft 层单测推进到部署件真实多进程证据。（隐性：①部署路径此前根本没有 witness 概念——StartClusterTCP 用 TCPNodeAddr.Witness 字段判定、StartNodeTCP 用 g<g>-w<k> 名字判定，两条路径必须同时一致否则 witness 会被静默当普通副本；②CrashNode 此前只停入向服务端、不停 raft goroutine，等价「假崩溃」——对端收不到故障不触发选举，容错证据会假绿（I189 抓到并修复，惠及其他所有崩溃类测试）；③纯 2 副本 kill 1 即全瘫，而 2 投票+1 witness 用 2 份存储达 3 副本容错——这一收益此前只在 in-process experiments 验证过，部署件本身从未被证明能跑 witness。；score=19）
 - **[190] `witness_self_crash_i190`** — I189 第18项只验证了 kill 投票副本、witness 补 quorum；对称故障模式——kill witness 自身（剩 2 投票=quorum 2 仍可读写）+ 重启后追平 leader 日志——从未被测试。补为第18项子阶段 C，完成 witness 容错收益的对称闭环。（隐性：①子阶段 C 初版断言失败并非系统 bug，而是测试探针 bug：kvnode GET /status 返回 JSON Diagnostics（字段 CommitIndex），而 GET / 根路径才输出文本 raft : ... commit=%d ...；我原正则 commit=(\d+) 只能匹配文本格式，匹配不到 JSON → 误报 commit=-1。根因是端点/格式不匹配，witness 实际已正确重启并服务。；score=19）
 - **[191] `witness_snapshot_churn_i191`** — I189/I190 只证明 witness 短暂停机（AppendEntries 追平）的对称容错；witness 设计的最后一根支柱——「leader 在 witness 宕机期频繁快照、把日志压缩到 witness 冻结点之后，witness 只能靠 InstallSnapshot(仅元数据) 追平」——从未被端到端验证。同时部署冒烟多组混沌阶段偶发 503/熔断导致门禁约 50% 飘红，会随机阻断提交。（隐性：①witness 持完整日志但从不自快照；leader 快照（max_raft_state）把它日志压缩后，witness 重启 nextIndex 落在已 compact 区间，只能收 InstallSnapshot（raft.go InstallSnapshot 对 witness 置 data=nil 只吃 lastIncludedIndex）。此前该路径零运行时证据。②多组混沌阶段「预热 20 key 12/20」「零丢失 19」「/readyz 503 熔断」是瞬时不可用被误判——kill 一个副本后 2/3 仍 quorum，集群会恢复，但测试不重试读/写，把正确行为当失败；且预热在故障前也偶发 503（bootstrap 期网关熔断）。属测试探针对瞬时不可用零容忍的设计缺陷，非系统逻辑 bug（同代码重跑曾 38/38 全绿）。；score=20）
+- **[192] `witness_join_leave_i192`** — I189/I190/I191 让 witness 静态写入 3 节点组、并在三种故障模式下被证明容错；但 witness 是构造时写死在 raft group 配置里的，集群运行中无法动态加入/移除一个 witness——运维上「今天加廉价 witness 把 2 副本组升级成可抗单数据副本故障、明天移除回到省存储 2 副本」的闭环从未实现，raft 层也完全没有运行时成员变更通道。（隐性：①raft 全部用固定 len(rf.peers) 算 quorum（advanceCommit/选举计票/hasLeaderLease），集群层面根本不知道谁在投票集合里——witness 只靠本地 isWitness 自我约束，无法被动态增删。②真·动态成员变更必须保证「新旧配置多数派必重叠」才不会脑裂，标准做法是 Ongaro 单服变更（一次只变一个成员、pendingConf 守卫）。③witness 维度纯本地（不参与选举/不 apply），集群只需追踪 voter 集合即可，无需区分 witness/数据参与共识——这把改动收敛到最小且安全。④测试 harness 直接给 *Raft 句柄，可在进程内确定性驱动 ProposeConfChange，无需先造网关控制面。；score=20）
 
 ---
 

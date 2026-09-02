@@ -15,7 +15,9 @@ import (
 // makeConfigWitness 同 makeConfig，但 witnesses 集合内的节点用 MakeWitness 构造，
 // 其余用 Make。测试框架其余方法（connectAll/addServerHandler/monitor/kill 等）对
 // witness 与普通节点一视同仁——witness 仍是 *Raft 实例。
-func makeConfigWitness(t testing.TB, n int, witnesses map[int]bool) *config {
+// 可选参数 initialVoters 在节点启动、参与选举前设定初始投票成员集合（I192 动态重配置
+// 测试用）：传入如 []int{0,1} 可让下标 2 的 witness 初始「不投票」，从而演示运行时 Join。
+func makeConfigWitness(t testing.TB, n int, witnesses map[int]bool, initialVoters ...[]int) *config {
 	net := MakeNetwork()
 	cfg := &config{net: net, n: n, t: t}
 	cfg.rafts = make([]*Raft, n)
@@ -34,6 +36,10 @@ func makeConfigWitness(t testing.TB, n int, witnesses map[int]bool) *config {
 			cfg.endnames[i][j] = net.MakeEnd(i*n+j, i)
 		}
 	}
+	initCfg := []int(nil)
+	if len(initialVoters) > 0 {
+		initCfg = initialVoters[0]
+	}
 	for i := 0; i < n; i++ {
 		cfg.applyCh[i] = make(chan ApplyMsg, 4000)
 		go cfg.monitor(i, cfg.applyCh[i])
@@ -43,6 +49,11 @@ func makeConfigWitness(t testing.TB, n int, witnesses map[int]bool) *config {
 			rf = MakeWitness(cfg.endnames[i], i, cfg.persisters[i], cfg.applyCh[i])
 		} else {
 			rf = Make(cfg.endnames[i], i, cfg.persisters[i], cfg.applyCh[i])
+		}
+		if initCfg != nil {
+			// 初始投票配置必须在选举前设定（仅 I192 测试场景；正常运行中变更走
+			// ProposeConfChange）。所有节点设定为同一集合，保证初始 quorum 一致。
+			rf.SetInitialConfig(initCfg)
 		}
 		cfg.rafts[i] = rf
 		cfg.connectAll(i)

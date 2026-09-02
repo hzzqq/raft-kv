@@ -18,6 +18,12 @@ import (
 // 网关 / 演示程序可读取 raft.Metrics.Snapshot() 查看领导者变更、日志应用等。
 var Metrics = metrics.NewRegistry()
 
+func init() {
+	// 注册成员变更命令类型（I192），使 gob 在跨进程 AppendEntries / 持久化时能正确
+	// 编解码含 ConfChange 的日志条目（interface{} 中的具体类型须两端已知）。
+	gob.Register(ConfChange{})
+}
+
 // ============================== 常量与类型 ==============================
 
 const (
@@ -62,6 +68,16 @@ type ApplyMsg struct {
 	Snapshot      []byte
 	SnapshotTerm  int
 	SnapshotIndex int
+}
+
+// ConfChange 是集群成员（投票配置）变更命令（Ongaro 论文 §6 单服变更）。
+// NewVoters 为变更后「完整」的投票成员索引集合（peer 在 rf.peers 中的下标），
+// 其中可含 witness（witness 是持日志、参与投票但不持状态机的成员）。applier 应用
+// 该日志条目后原子切换 rf.cfg。一次仅允许一个进行中的成员变更（rf.pendingConf
+// 守卫），保证任意时刻新旧配置只差一个成员、两者的多数派必重叠——这正是单服变更
+// 安全性的充要条件（不会选出两个 leader、不会出现两个不相交的提交多数派）。
+type ConfChange struct {
+	NewVoters []int
 }
 
 // ============================== RPC 参数 ==============================
@@ -199,6 +215,16 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
+	// ---- 成员配置（动态重配置，I192）----
+	// cfg 是当前已提交的投票成员集合（rf.peers 的下标）。quorum = len(cfg)/2 + 1。
+	// 初始为全部 peer（或 SetInitialConfig 指定的子集）。成员变更经 ConfChange 日志
+	// 条目提交后由 applier 原子切换。witness 是 cfg 中的一员（参与投票），但其「不持
+	// 状态机 / 永不当选」由本地 isWitness 自我约束，集群层面只需追踪投票集合即可。
+	cfg []int
+	// pendingConf 标记 leader 已提议一个尚未提交的成员变更；期间禁止再提议新的变更，
+	// 以保证单服变更安全性（新旧配置多数派必重叠，不会脑裂）。
+	pendingConf bool
+
 	// ---- leader 租约（线性一致读 ReadIndex 快路径用）----
 	// lastContact[i] 记录本节点最后一次「接触」peer i 的时间：follower 在收到合法
 	// leader 的 AppendEntries/InstallSnapshot 时更新 lastContact[LeaderId]；leader
@@ -262,6 +288,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.commitIndex)
+	e.Encode(rf.cfg) // 投票配置：重启后直接恢复，无需重放日志即可正确计 quorum
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -288,6 +315,12 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.lastIncludedIndex = lii
 	rf.lastIncludedTerm = lit
 	rf.commitIndex = commit
+	// 兼容旧格式：旧持久化数据不含 cfg 字段，Decode 在此返回 io.EOF，
+	// rf.cfg 保留 makeRaft 里设定的默认（全部 peer），不影响正确性。
+	var cfg []int
+	if d.Decode(&cfg) == nil && len(cfg) > 0 {
+		rf.cfg = cfg
+	}
 }
 
 // ============================== 对外接口 ==============================
@@ -323,9 +356,18 @@ func (rf *Raft) hasLeaderLeaseLocked() bool {
 	if rf.role != Leader {
 		return false
 	}
+	// 投票集合默认取当前配置 cfg；白盒单测可能直接构造 *Raft 而不设 cfg，
+	// 此时回退到全部 peer，保持「多数派近期有接触」的语义不变。
+	voters := rf.cfg
+	if len(voters) == 0 {
+		voters = make([]int, len(rf.peers))
+		for i := range rf.peers {
+			voters[i] = i
+		}
+	}
 	lease := ElectionTimeoutMin
 	contacted := 0
-	for i := range rf.peers {
+	for _, i := range voters {
 		if i == rf.me {
 			contacted++
 			continue
@@ -334,7 +376,7 @@ func (rf *Raft) hasLeaderLeaseLocked() bool {
 			contacted++
 		}
 	}
-	return contacted > len(rf.peers)/2
+	return contacted > len(voters)/2
 }
 
 // HasCommittedCurrentTerm 返回 leader 是否已在当前任期提交过条目（通常为 no-op）。
@@ -450,6 +492,68 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return idx, rf.currentTerm, true
 }
 
+// ============================== 成员配置（动态重配置，I192） ==============================
+
+// inCfg 报告 peer i 是否属于当前已提交的投票配置（调用方持锁与否均可，读 cfg 切片）。
+func (rf *Raft) inCfg(i int) bool {
+	for _, v := range rf.cfg {
+		if v == i {
+			return true
+		}
+	}
+	return false
+}
+
+// SetInitialConfig 在节点启动、参与选举前设定初始投票成员集合。
+// 正常运行中变更成员必须走 ProposeConfChange（经 ConfChange 日志条目提交），不可直接
+// 改 rf.cfg——否则会与已提交日志产生不一致、破坏单服变更安全性。仅测试/引导阶段使用。
+func (rf *Raft) SetInitialConfig(voters []int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.cfg = append([]int(nil), voters...)
+	rf.persist()
+}
+
+// VoterConfig 返回当前已提交的投票成员集合快照（测试/运维观测用）。
+func (rf *Raft) VoterConfig() []int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return append([]int(nil), rf.cfg...)
+}
+
+// HasPendingConf 返回 leader 是否有在途、尚未提交的成员变更。
+func (rf *Raft) HasPendingConf() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.pendingConf
+}
+
+// ProposeConfChange 由 leader 提议一次成员变更（Ongaro 论文 §6 单服变更）。
+// 返回 (条目索引, 是否 leader)。pendingConf 守卫：上一次变更未提交前禁止再提议，保证
+// 任意时刻新旧配置只差一个成员、两者多数派必重叠——单服变更安全性的充要条件（不会
+// 选出两个 leader、不会出现两个不相交的提交多数派）。变更经旧配置多数派复制并提交后，
+// 由 applier 原子切换 rf.cfg；此时新配置才开始参与 quorum 计票。
+func (rf *Raft) ProposeConfChange(newVoters []int) (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != Leader {
+		return -1, false
+	}
+	if rf.pendingConf {
+		return -1, false // 上一次变更仍在途，拒绝堆叠
+	}
+	idx := rf.lastLogIndex() + 1
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: ConfChange{NewVoters: append([]int(nil), newVoters...)}})
+	rf.pendingConf = true
+	rf.persist()
+	// 立刻唤醒一次复制（非阻塞，缓冲 1 自动合批）。
+	select {
+	case rf.kickCh <- struct{}{}:
+	default:
+	}
+	return idx, true
+}
+
 // ============================== 选举 ==============================
 
 // SetElectionTimeoutFn 注入自定义选举超时生成器（每次重置计时器时调用一次）。
@@ -526,11 +630,15 @@ func (rf *Raft) startElection() {
 			if !reply.VoteGranted {
 				return
 			}
+			// 只统计当前投票配置内的成员（I192）：被移除的节点票权不再计入 quorum。
+			if !rf.inCfg(i) {
+				return
+			}
 			pmu.Lock()
 			preVotes++
 			got := preVotes
 			pmu.Unlock()
-			if got == len(rf.peers)/2+1 {
+			if got == len(rf.cfg)/2+1 {
 				rf.doRealElection(preTerm, lastIdx, lastTerm, me)
 			}
 		}(i, args)
@@ -586,11 +694,15 @@ func (rf *Raft) doRealElection(preTerm int, lastIdx, lastTerm, me int) {
 				return
 			}
 			if args.Term == rf.currentTerm && rf.role == Candidate && reply.VoteGranted {
+				// 只统计当前投票配置内的成员（I192）。
+				if !rf.inCfg(i) {
+					return
+				}
 				mu.Lock()
 				votes++
 				got := votes
 				mu.Unlock()
-				if got == len(rf.peers)/2+1 {
+				if got == len(rf.cfg)/2+1 {
 					rf.becomeLeader()
 				}
 			}
@@ -661,6 +773,7 @@ func (rf *Raft) becomeLeader() {
 	}
 	rf.role = Leader
 	rf.leaderId = rf.me // 成为 leader 后自身即 leader，Status 据此回报 me
+	rf.pendingConf = false // 新 leader 没有自己提议的在途成员变更（旧 leader 的 pending 与此无关）
 	// 新任期必须重新提交一条当前任期 no-op 才能提交旧任期条目；重置该标记，
 	// 确保 GetShard 等传输守卫在重新提交 no-op 之前不会传出陈旧快照。
 	rf.committedCurrentTerm = false
@@ -780,18 +893,25 @@ func (rf *Raft) resetHeartbeatTimer() {
 }
 
 // advanceCommit 依据 matchIndex 推进 commitIndex（多数派复制到的位置才提交）。
+// 多数派严格按当前投票配置 cfg 计算：只有 cfg 中的成员计票，quorum = len(cfg)/2+1。
+// 这样 witness 加入/移除投票集合后，提交门槛随配置实时变化（动态重配置的核心）。
 func (rf *Raft) advanceCommit() {
 	if rf.role != Leader {
 		return
 	}
+	quorum := len(rf.cfg)/2 + 1
 	for n := rf.lastLogIndex(); n > rf.commitIndex; n-- {
-		count := 1
-		for i := range rf.peers {
-			if i != rf.me && rf.matchIndex[i] >= n {
+		count := 0
+		for _, i := range rf.cfg {
+			if i == rf.me {
+				count++ // 自己默认已复制
+				continue
+			}
+			if rf.matchIndex[i] >= n {
 				count++
 			}
 		}
-		if count > len(rf.peers)/2 && rf.entryTerm(n) == rf.currentTerm {
+		if count >= quorum && rf.entryTerm(n) == rf.currentTerm {
 			rf.commitIndex = n
 			rf.committedCurrentTerm = true // 当前任期条目已提交，旧任期写现可安全服务
 			rf.persist() // 持久化提交点：崩溃重启后据 commitIndex 重放已提交条目
@@ -1151,9 +1271,19 @@ func (rf *Raft) applier() {
 			Metrics.Counter("snapshots_installed").Inc()
 		} else {
 			pos := idx - rf.lastIncludedIndex - 1
+			cmd := rf.log[pos].Command
+			// 成员变更条目是 raft 内部命令（I192）：不投递给上层状态机，仅原子切换
+			// 投票配置 cfg。pendingConf 同步清零，允许 leader 提议下一次变更。
+			if cc, ok := cmd.(ConfChange); ok {
+				rf.cfg = append([]int(nil), cc.NewVoters...)
+				rf.pendingConf = false
+				rf.persist()
+				rf.mu.Unlock()
+				continue
+			}
 			msg = ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[pos].Command,
+				Command:      cmd,
 				CommandIndex: idx,
 			}
 			Metrics.Counter("log_applied").Inc()
@@ -1217,6 +1347,13 @@ func makeRaft(peers []*ClientEnd, me int, persister Persister, applyCh chan Appl
 		isWitness:         isWitness,
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
+
+	// 默认投票配置：全部 peer 均为投票成员。运行中若经 ConfChange 变更，会由
+	// readPersist 从持久化状态恢复（持久化早于本默认设定，覆盖之）。
+	rf.cfg = make([]int, len(peers))
+	for i := range peers {
+		rf.cfg[i] = i
+	}
 
 	rf.readPersist(persister.ReadRaftState())
 	if snap := persister.ReadSnapshot(); snap != nil {
