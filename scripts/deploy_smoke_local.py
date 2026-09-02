@@ -14,7 +14,7 @@ Go 二进制：
 那套端点契约，并额外做一次真实故障演练——从而在没有 docker 的机器上，依然能
 证明「这套部署件真的起得来、真的能服务、挂一个副本真的还能用」。
 
-检查项（共 14 项，全绿即 deploy 交付物在真实进程 + 真实 TCP 下确认可用）：
+检查项（共 16 项，全绿即 deploy 交付物在真实进程 + 真实 TCP 下确认可用）：
   1. 6 个 kvnode 的 /healthz 全部 200
   2. gateway /readyz 200（集群可读可写）
   3. 经 gateway 做真实 PUT/GET 往返，值必须一致
@@ -33,6 +33,11 @@ Go 二进制：
      合法 exposition（UP）——证明监控栈在真实进程下完整覆盖部署拓扑。
  14. 监控平面：alerts.yml 每条规则的「指标 + 标签选择器」在实时抓取序列中至少命中 1 条——
      告警是活规则（非死规则），即真实 Prometheus 也会对活数据求值。
+ 15. Grafana 面板活契约：dashboard JSON 里每个面板查询引用的指标名都必须真实存在——
+     面板查了一个代码没暴露的指标，看板恒空但没人知道（防「看板幻觉」）。
+ 16. loadgen 真实压测：deploy loadgen profile 同款命令（kvcli bench mixed 500 ops ×
+     8 workers）经 gateway 打真实混合负载，且在 kill 一个副本之后跑——批量并发
+     下降级 quorum 仍稳、errors=0。
 
 注：13/14 用标准库复刻了 Prometheus 的「抓取 + 告警求值」语义，无需 Docker / 无需
 Prometheus 二进制（本环境 wsl 黑名单 + 大文件下载被限速，二者皆不可得）；一旦取得原生
@@ -229,7 +234,7 @@ class Smoke:
         # 跨模块污染；②构建失败（尤其 not in std）时清空 GOCACHE 重试，最多 3 次，兜住 flake。
         env = dict(os.environ)
         env["GOCACHE"] = os.path.join(ROOT, ".gocache_smoke")
-        pkgs = ("kvnode", "gateway")
+        pkgs = ("kvnode", "gateway", "kvcli")
         for attempt in range(1, 4):
             built = True
             for pkg in pkgs:
@@ -267,7 +272,7 @@ class Smoke:
         self._p(f"✓ 本地部署清单已生成：{self.cfg_path}")
 
     # ---------- 启动 ----------
-    def launch(self, pkg, label, args):
+    def launch(self, pkg, label, args, env_extra=None):
         """启动一个真实进程。pkg 是二进制名（kvnode/gateway），label 仅用于日志与识别。"""
         ext = ".exe" if os.name == "nt" else ""
         binpath = os.path.join(self.bin_dir, pkg + ext)
@@ -275,7 +280,11 @@ class Smoke:
             raise FileNotFoundError(f"二进制不存在: {binpath}（构建失败？）")
         logpath = os.path.join(self.log_dir, f"{label}.log")
         logf = open(logpath, "w", encoding="utf-8", errors="replace")
-        p = subprocess.Popen([binpath] + args, cwd=ROOT,
+        env = None
+        if env_extra:
+            env = dict(os.environ)
+            env.update(env_extra)
+        p = subprocess.Popen([binpath] + args, cwd=ROOT, env=env,
                              stdout=logf, stderr=subprocess.STDOUT)
         self.procs.append((label, p, logf))
         return p
@@ -290,9 +299,13 @@ class Smoke:
             self.launch("kvnode", f"kvnode-g0-{i}",
                         ["-config", self.cfg_path, "-name", f"g0-{i}",
                          "-http", f"127.0.0.1:{b+KV_HTTP[i]}"])
+        # 网关按 RAFTKV_CLIENT_RATE 调高每客户端限流（默认 200 rps/burst 40 会被
+        # 8 workers 压测打爆成 429——见 I186b 根因）。全局并发 maxConcurrent=64 仍兜底。
         self.launch("gateway", "gateway",
                     ["-connect", self.cfg_path,
-                     "-addr", f"127.0.0.1:{b+GW_PORT}"])
+                     "-addr", f"127.0.0.1:{b+GW_PORT}"],
+                    env_extra={"RAFTKV_CLIENT_RATE": "100000",
+                               "RAFTKV_CLIENT_BURST": "10000"})
         self._p(f"✓ 已启动 {len(self.procs)} 个真实进程"
                 f"（3 ShardMaster + 3 ShardKV + 1 Gateway，真实 TCP）")
 
@@ -419,6 +432,9 @@ class Smoke:
         #    quorum 容错测试，不属于监控覆盖度验证。
         ok &= self.verify_monitoring_plane()
 
+        # 15. Grafana 面板活契约（防看板幻觉，同样需健康拓扑）
+        ok &= self.verify_dashboard_contract()
+
         # 6. 故障演练：kill 一个 ShardKV 副本，quorum 2/3 仍可服务
         victim = None
         for name, p, _ in self.procs:
@@ -439,6 +455,9 @@ class Smoke:
                              survived, f"put={st2} get={st3} value={got3.strip()!r}")
         else:
             ok &= self.check("故障演练：找到目标副本", False, "未找到 kvnode-g0-2")
+
+        # 16. loadgen 真实压测（在 kill 副本后跑：批量并发下降级 quorum 仍稳）
+        ok &= self.verify_loadgen()
 
         # 10. alerts.yml 契约：每条告警引用的「指标名」+「{label=...} 匹配器」都真实存在。
         #     比单纯指标名更深一层——http_responses_total{code=~"5.."} 指标名在、但 code
@@ -530,6 +549,32 @@ class Smoke:
         return ok
 
     # ---------- 监控平面：复刻 Prometheus 抓取 + 告警求值语义 ----------
+    def _scrape_live(self):
+        """按 prometheus.yml 目标清单真实抓取 7 端点（6 节点 + 1 网关）。
+
+        prometheus.yml 里节点统一抓容器端口 :9100、网关抓 :8080；本地真机进程监听
+        port_base + 偏移，故按 6 节点（SM_HTTP + KV_HTTP）+ 1 网关（GW_PORT）映射。
+        返回 (up_count, live_names, live_labels)：up_count = 返回合法 exposition 的
+        端点数；live_names = 全部指标名；live_labels = {指标名: 真实 emit 的标签名集}。
+        """
+        b = self.port_base
+        node_offsets = [SM_HTTP[0], SM_HTTP[1], SM_HTTP[2],
+                        KV_HTTP[0], KV_HTTP[1], KV_HTTP[2]]
+        targets = [b + o for o in node_offsets] + [b + GW_PORT]
+        up_count = 0
+        live_names = set()
+        live_labels = {}
+        for port in targets:
+            st, body = http("GET", f"http://127.0.0.1:{port}/metrics",
+                            headers={"Accept": PROM_ACCEPT})
+            if st == 200 and "# TYPE" in body and "# HELP" in body:
+                up_count += 1
+                n, l = _extract_metrics_and_labels(body)
+                live_names |= n
+                for k, v in l.items():
+                    live_labels.setdefault(k, set()).update(v)
+        return up_count, live_names, live_labels
+
     def verify_monitoring_plane(self):
         """复刻 Prometheus 的「抓取 + 告警求值」语义，对真实进程验证监控平面可用。
 
@@ -542,31 +587,11 @@ class Smoke:
             选择器」与实时抓取序列比对，至少命中 1 条活序列才判活规则——即真实 Prometheus 
             也会对活数据求值（非死规则）。
         """
-        b = self.port_base
         ok = True
 
-        # ---- 抓取层：按 prometheus.yml 目标清单映射真实进程端口 ----
-        topo = _deploy_topo()
-        # prometheus.yml 里节点统一抓容器端口 :9100、网关抓 :8080；本地真机进程监听
-        # port_base + 偏移，故按 6 节点（SM_HTTP + KV_HTTP）+ 1 网关（GW_PORT）映射。
-        node_offsets = [SM_HTTP[0], SM_HTTP[1], SM_HTTP[2],
-                        KV_HTTP[0], KV_HTTP[1], KV_HTTP[2]]
-        live_targets = [("node", b + o) for o in node_offsets] + [("gateway", b + GW_PORT)]
-
-        up_count = 0
-        live_names = set()
-        live_labels = {}     # 指标名 -> {真实 emit 的标签名}
-        for kind, port in live_targets:
-            st, body = http("GET", f"http://127.0.0.1:{port}/metrics",
-                            headers={"Accept": PROM_ACCEPT})
-            valid = st == 200 and "# TYPE" in body and "# HELP" in body
-            if valid:
-                up_count += 1
-                n, l = _extract_metrics_and_labels(body)
-                live_names |= n
-                for k, v in l.items():
-                    live_labels.setdefault(k, set()).update(v)
-        expected = len(live_targets)
+        # ---- 抓取层（第 13 项）：按 prometheus.yml 目标清单真实抓取 7 端点 ----
+        up_count, live_names, live_labels = self._scrape_live()
+        expected = 7
         ok &= self.check(
             f"监控平面：按 prometheus.yml 抓取 {expected} 端点全部 UP（{up_count}/{expected}）",
             up_count == expected,
@@ -646,6 +671,95 @@ class Smoke:
                 return True
         return False
 
+    def verify_dashboard_contract(self):
+        """第 15 项：Grafana 面板活契约——dashboard JSON 每个面板查询引用的指标名
+        都必须在实时抓取序列中真实存在。
+
+        防「看板幻觉」：面板查了一个代码根本没暴露的指标，Grafana 不会报错，
+        看板永远空白但没人知道——与 alerts 死规则同构，但藏在 JSON 里更深一层。
+        """
+        ok = True
+        _, live_names, _ = self._scrape_live()
+        dash_dir = os.path.join(ROOT, "deploy", "grafana", "dashboards")
+        missing = []
+        queries = 0
+        if os.path.isdir(dash_dir):
+            for fn in sorted(os.listdir(dash_dir)):
+                if not fn.endswith(".json"):
+                    continue
+                try:
+                    d = json.load(open(os.path.join(dash_dir, fn), encoding="utf-8"))
+                except Exception as e:  # noqa: BLE001
+                    missing.append(f"{fn}: JSON 解析失败 {e}")
+                    continue
+                exprs = []
+                self._collect_queries(d, exprs)
+                queries += len(exprs)
+                for e in exprs:
+                    for tok in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", e):
+                        if tok in PROM_BUILTIN or tok in PROM_FUNCS or tok in PROM_LABELS:
+                            continue
+                        if not self._looks_metric(tok):
+                            continue
+                        if not _metric_exists(tok, live_names):
+                            missing.append(f"{tok}  ←  {fn}")
+        missing = sorted(set(missing))
+        ok &= self.check(
+            "Grafana 面板活契约（dashboard 引用指标全部真实存在，无看板幻觉）",
+            len(missing) == 0,
+            f"{queries} 条面板查询 · 幻觉指标 {len(missing)} 个"
+            + ("" if not missing else "：\n      " + "\n      ".join(missing)))
+        return ok
+
+    @staticmethod
+    def _collect_queries(node, out):
+        """递归收集 dashboard JSON 里所有查询表达式（expr/query/rawQuery 字段）。"""
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k in ("expr", "query", "rawQuery") and isinstance(v, str) and v.strip():
+                    out.append(v)
+                else:
+                    Smoke._collect_queries(v, out)
+        elif isinstance(node, list):
+            for x in node:
+                Smoke._collect_queries(x, out)
+
+    def verify_loadgen(self):
+        """第 16 项：loadgen 真实压测——deploy loadgen profile 同款命令
+        （kvcli bench loadgen mixed 500 8）对 gateway 打真实混合负载。
+
+        本检查在 kill 一个 ShardKV 副本「之后」执行：批量并发下降级 quorum
+        仍稳、errors=0，比单次 PUT/GET 强一个量级的真实负载证据。
+        网关已按 RAFTKV_CLIENT_RATE 调高每客户端限流（否则 8 workers 会被
+        默认 200 rps 桶打爆成 429——那正是 I186b 诊断出的部署缺口）。
+        """
+        ext = ".exe" if os.name == "nt" else ""
+        kvcli = os.path.join(self.bin_dir, "kvcli" + ext)
+        if not os.path.exists(kvcli):
+            return self.check("loadgen 真实压测", False, "kvcli 二进制不存在（构建失败？）")
+        gw = f"http://127.0.0.1:{self.port_base + GW_PORT}"
+        try:
+            p = subprocess.run(
+                [kvcli, "-addr", gw, "bench", "loadgen", "mixed", "500", "8"],
+                cwd=ROOT, capture_output=True, text=True, timeout=90)
+        except subprocess.TimeoutExpired:
+            return self.check("loadgen 真实压测", False, "bench 超时（>90s）")
+        out = (p.stdout or "") + (p.stderr or "")
+        m = re.search(r"ops=(\d+) duration=(\S+) ops/sec=([\d.]+) errors=(\d+)", out)
+        if not m:
+            return self.check("loadgen 真实压测", False,
+                              f"输出不可解析（returncode={p.returncode}）：{out[:200]!r}")
+        ops, dur, opssec, errs = (int(m.group(1)), m.group(2),
+                                  float(m.group(3)), int(m.group(4)))
+        lat = re.search(r"p50=([\d.]+) p95=([\d.]+) p99=([\d.]+)", out)
+        lat_s = (f" p50={lat.group(1)}ms p95={lat.group(2)}ms p99={lat.group(3)}ms"
+                 if lat else "")
+        good = p.returncode == 0 and ops == 500 and errs == 0
+        return self.check(
+            "loadgen 真实压测（bench mixed 500 ops × 8 workers，kill 副本后零错误）",
+            good,
+            f"ops={ops} errors={errs} 用时={dur}（{opssec:.0f} ops/s）{lat_s}")
+
     # ---------- 清理 ----------
     def cleanup(self, keep=False):
         for name, p, logf in self.procs:
@@ -688,6 +802,8 @@ def _write_smoke_report(smoke, ok, port_base, quiet=False):
             "quorum_survived": _all(["kill"]),
             "alerts_metric_contract_ok": _all(["alerts.yml"]),
             "topology_consistent": _all(["拓扑"]),
+            "dashboard_contract_ok": _all(["Grafana"]),
+            "loadgen_ok": _all(["压测"]),
         },
     }
     report_path = os.path.join(ROOT, "deploy", "smoke_report.json")

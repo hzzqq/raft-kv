@@ -97,6 +97,12 @@ services:
       dockerfile: deploy/Dockerfile
     container_name: raftkv-gateway
     command: ["gateway", "-connect", "/etc/raftkv/cluster.json", "-addr", ":8080"]
+    environment:
+      # I186b：loadgen profile 以 8 workers 压测，默认每客户端桶（200 rps/burst 40）
+      # 会被快速后端打爆成 429 洪水。调高每客户端限流让压测流量真实打到集群；
+      # 全局在途并发 maxConcurrent=64 仍兜底，不会失去过载保护。
+      RAFTKV_CLIENT_RATE: "5000"
+      RAFTKV_CLIENT_BURST: "1000"
     restart: unless-stopped
     networks: [raftkv]
     volumes:

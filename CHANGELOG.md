@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–185，共 137 轮交付；时间跨度 2026-07-19 ~ 2026-09-02T13:09:00。
+> 覆盖 cycle 39–186，共 138 轮交付；时间跨度 2026-07-19 ~ 2026-09-02T16:20:00。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -180,6 +180,7 @@
 - **[183] `deploy_gate_i183`** — 续推：I182 只验证了告警指标名，更深的隐性失效仍有敞口——标签匹配器、监控拓扑漂移、故障强度标注落后、quorum 证据不可展示，四项一次性收口（隐性：指标名对了但引用的标签没 emit 仍静默失效；prometheus.yml 与 docker-compose 端口/副本数对不齐会静默无数据（抓盲）；控制台 migration 卡仍写三重，而场景 D 实验早已升四重（含配置抖动 Leave/Join）；quorum 容错证据只活在进程退出后的 stdout，不可审计/不可展示；score=22）
 - **[184] `migration_fivefold_i184`** — 指令 B 续推：在场景 D 四重并发故障（I179 升、I183 标注）基础上继续叠更狠的迁移故障强度，而非停在四重（隐性：单波连续网络分区是较软目标——系统收敛一次即可保持稳定；而「愈合→立即再分裂」振荡会强制二次 leader 重选 + 二次配置再收敛，是比单波分区更狠的真实正确性压力；难点路径必须持续加压、不能停在已有强度上；score=18）
 - **[185] `monitoring_plane_equiv_i185`** — 指令「自己想办法解决」：docker/wsl 被黑名单挡死、Prometheus/Grafana 二进制大文件下载限速不可得，绕过硬约束用标准库等价复刻 Prometheus「抓取+告警求值」语义，给 deploy 监控平面（docker-compose 相对原生冒烟唯一缺口）拿到真实运行时证据（隐性：docker-compose 相对 deploy_smoke 唯一多的是 Prometheus/Grafana 真实抓取；拿不到原生二进制就停在跑不了是借口，要用标准库复刻等价语义证明监控平面确实覆盖全部端点且 alerts 是活规则；score=18）
+- **[186] `deploy_dashboard_loadgen_i186`** — 老板指令「继续自驱下一轮，可选方向都做」：①Grafana dashboard 指标名做活契约校验（防看板幻觉）②loadgen 真实压测路径进冒烟（从单次 PUT/GET 升级为批量并发负载）（隐性：冒烟 12→14 项只覆盖了 alerts 死规则与拓扑漂移，但看板 JSON 里的幻觉指标（面板恒空无人知）与真实并发负载下的端到端行为仍是盲区；且 loadgen 一进去就撞上网关限流不可调的部署级缺口；score=19）
 
 ---
 

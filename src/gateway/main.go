@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -72,6 +73,23 @@ func main() {
 	nGroups := len(c.Groups)
 	s := NewServer(c)
 	s.Init(nGroups)
+
+	// I186b：每客户端限流可用环境变量覆盖（NewServer 默认 200 rps / burst 40）。
+	// 背景：deploy 的 loadgen profile 以 8 workers 压测网关，后端响应极快时单客户端
+	// 速率远超默认桶，压测会被 429 打断（config.go 的配置机制此前未接入 main，
+	// 部署方无法调参）。部署方可按需调高（如 5000）；全局并发上限 maxConcurrent=64
+	// 仍兜底，不会失去过载保护。RAFTKV_CLIENT_RATE 设为 0 表示关闭每客户端限流。
+	if v := os.Getenv("RAFTKV_CLIENT_RATE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			burst := 40
+			if w := os.Getenv("RAFTKV_CLIENT_BURST"); w != "" {
+				if n, err2 := strconv.Atoi(w); err2 == nil && n > 0 {
+					burst = n
+				}
+			}
+			s.SetClientRateLimit(f, burst)
+		}
+	}
 
 	srv := &http.Server{Addr: *addr, Handler: s.Handler()}
 	s.SetHTTPServer(srv)
