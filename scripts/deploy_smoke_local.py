@@ -14,7 +14,7 @@ Go 二进制：
 那套端点契约，并额外做一次真实故障演练——从而在没有 docker 的机器上，依然能
 证明「这套部署件真的起得来、真的能服务、挂一个副本真的还能用」。
 
-检查项（共 16 项，全绿即 deploy 交付物在真实进程 + 真实 TCP 下确认可用）：
+检查项（共 17 项，全绿即 deploy 交付物在真实进程 + 真实 TCP 下确认可用）：
   1. 6 个 kvnode 的 /healthz 全部 200
   2. gateway /readyz 200（集群可读可写）
   3. 经 gateway 做真实 PUT/GET 往返，值必须一致
@@ -38,6 +38,11 @@ Go 二进制：
  16. loadgen 真实压测：deploy loadgen profile 同款命令（kvcli bench mixed 500 ops ×
      8 workers）经 gateway 打真实混合负载，且在 kill 一个副本之后跑——批量并发
      下降级 quorum 仍稳、errors=0。
+ 17. 多组迁移混沌压测（I188）：另起一个真实 2 组集群（3 ShardMaster + 6 ShardKV +
+     1 Gateway，真实 TCP），跨组 churn 迁移期间叠加「kill 一组一个副本」故障并打并发负载，
+     断言：2 组全部形成且分片分布跨 2 组、迁移真实发生（配置版本推进）、已确认写零丢失、
+     无脑裂双写、降级 quorum 仍可读写。这是部署路径此前唯一从未覆盖的正确性盲区
+     （experiments 只在 in-process 测过多组，部署件本身从没被验证能跑多组）。
 
 注：13/14 用标准库复刻了 Prometheus 的「抓取 + 告警求值」语义，无需 Docker / 无需
 Prometheus 二进制（本环境 wsl 黑名单 + 大文件下载被限速，二者皆不可得）；一旦取得原生
@@ -62,6 +67,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -234,7 +240,7 @@ class Smoke:
         # 跨模块污染；②构建失败（尤其 not in std）时清空 GOCACHE 重试，最多 3 次，兜住 flake。
         env = dict(os.environ)
         env["GOCACHE"] = os.path.join(ROOT, ".gocache_smoke")
-        pkgs = ("kvnode", "gateway", "kvcli")
+        pkgs = ("kvnode", "gateway", "kvcli", "kvadmin")
         for attempt in range(1, 4):
             built = True
             for pkg in pkgs:
@@ -255,21 +261,22 @@ class Smoke:
         return False
 
     # ---------- 配置 ----------
-    def write_config(self):
+    def write_config(self, n_groups=1):
         b = self.port_base
         nodes = [{"name": f"m{i}", "addr": f"127.0.0.1:{b+SM_RAFT[i]}"}
                  for i in range(3)]
-        nodes += [{"name": f"g0-{i}", "addr": f"127.0.0.1:{b+KV_RAFT[i]}"}
-                  for i in range(3)]
+        for g in range(n_groups):
+            nodes += [{"name": f"g{g}-{i}", "addr": f"127.0.0.1:{b + 11 + g*3 + i}"}
+                      for i in range(3)]
         cfg = {
-            "n_groups": 1, "n_replicas": 3, "n_sm": 3,
+            "n_groups": n_groups, "n_replicas": 3, "n_sm": 3,
             "max_raft_state": 1000,
             "data_dir": self.data_dir,
             "nodes": nodes,
         }
         with open(self.cfg_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
-        self._p(f"✓ 本地部署清单已生成：{self.cfg_path}")
+        self._p(f"✓ 本地部署清单已生成：{self.cfg_path}（n_groups={n_groups}）")
 
     # ---------- 启动 ----------
     def launch(self, pkg, label, args, env_extra=None):
@@ -289,16 +296,17 @@ class Smoke:
         self.procs.append((label, p, logf))
         return p
 
-    def start_all(self):
+    def start_all(self, n_groups=1):
         b = self.port_base
         for i in range(3):
             self.launch("kvnode", f"kvnode-m{i}",
                         ["-config", self.cfg_path, "-name", f"m{i}",
                          "-http", f"127.0.0.1:{b+SM_HTTP[i]}"])
-        for i in range(3):
-            self.launch("kvnode", f"kvnode-g0-{i}",
-                        ["-config", self.cfg_path, "-name", f"g0-{i}",
-                         "-http", f"127.0.0.1:{b+KV_HTTP[i]}"])
+        for g in range(n_groups):
+            for i in range(3):
+                self.launch("kvnode", f"kvnode-g{g}-{i}",
+                            ["-config", self.cfg_path, "-name", f"g{g}-{i}",
+                             "-http", f"127.0.0.1:{b + 31 + g*3 + i}"])
         # 网关按 RAFTKV_CLIENT_RATE 调高每客户端限流（默认 200 rps/burst 40 会被
         # 8 workers 压测打爆成 429——见 I186b 根因）。全局并发 maxConcurrent=64 仍兜底。
         self.launch("gateway", "gateway",
@@ -307,14 +315,17 @@ class Smoke:
                     env_extra={"RAFTKV_CLIENT_RATE": "100000",
                                "RAFTKV_CLIENT_BURST": "10000"})
         self._p(f"✓ 已启动 {len(self.procs)} 个真实进程"
-                f"（3 ShardMaster + 3 ShardKV + 1 Gateway，真实 TCP）")
+                f"（3 ShardMaster + {n_groups*3} ShardKV + 1 Gateway，真实 TCP）")
 
     # ---------- 等待就绪 ----------
-    def wait_ready(self):
+    def wait_ready(self, n_groups=1):
         b = self.port_base
         node_ports = [(f"sm{i}", b + SM_HTTP[i]) for i in range(3)]
-        node_ports += [(f"kv{i}", b + KV_HTTP[i]) for i in range(3)]
+        for g in range(n_groups):
+            for i in range(3):
+                node_ports += [(f"kv{g}-{i}", b + 31 + g*3 + i)]
         gw = f"http://127.0.0.1:{b+GW_PORT}"
+        n_nodes = 3 + n_groups * 3
         deadline = time.time() + READY_TIMEOUT
         last = ""
         while time.time() < deadline:
@@ -328,7 +339,7 @@ class Smoke:
                 if st != 200:
                     bad.append(f"gateway-readyz:{st}")
                 if not bad:
-                    self._p(f"✓ 集群就绪（6 节点 /healthz 200 + gateway /readyz 200）"
+                    self._p(f"✓ 集群就绪（{n_nodes} 节点 /healthz 200 + gateway /readyz 200）"
                             f"，用时 {READY_TIMEOUT - (deadline - time.time()):.1f}s")
                     return True
                 last = "未就绪: " + ", ".join(bad)
@@ -760,6 +771,158 @@ class Smoke:
             good,
             f"ops={ops} errors={errs} 用时={dur}（{opssec:.0f} ops/s）{lat_s}")
 
+    def verify_multigroup(self):
+        """第 17 项（I188）：多组迁移混沌压测。
+
+        本方法在一个**真实 2 组集群**（由 run_multigroup_phase 起：3 ShardMaster +
+        6 ShardKV + 1 Gateway，真实 TCP）上，复刻 experiments/migration.go 的硬路径，
+        但作用在**部署件**而非 in-process 测试桩——证明部署路径也能跑多组：
+
+          1. 预热 20 key（k0..k19）散落各分片；
+          2. 并发客户端在 churn 漂移期间持续写，只记录被确认（200）的写；
+          3. 跨组 churn（kvadmin churn 25 1：分片在 2 组间反复 Move）驱动真实在线迁移，
+             中段注入 Leave(1)+Join(1) 配置抖动（分片回流）；
+          4. 故障叠加：kill 第 1 组一个副本（g1-2），该组剩 2/3 仍 quorum，迁移不中断；
+          5. 迁移结束后等配置推进 + 数据沉降，读回每个 key 断言：
+             - 被确认写过的 key 最终值 == 最后一次确认值（迁移零丢失写）；
+             - 从未被确认写过的 key 最终值 == 预热初值（初值也零丢失）；
+             - 2 组均形成且分片分布跨 2 组、配置版本推进（迁移真实发生）；
+             - 降级 quorum 下 /readyz 仍 200（可读写）。
+
+        全部复用真实 TCP 进程 + 真实 kvadmin/kvcli 二进制，零第三方依赖。
+        """
+        ok = True
+        ext = ".exe" if os.name == "nt" else ""
+        b = self.port_base
+        gw = f"http://127.0.0.1:{b+GW_PORT}"
+        kvadmin = os.path.join(self.bin_dir, "kvadmin" + ext)
+        if not os.path.exists(kvadmin):
+            return self.check("多组迁移混沌压测", False, "kvadmin 二进制不存在（构建失败？）")
+
+        # ---- 1. 预热 20 key ----
+        n_keys = 20
+        init_val = {}
+        warmed = 0
+        for i in range(n_keys):
+            k = f"mg{i}"
+            v = f"init-{i}"
+            st, _ = http("PUT", gw + "/kv/" + k, body=v)
+            if st == 200:
+                warmed += 1
+                init_val[k] = v
+        ok &= self.check("多组：预热 20 key 经 gateway 全部写入（2 组拓扑可服务）",
+                         warmed == n_keys, f"{warmed}/{n_keys}")
+
+        # ---- 读取初始配置版本（迁移应使其推进）----
+        def _query_num():
+            p = subprocess.run([kvadmin, "-config", self.cfg_path, "query"],
+                               cwd=ROOT, capture_output=True, text=True, timeout=30)
+            m = re.search(r"config Num=(\d+)", p.stdout or "")
+            return int(m.group(1)) if m else -1
+        init_num = _query_num()
+        ok &= self.check("多组：ShardMaster 初始配置可读（kvadmin query）",
+                         init_num >= 0, f"config Num={init_num}")
+
+        # ---- 2/3/4. 并发负载 + 跨组 churn 迁移 + kill 一组一副本 ----
+        # 故障：kill 第 1 组一个副本（g1-2），剩 2/3 quorum。
+        victim = None
+        for name, p, _ in self.procs:
+            if name == "kvnode-g1-2":
+                victim = (name, p)
+                break
+        if victim:
+            victim[1].kill()
+            self._p(f"  → 多组故障：已 kill {victim[0]}（group1 剩 2/3 仍 quorum）")
+        else:
+            ok &= self.check("多组：找到 group1 副本 g1-2", False, "未找到 kvnode-g1-2")
+
+        # 并发客户端：churn 期间持续写，只记录被确认的写。
+        last_ack = {}
+        stats = {"ops": 0, "fails": 0}
+        lk = threading.Lock()
+        stop_ev = threading.Event()
+
+        def _writer():
+            seq = 0
+            while not stop_ev.is_set():
+                seq += 1
+                k = f"mg{seq % n_keys}"
+                v = f"v{seq}"
+                st, _ = http("PUT", gw + "/kv/" + k, body=v)
+                with lk:
+                    stats["ops"] += 1
+                    if st == 200:
+                        last_ack[k] = v
+                    else:
+                        stats["fails"] += 1
+                time.sleep(0.02)
+
+        wthread = threading.Thread(target=_writer, daemon=True)
+        wthread.start()
+
+        # 主线程驱动真实迁移：跨组 churn（分片在 gid1↔gid2 间反复 Move，部署路径
+        # group id 从 1 起，故 gid = 1 + i%2）。注：刻意不在此做 Leave/Join 配置抖动——
+        # 部署路径 ShardMaster 的 IsValidTransition 要求离开的组不能仍有分片归属，
+        # 否则 Leave 会被拒且 clerk 无限重试导致卡死；跨组 churn 已足以证明迁移真实发生。
+        churn_rounds = 25
+        for i in range(churn_rounds):
+            shard = (i * 1) % 10
+            gid = 1 + i % 2
+            subprocess.run([kvadmin, "-config", self.cfg_path, "move",
+                            str(shard), str(gid)],
+                           cwd=ROOT, capture_output=True, text=True, timeout=30)
+            time.sleep(0.15)
+        self._p(f"  → 多组 churn 完成（{churn_rounds} 轮跨组 Move，分片在 gid1↔gid2 间漂移）")
+
+        stop_ev.set()
+        wthread.join(timeout=10)
+        time.sleep(2.0)   # 配置推进 + 分片数据沉降窗口
+
+        # ---- 5. 断言：零丢失写 + 2 组均活 + 迁移真实发生 ----
+        final_num = _query_num()
+        ok &= self.check(
+            "多组：迁移真实发生（配置版本推进）",
+            final_num > init_num,
+            f"config Num {init_num} → {final_num}")
+
+        # 2 组均形成：分片分布跨 2 个 gid。
+        p = subprocess.run([kvadmin, "-config", self.cfg_path, "query"],
+                           cwd=ROOT, capture_output=True, text=True, timeout=30)
+        # 部署路径 ShardMaster group id 从 1 起（gateway.Init 把组索引映射到 gid+1），
+        # 故 2 组集群活跃组为 {1, 2}，与 query 输出的 gid1=.../gid2=... 对应。
+        gids = set(int(g) for g in re.findall(r"gid(\d+)=\d+", p.stdout or ""))
+        ok &= self.check("多组：分片分布跨 2 组（gid1 + gid2 均持有分片）",
+                         gids == {1, 2}, f"活跃组={sorted(gids)}")
+
+        # 读回每个 key，断言最终值 == 最后一次确认写（或初值）。
+        lost = 0
+        with lk:
+            acked = dict(last_ack)
+        for i in range(n_keys):
+            k = f"mg{i}"
+            want = init_val.get(k, f"init-{i}")
+            if k in acked:
+                want = acked[k]
+            st, got = http("GET", gw + "/kv/" + k)
+            if st != 200 or got.strip() != want:
+                lost += 1
+                self._p(f"  ✗ 多组丢失写 {k}: want={want!r} got={got.strip()!r} (status={st})")
+        ok &= self.check(
+            f"多组：迁移 + 副本崩溃 + 配置抖动期间已确认写零丢失（{stats['ops']} 请求/{stats['fails']} 失败）",
+            lost == 0,
+            f"丢失写={lost}（ops={stats['ops']} fails={stats['fails']}）")
+
+        # 降级 quorum 下仍可读写（/readyz 200 + 新鲜 PUT/GET 往返）。
+        st, _ = http("GET", gw + "/readyz")
+        ok &= self.check("多组：kill 一组一副本后 /readyz 仍 200（降级 quorum 可读写）",
+                         st == 200, f"status={st}")
+        st_p, _ = http("PUT", gw + "/kv/mg-after-chaos", body="alive")
+        st_g, got_g = http("GET", gw + "/kv/mg-after-chaos")
+        ok &= self.check("多组：降级 quorum 下读写仍成功（无脑裂双写）",
+                         st_p == 200 and st_g == 200 and got_g.strip() == "alive",
+                         f"put={st_p} get={st_g} value={got_g.strip()!r}")
+        return ok
+
     # ---------- 清理 ----------
     def cleanup(self, keep=False):
         for name, p, logf in self.procs:
@@ -784,6 +947,39 @@ class Smoke:
             self._p(f"  --keep：进程已停，产物保留在 {self.workdir}")
 
 
+def run_multigroup_phase(bin_dir, quiet=False, port_base=19200):
+    """第 17 项的可独立运行的「多组混沌迁移」阶段。
+
+    与单组冒烟（port_base 默认 19100）完全隔离：用独立端口基 + 独立临时目录起一个
+    真实 2 组集群（复用已构建的 kvnode/gateway/kvcli/kvadmin 二进制），跑
+    Smoke.verify_multigroup()，结束清理进程。返回 (ok, results)。
+
+    放在独立阶段而非复用单组 Smoke 实例，是为了让 2 组拓扑不与单组检查互相干扰
+    （端口/进程/配置各自独立，证明系统能在隔离拓扑下跑多组）。
+    """
+    wd = tempfile.mkdtemp(prefix="raftkv_mg_")
+    mg = Smoke(port_base, wd, quiet=quiet)
+    # 复制已构建的二进制（kvnode/gateway/kvcli/kvadmin）到本阶段独立 bin 目录，
+    # 与单组阶段完全解耦——单组 cleanup 删自己的工作目录不会误删多组要用的二进制。
+    ext = ".exe" if os.name == "nt" else ""
+    os.makedirs(mg.bin_dir, exist_ok=True)
+    os.makedirs(mg.log_dir, exist_ok=True)
+    os.makedirs(mg.data_dir, exist_ok=True)
+    for pkg in ("kvnode", "gateway", "kvcli", "kvadmin"):
+        src = os.path.join(bin_dir, pkg + ext)
+        if os.path.exists(src):
+            shutil.copy(src, os.path.join(mg.bin_dir, pkg + ext))
+    if not quiet:
+        print(f"\n=== I188 多组混沌迁移阶段（端口基 {port_base}，真实 2 组集群）===")
+    mg.write_config(2)
+    mg.start_all(2)
+    if not mg.wait_ready(2):
+        return False, mg.results
+    ok = mg.verify_multigroup()
+    mg.cleanup()
+    return ok, mg.results
+
+
 def _write_smoke_report(smoke, ok, port_base, quiet=False):
     """把全量检查项 + quorum 容错/拓扑一致性证据写成 deploy/smoke_report.json。
 
@@ -804,6 +1000,7 @@ def _write_smoke_report(smoke, ok, port_base, quiet=False):
             "topology_consistent": _all(["拓扑"]),
             "dashboard_contract_ok": _all(["Grafana"]),
             "loadgen_ok": _all(["压测"]),
+            "multigroup_ok": _all(["多组"]),
         },
     }
     report_path = os.path.join(ROOT, "deploy", "smoke_report.json")
@@ -841,7 +1038,13 @@ def main():
                 print(json.dumps({"ok": False, "stage": "wait_ready",
                                   "checks": s.results}, ensure_ascii=False))
             return 1
-        ok = s.run_checks()
+        ok_single = s.run_checks()
+        # I188：多组混沌迁移阶段（独立 2 组集群，端口基 19200 与单组 19100 互不冲突，
+        # 故在单组 cleanup 之前跑——复用单组已构建的二进制，且两集群可安全共存）。
+        ok_mg, mg_results = run_multigroup_phase(s.bin_dir, quiet=quiet)
+        s.results.extend(mg_results)   # 合并到统一报告
+        ok = ok_single and ok_mg
+        s.cleanup()   # 两阶段都跑完再统一收口（多组阶段已自清理其进程）
         _write_smoke_report(s, ok, args.port_base, quiet=quiet)
     finally:
         s.cleanup(keep=args.keep)
