@@ -873,6 +873,17 @@ func (rf *Raft) LeadershipTransfer(target int) bool {
 		rf.mu.Unlock()
 		return false
 	}
+	// 护栏（I192 收尾，与 I189 同不变式）：target 必须仍是当前投票集合成员。
+	// 否则向 witness（I189 永不当选）或已被移除的节点转移，要么被对方拒绝 TimeoutNow
+	// 而留下"旧 leader 已退位、新 leader 没上位"的领导真空，要么把一个已不在 voter
+	// 集合的节点推上领导位（其提交 quorum 又只数在册 voter，行为诡异）。运维应改为
+	// 转移到在册 voter；与 pendingConf 护栏一起把"领导权转移 × 成员配置"的交互收口。
+	if !rf.inCfg(target) {
+		rf.mu.Unlock()
+		dbg("me=%d LeadershipTransfer refused: target %d not in current voter config", rf.me, target)
+		Metrics.Counter("raft_leadership_transfer_refused_total").Inc()
+		return false
+	}
 	needSync := rf.matchIndex[target] < rf.commitIndex
 	term := rf.currentTerm
 	rf.mu.Unlock()

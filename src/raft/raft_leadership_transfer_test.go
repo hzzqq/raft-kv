@@ -13,6 +13,7 @@ package raft
 
 import (
 	"testing"
+	"time"
 )
 
 func TestLeadershipTransferRefusesWithPendingConf(t *testing.T) {
@@ -99,5 +100,39 @@ func TestLeadershipTransferRefusesWithPendingConf(t *testing.T) {
 	rfs[0].mu.Unlock()
 	if !rfs[0].LeadershipTransfer(1) {
 		t.Fatalf("LeadershipTransfer should succeed when no membership change is in flight and target is reachable")
+	}
+}
+
+// TestLeadershipTransferRefusesNonVoterTarget 把某一节点移出投票集合后，向该已不在
+// voter 集合的节点发起领导权转移必须被拒绝（护栏：target 须仍是当前投票成员）。
+// 这覆盖"领导权转移 × 成员配置"交互的另一面——避免把领导权推给 witness/已移除节点
+// （I189 同不变式：witness 永不当选）。
+func TestLeadershipTransferRefusesNonVoterTarget(t *testing.T) {
+	cfg := makeConfig(t, 3)
+	defer cfg.cleanup()
+
+	leader := cfg.leader()
+	if leader < 0 {
+		t.Fatalf("no leader elected")
+	}
+	other := (leader + 1) % 3
+	removed := (leader + 2) % 3
+
+	// 把 removed 节点移出投票集合（保留 leader + other 两个 voter）。
+	if _, ok := cfg.rafts[leader].ProposeConfChange([]int{leader, other}); !ok {
+		t.Fatalf("leader %d failed to propose conf change", leader)
+	}
+	if !waitVoterConfig(t, cfg.rafts[leader], []int{leader, other}, 6*time.Second) {
+		t.Fatalf("cluster did not converge to voter set [%d,%d]", leader, other)
+	}
+
+	// 向已不在 voter 集合的 removed 节点转移，必须被拒绝（避免领导真空/推非 voter 上位）。
+	if cfg.rafts[leader].LeadershipTransfer(removed) {
+		t.Fatalf("LeadershipTransfer must refuse a target not in the current voter config")
+	}
+
+	// 向仍在 voter 集合的 other 转移应正常进行（护栏不过度拒绝）。
+	if !cfg.rafts[leader].LeadershipTransfer(other) {
+		t.Fatalf("LeadershipTransfer should succeed to an in-config voter")
 	}
 }
