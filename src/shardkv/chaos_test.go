@@ -177,6 +177,55 @@ func TestLeaderKillRecover(t *testing.T) {
 	}
 }
 
+// I195：选举抖动窗口线性一致读回归（命名回归，结构等同 TestLeaderKillRecover）。
+//
+// 根因：Get 的 ReadIndex 快路径此前仅判 HasLeaderLease()，而经 restartReplica 重建的副本
+// 在新任期 no-op 尚未提交（committedCurrentTerm 为 false）且状态机尚未回放已提交写
+// （localK 为空）时，HasLeaderLease() 因选举得票即算"多数派接触"而上任瞬间即为 true，于是
+// 快路径基于过时偏低的 commitIndex 读到尚未 apply 的空状态机、返回空值（写已提交却读到空）。
+// 修复后快路径被 HasLeaderLease()&&HasCommittedCurrentTerm() 双守卫拦截，回退 propose 经共识
+// 返回真实值（"v"）。
+//
+// 本测试在"杀主→新 leader 选出"的瞬间立即经 clerk 读（不给状态机回放留缓冲），断言读到的
+// 必然是真实值而非陈旧空——这正是修复前会偶发失败（写已提交却读到空）的窗口。多轮（cycles）
+// 放大捕捉概率。修复后该测试确定性绿；修复前会偶发 Fatalf（已线下验证：无守卫时
+// TestLeaderKillRecover 在 kill #1 即 Get(k)=""）。
+func TestLeaderKillReadNoStaleAfterElect(t *testing.T) {
+	const nGroups = 1
+	const cycles = 16
+	cfg := makeSKVConfig(t, nGroups, 3, 3, 0)
+	defer cfg.cleanup()
+	cfg.joinGroup(0)
+	cfg.waitGroupConfig(0, 0, 1)
+	ck := cfg.makeClerk()
+	ck.Put("k", "v") // 写点数据，验证恢复后可服务
+
+	for n := 0; n < cycles; n++ {
+		if lr := cfg.leaderOf(0); lr >= 0 {
+			cfg.restartReplica(0, lr)
+		}
+		// 等新一轮 leader 选出
+		deadline := time.Now().Add(12 * time.Second)
+		got := -1
+		for time.Now().Before(deadline) {
+			if l := cfg.leaderOf(0); l >= 0 {
+				got = l
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if got < 0 {
+			t.Fatalf("no leader after kill #%d/%d (product crash-recovery bug?)", n+1, cycles)
+		}
+		// 恢复后数据仍可服务（I195：修复前重建 leader 在状态机回放前可能经 ReadIndex
+		// 快路径返回空值，此处断言绝不返回空）
+		if v := ck.Get("k"); v != "v" {
+			t.Fatalf("after kill #%d/%d data lost (I195 stale read): Get(k)=%q want v", n+1, cycles, v)
+		}
+		t.Logf("kill #%d/%d recovered, leader=%d", n+1, cycles, got)
+	}
+}
+
 // I18-本地变体：更长时间、更多轮的"迁移中杀主"混沌，作为 CI chaos 长时 job 的
 // 主体用例（相比 I16 的 8 轮，这里跑 20 轮并穿插并发纯读，放大崩溃-重选窗口）。
 func TestChaosLongRun(t *testing.T) {
