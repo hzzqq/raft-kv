@@ -29,6 +29,7 @@
 | `raft_log_appends_total` | Counter | leader 累计追加日志条目数（写入吞吐） |
 | `raft_term_changes_total` | Counter | 累计任期变更次数（选举发起与退位）；**频繁翻滚 = 脑裂 / 网络抖动信号** |
 | `leadership_transfers` | Counter | 领导权转移（LeadershipTransfer）次数 |
+| `raft_leadership_transfer_refused_total` | Counter | 领导权转移被拒绝次数（原因：在途成员变更 / 非法目标）；配合 `leadership_transfers` 观测转移成功率，被拒通常意味着运维在成员变更提交前抢跑转移 |
 | `leader_changes` | Counter | 领导变更次数 |
 | `snapshots_installed` | Counter | 安装快照次数 |
 | `log_applied` | Counter | 已应用日志条目数 |

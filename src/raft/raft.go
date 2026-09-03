@@ -857,6 +857,18 @@ func (rf *Raft) LeadershipTransfer(target int) bool {
 		rf.mu.Unlock()
 		return false
 	}
+	// 护栏（I192 收尾）：在途成员变更（pendingConf）期间禁止转移领导权。
+	// 否则尚未提交的 ConfChange 条目可能根本没复制到 target，旧 leader 退位后被
+	// 新 leader 的 AppendEntries 截断丢弃——一次已"成功"提议的成员变更会静默消失，
+	// 集群拓扑因此永远停在旧配置。etcd/rqlite 等实现同样拒绝在 pendingConf 时转移，
+	// 让运维改为"等本次变更提交后再转移（pendingConf 清零）"。
+	if rf.pendingConf {
+		rf.mu.Unlock()
+		dbg("me=%d LeadershipTransfer refused: membership change in flight (pendingConf)", rf.me)
+		Metrics.CounterWithHelp("raft_leadership_transfer_refused_total",
+			"领导权转移被拒绝次数(在途成员变更/非法目标)").Inc()
+		return false
+	}
 	if target == rf.me || target < 0 || target >= len(rf.peers) {
 		rf.mu.Unlock()
 		return false

@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–196，共 148 轮交付；时间跨度 2026-07-19 ~ 2026-09-02T22:30:00+0800。
+> 覆盖 cycle 39–197，共 149 轮交付；时间跨度 2026-07-19 ~ 2026-09-02T22:30:00+0800。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -54,6 +54,7 @@
 - **[194] `I192-SNAP-CFG`** — （隐性：；score=10）
 - **[195] `I192-STATUS-MEMBERSHIP`** — （隐性：；score=9）
 - **[196] `I192-CONFCHANGE-VALIDATE`** — （隐性：；score=9）
+- **[197] `I192-XFER-GUARD`** — （隐性：；score=11）
 
 ## shardkv
 
