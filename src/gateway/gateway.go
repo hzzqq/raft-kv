@@ -625,6 +625,14 @@ func (s *Server) SetCache(ttl time.Duration, maxKeys int) {
 	}
 }
 
+// SetCacheEnabled 单独开关响应缓存（不改动 TTL/容量配置）。用于仅需 ETag 条件 GET、
+// 而不要回源缓存的场景（如单测隔离）。生产由 SetCache 一并开启。
+func (s *Server) SetCacheEnabled(on bool) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.cacheOn = on
+}
+
 // cacheKey 以 method+path+Accept-Encoding 维度生成缓存键（gzip 与明文分开存储/回放）。
 func (s *Server) cacheKey(r *http.Request) string {
 	enc := "plain"
@@ -632,6 +640,14 @@ func (s *Server) cacheKey(r *http.Request) string {
 		enc = "gzip"
 	}
 	return r.Method + " " + r.URL.Path + " " + enc
+}
+
+// isDataGET 判断该 GET 是否走网关的"数据路径"缓存/ETag（仅 /kv/{key} 数据接口）。
+// 诊断/指标端点（/metrics /status /healthz /debug/*）不得缓存、也不得带 ETag——
+// 否则会把这些实时状态冻结成过期快照，使 Prometheus 抓到陈旧指标、运维看板失活。
+// I194：此前缓存/ETag 对所有 GET 生效，一旦开启就会误冻诊断端点；现限定仅数据路径。
+func (s *Server) isDataGET(r *http.Request) bool {
+	return r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/kv/")
 }
 
 // cacheGet 命中且未过期则返回缓存值（调用方不得修改返回值）；过期则顺手清理并返回 nil。
@@ -981,14 +997,16 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		// I91：回写请求追踪 ID，便于两侧关联链路。
 		s.setTraceHeaders(w, reqID)
 		// I68：GET 命中响应缓存则直接回放，跳过并发信号量与回源（限流/安全语义已于上方校验）。
-		if s.cacheOn && r.Method == http.MethodGet {
+		// 仅数据路径 /kv/{key} 走缓存（isDataGET），诊断/指标端点不得缓存。
+		if s.cacheOn && s.isDataGET(r) {
 			if cv := s.cacheGet(s.cacheKey(r)); cv != nil {
 				s.replayCache(w, cv, start, r)
 				return
 			}
 		}
 		// I69：条件 GET。客户端带 If-None-Match 且与该路径已记录 ETag 一致时直接 304，不回源。
-		if s.etagOn && r.Method == http.MethodGet {
+		// 同样仅数据路径生效（isDataGET），避免 /metrics 等实时端点被 304 冻结。
+		if s.etagOn && s.isDataGET(r) {
 			if inm := r.Header.Get("If-None-Match"); inm != "" && s.etagMatches(s.cacheKey(r), inm) {
 				w.WriteHeader(http.StatusNotModified)
 				s.recordAccess(r.Method, r.URL.Path, http.StatusNotModified, time.Since(start), reqID)
@@ -1032,8 +1050,8 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		}
 		rec := &statusRecorder{ResponseWriter: w}
 		var st int
-		if (s.cacheOn || s.etagOn) && r.Method == http.MethodGet {
-			// 缓存/ETag 路径：crec 仅缓冲响应（不下发），handler 跑完后再统一 WriteHeader 下发，
+		if (s.cacheOn || s.etagOn) && s.isDataGET(r) {
+			// 缓存/ETag 路径（仅数据路径 /kv/{key} 生效，isDataGET）：crec 仅缓冲响应（不下发），handler 跑完后再统一 WriteHeader 下发，
 			// 确保 ETag 等头在首次 Write/WriteHeader（冻结响应头）之前已设置好。
 			crec := &capturingRecorder{ResponseWriter: w, buf: &bytes.Buffer{}}
 			h(crec, r)

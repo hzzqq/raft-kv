@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–199，共 151 轮交付；时间跨度 2026-07-19 ~ 2026-09-02T22:30:00+0800。
+> 覆盖 cycle 39–200，共 152 轮交付；时间跨度 2026-07-19 ~ 2026-09-03。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -22,6 +22,7 @@
 - **[144] `gateway_connect_mode`** — gateway -connect 纯客户端接入模式 + clusterHealthy 远程降级（直连 ShardMaster 取最新 ConfigNum）（隐性：纯客户端模式无本地副本，原 /readyz 遍历本地 KV 句柄会导致空指针/卡死（R2 远程接入可用性缺口）；score=15）
 - **[165] `histogram_help_honest`** — 网关延迟/响应大小直方图补诚实 HELP（样本环形缓冲语义）（隐性：直方图按样本次数滑窗、非时间滑窗，故障期 p99 可能反而偏低被误读；Grafana 已注明但 /metrics 无 HELP；score=15）
 - **[199] `I193-GATEWAY-CACHE-INVALIDATE`** — （隐性：；score=9）
+- **[200] `I194-GATEWAY-CACHE-SCOPE`** — （隐性：；score=10）
 
 ## kvcli
 

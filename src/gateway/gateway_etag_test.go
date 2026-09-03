@@ -23,7 +23,7 @@ func TestETagConditionalGet(t *testing.T) {
 	defer ts.Close()
 
 	// 第一次 GET：200 + ETag
-	req1, _ := http.NewRequest("GET", ts.URL+"/e", nil)
+	req1, _ := http.NewRequest("GET", ts.URL+"/kv/e", nil)
 	resp1, err := http.DefaultClient.Do(req1)
 	if err != nil {
 		t.Fatal(err)
@@ -39,7 +39,7 @@ func TestETagConditionalGet(t *testing.T) {
 	}
 
 	// 带 If-None-Match 的第二次 GET：应 304 且不回源
-	req2, _ := http.NewRequest("GET", ts.URL+"/e", nil)
+	req2, _ := http.NewRequest("GET", ts.URL+"/kv/e", nil)
 	req2.Header.Set("If-None-Match", etag)
 	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
@@ -54,7 +54,7 @@ func TestETagConditionalGet(t *testing.T) {
 	}
 
 	// 带错误 If-None-Match：应 200 且再次回源
-	req3, _ := http.NewRequest("GET", ts.URL+"/e", nil)
+	req3, _ := http.NewRequest("GET", ts.URL+"/kv/e", nil)
 	req3.Header.Set("If-None-Match", `"wrong"`)
 	resp3, err := http.DefaultClient.Do(req3)
 	if err != nil {

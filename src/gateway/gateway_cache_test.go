@@ -51,8 +51,8 @@ func TestResponseCacheHit(t *testing.T) {
 	ts := httptest.NewServer(s.Wrap(stub))
 	defer ts.Close()
 
-	code1, b1 := getBody(t, ts, "GET", "/x")
-	code2, b2 := getBody(t, ts, "GET", "/x")
+	code1, b1 := getBody(t, ts, "GET", "/kv/x")
+	code2, b2 := getBody(t, ts, "GET", "/kv/x")
 	if code1 != 200 || code2 != 200 {
 		t.Fatalf("status: %d / %d", code1, code2)
 	}
@@ -82,8 +82,8 @@ func TestResponseCacheNegative(t *testing.T) {
 	ts := httptest.NewServer(s.Wrap(stub))
 	defer ts.Close()
 
-	c1, _ := getBody(t, ts, "GET", "/y")
-	c2, _ := getBody(t, ts, "GET", "/y")
+	c1, _ := getBody(t, ts, "GET", "/kv/y")
+	c2, _ := getBody(t, ts, "GET", "/kv/y")
 	if c1 != 503 || c2 != 503 {
 		t.Fatalf("expected 503/503, got %d/%d", c1, c2)
 	}
@@ -110,9 +110,9 @@ func TestResponseCacheExpiry(t *testing.T) {
 	ts := httptest.NewServer(s.Wrap(stub))
 	defer ts.Close()
 
-	getBody(t, ts, "GET", "/z")
+	getBody(t, ts, "GET", "/kv/z")
 	time.Sleep(120 * time.Millisecond) // 超过 TTL
-	getBody(t, ts, "GET", "/z")
+	getBody(t, ts, "GET", "/kv/z")
 	mu.Lock()
 	defer mu.Unlock()
 	if calls != 2 {
@@ -136,10 +136,10 @@ func TestResponseCacheFIFO(t *testing.T) {
 	ts := httptest.NewServer(s.Wrap(stub))
 	defer ts.Close()
 
-	getBody(t, ts, "GET", "/a")
-	getBody(t, ts, "GET", "/b")
-	getBody(t, ts, "GET", "/c") // 触发淘汰 /a
-	getBody(t, ts, "GET", "/a") // /a 已淘汰，应回源
+	getBody(t, ts, "GET", "/kv/a")
+	getBody(t, ts, "GET", "/kv/b")
+	getBody(t, ts, "GET", "/kv/c") // 触发淘汰 /a
+	getBody(t, ts, "GET", "/kv/a") // /a 已淘汰，应回源
 	mu.Lock()
 	defer mu.Unlock()
 	if calls != 4 {
@@ -163,8 +163,8 @@ func TestResponseCacheSkipNonGet(t *testing.T) {
 	ts := httptest.NewServer(s.Wrap(stub))
 	defer ts.Close()
 
-	getBody(t, ts, "PUT", "/w")
-	getBody(t, ts, "PUT", "/w")
+	getBody(t, ts, "PUT", "/kv/w")
+	getBody(t, ts, "PUT", "/kv/w")
 	mu.Lock()
 	defer mu.Unlock()
 	if calls != 2 {

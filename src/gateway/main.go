@@ -94,6 +94,16 @@ func main() {
 	srv := &http.Server{Addr: *addr, Handler: s.Handler()}
 	s.SetHTTPServer(srv)
 
+	// I194：生产默认开启数据路径响应缓存与 ETag（仅作用于 GET /kv/{key}）。
+	// 缓存已在 cycle199 修正为"写后失效"，且上文 isDataGET 已限定仅数据路径、
+	// 不影响 /metrics /status /debug/* 等实时诊断端点；RAFTKV_CACHE=off 可关闭
+	// （调试或极端一致性要求场景）。这把报告 §4.5 宣传的"网关缓存/ETag"从休眠特性
+	// 变为真正生效的能力，降低读密集场景的后端回源压力、并支持 304 省带宽。
+	if os.Getenv("RAFTKV_CACHE") != "off" {
+		s.SetCache(2*time.Second, 1024)
+		s.SetETag(true)
+	}
+
 	// 优雅退出：捕获 SIGINT/SIGTERM，先等待在途请求完成、再关闭监听，最后 defer 清理集群。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
