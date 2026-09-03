@@ -42,6 +42,7 @@ const (
 	ElectionTimeoutMax = 480 * time.Millisecond
 	HeartbeatInterval  = 110 * time.Millisecond
 )
+
 // Role 表示节点在共识中的角色（Follower/Candidate/Leader）。
 type Role int
 
@@ -50,6 +51,7 @@ const (
 	Candidate
 	Leader
 )
+
 // String 返回 Role 的可读名称。
 func (r Role) String() string {
 	switch r {
@@ -99,6 +101,7 @@ type RequestVoteArgs struct {
 	LastLogIndex int
 	LastLogTerm  int
 }
+
 // RequestVoteReply 是 RequestVote 的响应。
 type RequestVoteReply struct {
 	Term        int
@@ -114,6 +117,7 @@ type RequestPreVoteArgs struct {
 	LastLogIndex int
 	LastLogTerm  int
 }
+
 // RequestPreVoteReply 是预投票（PreVote）的响应。
 type RequestPreVoteReply struct {
 	Term        int
@@ -126,10 +130,12 @@ type RequestPreVoteReply struct {
 type TimeoutNowArgs struct {
 	Term int
 }
+
 // TimeoutNowReply 是 TimeoutNow 的响应（用于领导权转移）。
 type TimeoutNowReply struct {
 	Term int
 }
+
 // AppendEntriesArgs 是日志复制/心跳的入参。
 type AppendEntriesArgs struct {
 	Term     int
@@ -141,6 +147,7 @@ type AppendEntriesArgs struct {
 
 	LeaderCommit int
 }
+
 // AppendEntriesReply 是日志复制/心跳的响应。
 type AppendEntriesReply struct {
 	Term    int
@@ -159,7 +166,13 @@ type InstallSnapshotArgs struct {
 	LastIncludedIndex int
 	LastIncludedTerm  int
 	Data              []byte
+	// LastIncludedConfig 是「快照点（LastIncludedIndex）处已提交的投票配置」。
+	// 快照会丢弃 <=LastIncludedIndex 的全部日志，其中的 ConfChange 条目若不在快照里
+	// 补上，接收方的 cfg/committedCfg 将永久停在旧配置（用错 quorum，可致双主）。
+	// 为 nil 时（旧版本 leader / 测试构造）接收方保持原有配置不变。
+	LastIncludedConfig []int
 }
+
 // InstallSnapshotReply 是安装快照的响应。
 type InstallSnapshotReply struct {
 	Term int
@@ -240,6 +253,15 @@ type Raft struct {
 	cfg []int
 	// committedCfg 已提交的投票配置，仅 applier 提交配置条目时更新；persist/VoterConfig 用。
 	committedCfg []int
+	// snapshotCfg 是「快照点（lastIncludedIndex）对应的已提交投票配置」。
+	// 存在的理由（快照吞配置 bug）：InstallSnapshot / Snapshot 会把 <=lastIncludedIndex
+	// 的日志整段丢弃，其中的 ConfChange 条目因此既走不到 AppendEntries 的配置切换、
+	// 也走不到 applier 的提交切换（applier 会把 lastApplied 直接跳到快照点）。若快照
+	// 不自带配置，follower 的 cfg/committedCfg 将永久停在旧配置——用旧配置算 quorum，
+	// 扩容后可能选出两个 leader（安全性破坏），缩容后则永远选不出主。
+	// 因此快照必须携带自己那一点的配置，且随持久化落盘（重启后 leader 重发旧快照时
+	// 也要带上正确配置）。
+	snapshotCfg []int
 	// pendingConf 标记 leader 已提议一个尚未提交的成员变更；期间禁止再提议新的变更，
 	// 以保证单服变更安全性（新旧配置多数派必重叠，不会脑裂）。
 	pendingConf bool
@@ -310,6 +332,9 @@ func (rf *Raft) persist() {
 	// 持久化「已提交」配置 committedCfg：绝不序列化未提交的最新配置（rf.cfg 在 leader
 	// 提议变更后即指向未提交配置），否则重启可能复活未生效的成员变更、破坏单服变更安全性。
 	e.Encode(rf.committedCfg) // 已提交投票配置：重启后直接恢复，无需重放日志即可正确计 quorum
+	// 快照点配置：必须与 committedCfg 一起落盘。否则重启后本节点重发历史快照时只能
+	// 发空配置，落后的 follower 装完快照仍拿不到配置（快照吞配置 bug 的持久化缺口）。
+	e.Encode(rf.snapshotCfg)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -342,6 +367,15 @@ func (rf *Raft) readPersist(data []byte) {
 	if d.Decode(&cfg) == nil && len(cfg) > 0 {
 		rf.cfg = cfg
 		rf.committedCfg = append([]int(nil), cfg...)
+	}
+	// 兼容旧格式：旧持久化数据不含 snapshotCfg 字段，Decode 返回 io.EOF，此时退化用
+	// committedCfg 作为快照点配置——旧格式下两者一致（旧代码没有快照携带配置的语义，
+	// 快照点配置就等于当时恢复出来的已提交配置），不影响正确性。
+	var snapCfg []int
+	if d.Decode(&snapCfg) == nil && len(snapCfg) > 0 {
+		rf.snapshotCfg = snapCfg
+	} else if len(rf.snapshotCfg) == 0 {
+		rf.snapshotCfg = append([]int(nil), rf.committedCfg...)
 	}
 }
 
@@ -415,17 +449,17 @@ func (rf *Raft) HasCommittedCurrentTerm() bool {
 // RaftStatus 是 Raft 节点运行时的只读快照，供运维/诊断/监控在不打扰共识热路径的
 // 前提下读取关键状态。所有字段均在持 rf.mu 下采集，调用零副作用、可并发安全读取。
 type RaftStatus struct {
-	Me                   int    // 本节点编号
-	Role                 Role   // Follower / Candidate / Leader
-	Term                 int    // 当前任期
-	VotedFor             int    // 本任期投票对象（-1 表示未投）
-	LeaderID             int    // 认知的 leader 编号（role==Leader 时为 me；未知为 -1）
-	LastLogIndex         int    // 最后一条日志索引（含快照偏移）
-	LastLogTerm          int    // 最后一条日志任期
-	CommitIndex          int    // 已提交索引
-	LastApplied          int    // 已应用索引
-	CommittedCurrentTerm bool   // leader 是否已在当前任期提交过条目（线性一致读守卫）
-	HasLeaderLease       bool   // leader 是否在 ElectionTimeoutMin 内与多数派保持接触
+	Me                   int  // 本节点编号
+	Role                 Role // Follower / Candidate / Leader
+	Term                 int  // 当前任期
+	VotedFor             int  // 本任期投票对象（-1 表示未投）
+	LeaderID             int  // 认知的 leader 编号（role==Leader 时为 me；未知为 -1）
+	LastLogIndex         int  // 最后一条日志索引（含快照偏移）
+	LastLogTerm          int  // 最后一条日志任期
+	CommitIndex          int  // 已提交索引
+	LastApplied          int  // 已应用索引
+	CommittedCurrentTerm bool // leader 是否已在当前任期提交过条目（线性一致读守卫）
+	HasLeaderLease       bool // leader 是否在 ElectionTimeoutMin 内与多数派保持接触
 	// LeaderElections 是本副本自进程启动以来赢得选举（becomeLeader）的累计次数。
 	// 单调不减，可直接被 Prometheus 当累计量 scrape：全组求和的增量即该 group 的
 	// leader 切换次数（每次切换必有且仅有一个副本赢得选举）。跨进程部署时 gateway
@@ -474,6 +508,7 @@ func (rf *Raft) RaftStateSize() int {
 	defer rf.mu.Unlock()
 	return len(rf.persister.ReadRaftState())
 }
+
 // Kill 关闭节点，停止选举/心跳/应用等后台协程，仅测试使用。
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
@@ -811,7 +846,7 @@ func (rf *Raft) becomeLeader() {
 		return
 	}
 	rf.role = Leader
-	rf.leaderId = rf.me // 成为 leader 后自身即 leader，Status 据此回报 me
+	rf.leaderId = rf.me    // 成为 leader 后自身即 leader，Status 据此回报 me
 	rf.pendingConf = false // 新 leader 没有自己提议的在途成员变更（旧 leader 的 pending 与此无关）
 	// 新任期必须重新提交一条当前任期 no-op 才能提交旧任期条目；重置该标记，
 	// 确保 GetShard 等传输守卫在重新提交 no-op 之前不会传出陈旧快照。
@@ -854,6 +889,7 @@ func (rf *Raft) stepDown(term int) {
 	rf.leaderId = -1 // 退位后失去对 leader 的认知，待下次合法 AppendEntries 重新确认
 	rf.resetElectionTimer()
 }
+
 // RequestVote 处理投票请求，按任期与日志完整性决定是否授权。
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
@@ -955,7 +991,7 @@ func (rf *Raft) advanceCommit() {
 		if count >= quorum && rf.entryTerm(n) == rf.currentTerm {
 			rf.commitIndex = n
 			rf.committedCurrentTerm = true // 当前任期条目已提交，旧任期写现可安全服务
-			rf.persist() // 持久化提交点：崩溃重启后据 commitIndex 重放已提交条目
+			rf.persist()                   // 持久化提交点：崩溃重启后据 commitIndex 重放已提交条目
 			rf.applyCond.Broadcast()
 			break
 		}
@@ -988,6 +1024,9 @@ func (rf *Raft) broadcastAppendEntries() {
 				LastIncludedIndex: lastIncludedIndex,
 				LastIncludedTerm:  snapTerm,
 				Data:              snap,
+				// 带上快照点的已提交配置：接收方据此重建 cfg/committedCfg，
+				// 补上被快照吞掉的 ConfChange 条目（否则其配置永久停在旧值）。
+				LastIncludedConfig: append([]int(nil), rf.snapshotCfg...),
 			}
 			go func(i int, args *InstallSnapshotArgs) {
 				reply := &InstallSnapshotReply{}
@@ -1072,6 +1111,7 @@ func (rf *Raft) firstIndexWithTerm(term int) int {
 	}
 	return -1
 }
+
 // AppendEntries 处理日志追加与心跳，维护提交索引与冲突回退。
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
@@ -1169,7 +1209,28 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return // 不能快照尚未提交的部分
 	}
 	pos := index - rf.lastIncludedIndex - 1
+	if pos >= len(rf.log) {
+		return // 越界保护：日志短于快照点（commitIndex 与日志不一致的异常情况）
+	}
 	rf.lastIncludedTerm = rf.log[pos].Term
+
+	// 记账即将被丢弃的日志段里的成员变更（快照吞配置 bug 的修复点）。
+	// 这些条目被截断后：AppendEntries 的配置切换再也走不到（条目没了），applier 也会
+	// 把 lastApplied 直接跳到 lastIncludedIndex 从而整段跳过它们。若不在此记账，本节点
+	// 的 snapshotCfg/committedCfg 将永久停在旧配置，pendingConf 也永远等不到清零。
+	// 注意 index <= commitIndex（上面已校验），故这些变更一定**已提交**，把它记入
+	// committedCfg 是安全的。
+	end := pos + 1
+	for _, e := range rf.log[:end] {
+		if cc, ok := e.Command.(ConfChange); ok {
+			rf.snapshotCfg = append([]int(nil), cc.NewVoters...)
+			rf.committedCfg = append([]int(nil), cc.NewVoters...)
+			// 该条目已提交且随后会被快照吞掉，applier 永远不会 apply 它——
+			// 若不在此时清零，pendingConf 将永久为 true，此后所有成员变更都被拒。
+			rf.pendingConf = false
+		}
+	}
+
 	// 保留 index 之后的日志
 	rf.log = append([]LogEntry{}, rf.log[pos+1:]...)
 	rf.lastIncludedIndex = index
@@ -1182,7 +1243,16 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.condInstallSnapshotLocked(lastIncludedTerm, lastIncludedIndex, snapshot)
+	// 导出版不带配置：保持原有行为（配置不变），供状态机直接投递本地快照的场景使用。
+	return rf.condInstallSnapshotLocked(lastIncludedTerm, lastIncludedIndex, snapshot, nil)
+}
+
+// CondInstallSnapshotWithConfig 是带快照点配置的导出版（InstallSnapshot RPC 走这条）。
+// lastIncludedCfg 为快照点处已提交的投票配置，接收方据此重建 cfg/committedCfg。
+func (rf *Raft) CondInstallSnapshotWithConfig(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte, lastIncludedCfg []int) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.condInstallSnapshotLocked(lastIncludedTerm, lastIncludedIndex, snapshot, lastIncludedCfg)
 }
 
 // condInstallSnapshotLocked 是安装快照的主体逻辑，调用方必须已持有 rf.mu。
@@ -1195,7 +1265,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 //     即便不死锁，follower 的 KV 状态机也拿不到快照数据（隐性数据缺失）。
 //     现在只推进 commitIndex 并唤醒 applier，由 applier 发 SnapshotValid 给状态机，
 //     lastApplied 在 applier 的快照分支一次跳到位。
-func (rf *Raft) condInstallSnapshotLocked(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
+func (rf *Raft) condInstallSnapshotLocked(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte, lastIncludedCfg []int) bool {
 	if lastIncludedIndex <= rf.lastIncludedIndex {
 		return true // 已经有更新的快照
 	}
@@ -1213,8 +1283,37 @@ func (rf *Raft) condInstallSnapshotLocked(lastIncludedTerm int, lastIncludedInde
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
 	rf.snapshot = snapshot
+	// 用快照自带的配置重建成员配置（快照吞配置 bug 的修复点）：上面的日志截断已经把
+	// <=lastIncludedIndex 的 ConfChange 条目全部丢弃，而 AppendEntries 的配置切换与
+	// applier 的提交切换都不会再经过这些条目。不补这一步，本节点的 cfg/committedCfg
+	// 会永久停在旧配置：扩容后用旧（更小）配置算 quorum 可能出现两个 leader，
+	// 缩容后则要求已移除成员投票、永远选不出主。
+	if len(lastIncludedCfg) > 0 {
+		rf.snapshotCfg = append([]int(nil), lastIncludedCfg...)
+		rf.committedCfg = append([]int(nil), lastIncludedCfg...)
+		rf.cfg = append([]int(nil), lastIncludedCfg...)
+		// 重放残留日志（快照点之后）里的 ConfChange 推进 cfg：与 AppendEntries 追加
+		// 路径保持同一语义——cfg 取「日志最新配置」，committedCfg 取「已提交配置」。
+		for _, e := range rf.log {
+			if cc, ok := e.Command.(ConfChange); ok {
+				rf.cfg = append([]int(nil), cc.NewVoters...)
+			}
+		}
+	}
+	// 安装快照后必须统一夹紧 commitIndex / lastApplied 到 [lastIncludedIndex, lastIndex]。
+	// 否则若本节点曾是更高任期 leader（commitIndex/lastApplied 偏高），而新日志因分叉被
+	// 截断变短，二者会停在「已不存在的日志下标」之上；applier 随后按旧 commitIndex 把
+	// lastApplied 推进到越界位置，触发 raft.go:1412 的 index out of range panic。
+	// 这是 InstallSnapshot 的隐性记账遗漏：commitIndex/lastApplied 永远不得越过 lastIndex。
+	lastIndex := rf.lastIncludedIndex + len(rf.log)
 	if rf.commitIndex < lastIncludedIndex {
 		rf.commitIndex = lastIncludedIndex
+	}
+	if rf.commitIndex > lastIndex {
+		rf.commitIndex = lastIndex
+	}
+	if rf.lastApplied > lastIndex {
+		rf.lastApplied = lastIndex
 	}
 	rf.persister.SaveSnapshot(snapshot)
 	rf.persist()
@@ -1246,7 +1345,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if rf.isWitness {
 		data = nil
 	}
-	rf.condInstallSnapshotLocked(args.LastIncludedTerm, args.LastIncludedIndex, data)
+	// 注意：Witness 虽然不存状态机数据（data=nil），但仍要吃下快照点配置——它以投票者
+	// 身份参与共识，quorum 判断依赖正确的 cfg，配置错了同样会导致脑裂或选不出主。
+	rf.condInstallSnapshotLocked(args.LastIncludedTerm, args.LastIncludedIndex, data, args.LastIncludedConfig)
 }
 
 // ============================== 后台循环 ==============================
@@ -1323,15 +1424,15 @@ func (rf *Raft) applier() {
 			cmd := rf.log[pos].Command
 			// 成员变更条目是 raft 内部命令（I192）：不投递给上层状态机，仅原子切换
 			// 投票配置 cfg。pendingConf 同步清零，允许 leader 提议下一次变更。
-	if cc, ok := cmd.(ConfChange); ok {
-		dbg("me=%d apply ConfChange idx=%d NewVoters=%v", rf.me, idx, cc.NewVoters)
-		rf.cfg = append([]int(nil), cc.NewVoters...)
-		rf.committedCfg = append([]int(nil), cc.NewVoters...) // 已提交配置随 applier 切换
-		rf.pendingConf = false
-		rf.persist()
-		rf.mu.Unlock()
-		continue
-	}
+			if cc, ok := cmd.(ConfChange); ok {
+				dbg("me=%d apply ConfChange idx=%d NewVoters=%v", rf.me, idx, cc.NewVoters)
+				rf.cfg = append([]int(nil), cc.NewVoters...)
+				rf.committedCfg = append([]int(nil), cc.NewVoters...) // 已提交配置随 applier 切换
+				rf.pendingConf = false
+				rf.persist()
+				rf.mu.Unlock()
+				continue
+			}
 			msg = ApplyMsg{
 				CommandValid: true,
 				Command:      cmd,
@@ -1406,6 +1507,9 @@ func makeRaft(peers []*ClientEnd, me int, persister Persister, applyCh chan Appl
 		rf.cfg[i] = i
 	}
 	rf.committedCfg = append([]int(nil), rf.cfg...) // 初始已提交配置与 cfg 一致
+	// 快照点配置初始化为初始配置：尚未产生任何快照/配置变更时，快照点配置即初始配置，
+	// 保证 leader 首次发快照时带的一定是有效非空配置（而非让 follower 退回旧行为）。
+	rf.snapshotCfg = append([]int(nil), rf.cfg...)
 
 	rf.readPersist(persister.ReadRaftState())
 	if snap := persister.ReadSnapshot(); snap != nil {

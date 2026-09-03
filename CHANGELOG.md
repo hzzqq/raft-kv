@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–192，共 144 轮交付；时间跨度 2026-07-19 ~ 2026-09-02T22:30:00+0800。
+> 覆盖 cycle 39–194，共 146 轮交付；时间跨度 2026-07-19 ~ 2026-09-02T22:30:00+0800。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -50,6 +50,8 @@
 - **[150] `exp_partition_split_brain`** — 真网络分裂（脑裂）故障注入原语 + 场景 B：2+3 分区下不双写、愈合后收敛（隐性：原有分区注入只有 Enable(false)（整节点掉线），造不出「少数派节点仍存活且内部互通、旧 leader 仍自认 leader」的真脑裂——而这才是双写风险最大、最需要被证明的场景；score=18）
 - **[151] `exp_perf_shard_scaling`** — 场景 C：分片扩展性性能曲线（1/2/3/5 组吞吐与延迟对比，落盘 JSON + 自绘 SVG）（隐性：写路径复制此前完全依赖 110ms 心跳触发——Start() 只追加日志就返回，真正的 AppendEntries 要等下一次心跳。单次写延迟被硬钉在约 123ms（≈110ms 心跳 + RTT），吞吐上限约 100 ops/sec，且这个瓶颈在既有测试里完全看不出来（测试只断言正确性、不看延迟）；score=20）
 - **[162] `raft_kick_nonblock`** — kickCh 非阻塞并发压力测试（TestStartNeverBlocksUnderContention）（隐性：kickCh 非阻塞只靠结构推断、无并发回归护栏，误改阻塞发送吞吐塌到≈9/s 无人察觉；score=16）
+- **[193] `I192-E5`** — （隐性：；score=10）
+- **[194] `I192-SNAP-CFG`** — （隐性：；score=10）
 
 ## shardkv
 
