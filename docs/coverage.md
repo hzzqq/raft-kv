@@ -139,7 +139,7 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 | `kvnode` | 2 | 3 | ✅ | — |
 | `kvraft` | 1 | 4 | ✅ | OpResult |
 | `metrics` | 4 | 8 | ✅ | DefaultHistWindow, Desc, SetDefaultHistWindow, SetDesc |
-| `raft` | 4 | 17 | ✅ | Call, CondInstallSnapshotWithConfig, MakeSendFnEnd, PartitionServers, RaftStateSize, Send, SetSendFn, String …(+2) |
+| `raft` | 4 | 18 | ✅ | Call, CondInstallSnapshotWithConfig, MakeSendFnEnd, PartitionServers, RaftStateSize, Send, SetSendFn, String …(+2) |
 | `shardkv` | 15 | 24 | ✅ | GetE, PutE, MigrationPlan, MigrationStep |
 | `shardmaster` | 14 | 18 | ✅ | String, ConfigDelta, PlanResult |
 | `statusfmt` | 1 | 4 | ✅ | — |
