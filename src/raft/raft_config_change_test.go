@@ -232,3 +232,46 @@ func containsInt(s []int, v int) bool {
 	}
 	return false
 }
+
+// TestProposeConfChangeRejectsInvalid 验证成员变更的合法性护栏（I192 防误操作）：
+// 空集合 / 越界成员 / 重复成员会把集群推入 quorum 永远凑不齐的卡死状态，必须被拒绝
+// 且不能改变当前配置；拒绝后集群仍应能提交合法变更与正常写（未被推入死局）。
+func TestProposeConfChangeRejectsInvalid(t *testing.T) {
+	cfg := makeConfig(t, 3) // 默认全 peer 投票集合 [0,1,2]
+	defer cfg.cleanup()
+	l, _ := cfg.checkOneLeader()
+	if l < 0 {
+		t.Fatalf("初始未选出 leader")
+	}
+	want := []int{0, 1, 2}
+	if got := cfg.rafts[l].VoterConfig(); !sameVoters(got, want) {
+		t.Fatalf("前置：初始 voters 应为 [0,1,2]，实际 %v", got)
+	}
+
+	badCases := [][]int{
+		{},        // 空集合 -> 无成员，永久无法提交
+		{5},       // 越界节点 -> 永不在线，quorum 凑不齐
+		{0, 0},    // 重复成员 -> quorum 重复计数
+		{0, 1, 9}, // 含越界成员
+	}
+	for _, bad := range badCases {
+		if idx, ok := cfg.rafts[l].ProposeConfChange(bad); ok {
+			t.Fatalf("非法 voter 集合 %v 竟被接受（idx=%d），会把集群推入卡死", bad, idx)
+		}
+		if got := cfg.rafts[l].VoterConfig(); !sameVoters(got, want) {
+			t.Fatalf("拒绝非法 %v 后当前配置不应改变，实际 %v", bad, got)
+		}
+	}
+
+	// 合法变更仍应被接受，且集群未被卡死：能提交该变更并继续处理正常写。
+	if _, ok := cfg.rafts[l].ProposeConfChange([]int{0, 1}); !ok {
+		t.Fatalf("合法变更 [0,1] 应被接受")
+	}
+	if !waitVoterConfig(t, cfg.rafts[l], []int{0, 1}, 6*time.Second) {
+		t.Fatalf("合法变更 [0,1] 未提交")
+	}
+	idx := cfg.start1(777)
+	if !waitApplied(t, cfg.rafts[l], idx, 6*time.Second) {
+		t.Fatalf("拒绝非法变更后集群应能继续提交，写 %d 未应用（被推入死局）", idx)
+	}
+}

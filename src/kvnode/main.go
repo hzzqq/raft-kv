@@ -129,6 +129,12 @@ func diagHandler(node *cluster.TCPNode) http.Handler {
 			http.Error(w, `bad body: expect {"voters":[...]}`, http.StatusBadRequest)
 			return
 		}
+		// 运维护栏（I192 防误操作）：越界/空/重复成员会把集群推入 quorum 永远凑不齐的
+		// 卡死状态，必须先于 ProposeConfChange 以 400 拦截，而非写入日志后手工修复。
+		if err := node.ValidateConfChange(body.Voters); err != nil {
+			http.Error(w, "invalid voter set: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 		idx, ok := node.ProposeConfChange(body.Voters)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		if !ok {

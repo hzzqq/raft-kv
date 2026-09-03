@@ -124,6 +124,20 @@ func (n *TCPNode) VoterConfig() []int {
 	}
 }
 
+// ValidateConfChange 校验运维侧提议的成员变更目标集合是否合法（I192 防误操作护栏）：
+// 拦截空集合 / 越界成员 / 重复成员，避免把集群推入 quorum 永远凑不齐的卡死状态。
+// 运维端点 /admin/reconfigure 在调用 ProposeConfChange 前应先用它做 400 预检。
+func (n *TCPNode) ValidateConfChange(voters []int) error {
+	switch {
+	case n.kv != nil:
+		return n.kv.Raft().ValidateConfChange(voters)
+	case n.sm != nil:
+		return n.sm.Raft().ValidateConfChange(voters)
+	default:
+		return fmt.Errorf("node has no raft group")
+	}
+}
+
 // parseNodeName 解析节点名："m<j>" → (true, j, -1, -1)；"g<g>-<r>" → (false, -1, g, r)。
 func parseNodeName(name string) (isSM bool, j, g, r int, err error) {
 	if len(name) > 1 && name[0] == 'm' {

@@ -632,6 +632,13 @@ func (rf *Raft) ProposeConfChange(newVoters []int) (int, bool) {
 	if rf.pendingConf {
 		return -1, false // 上一次变更仍在途，拒绝堆叠
 	}
+	// 目标配置合法性校验：拦截会把集群推入不可恢复状态的运维误操作（越界/空/重复
+	// 成员）。不在此拦，可能提交一个含不存在成员的配置，使 quorum 永远凑不齐 → 集群
+	// 永久卡死（比单纯不生效更糟，因为已写入日志、需手工修复）。
+	if err := rf.ValidateConfChange(newVoters); err != nil {
+		dbg("me=%d ProposeConfChange rejected: %v", rf.me, err)
+		return -1, false
+	}
 	idx := rf.lastLogIndex() + 1
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: ConfChange{NewVoters: append([]int(nil), newVoters...)}})
 	// 注意：leader 这里**不**立即把 rf.cfg 切到 C_new（改用「提交后才生效」语义）。原因：
@@ -650,6 +657,33 @@ func (rf *Raft) ProposeConfChange(newVoters []int) (int, bool) {
 	default:
 	}
 	return idx, true
+}
+
+// ValidateConfChange 校验一次成员变更的目标投票集合是否合法（防运维误操作把集群推入
+// 不可恢复状态）。非法情形：
+//
+//	· 空集合 —— quorum=len/2+1 但无成员，集群永久无法提交任何条目；
+//	· 含越界/不存在的 peer 下标 —— 该成员永不在线，quorum 永远凑不齐 → 集群卡死；
+//	· 重复下标 —— quorum 计票会重复计数同一成员，等价缩小配置、破坏单服变更安全性。
+//
+// 返回 nil 表示合法。注意：单服变更允许 leader 把自己移出投票集合（提交后由旧配置
+// quorum 通过、再平滑退位），故此处不强制保留当前 leader。
+func (rf *Raft) ValidateConfChange(newVoters []int) error {
+	if len(newVoters) == 0 {
+		return fmt.Errorf("empty voter set: cluster would have no voters and stall")
+	}
+	n := len(rf.peers)
+	seen := make(map[int]bool, len(newVoters))
+	for _, v := range newVoters {
+		if v < 0 || v >= n {
+			return fmt.Errorf("voter %d out of range [0,%d): nonexistent peer would deadlock quorum", v, n-1)
+		}
+		if seen[v] {
+			return fmt.Errorf("duplicate voter %d: quorum would double-count one member", v)
+		}
+		seen[v] = true
+	}
+	return nil
 }
 
 // ============================== 选举 ==============================
