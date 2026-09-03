@@ -686,6 +686,28 @@ func (s *Server) evictOrder(key string) {
 	}
 }
 
+// invalidateKeyCache 在写操作（PUT/Append）成功后清除该 key 的 GET 响应缓存与 ETag，
+// 保证"写后读"立即看到新值（read-your-writes），避免开启响应缓存时返回陈旧值（违反线性一致）。
+// 同时清理该路径的正缓存与 5xx 负缓存（二者共用同一 cacheKey），以及 plain/gzip 两种编码变体；
+// ETag 同样按 cacheKey 维度存储，一并删除。缓存/ETag 未开启时 cacheStore/etagStore 为 nil，
+// 对 nil map 执行 delete 安全无副作用——故本方法在缓存关闭时零成本、零副作用。
+// 修复 I193：此前 handlePut/handleAppend 不失效缓存，开启缓存（SetCache 标注"生产可用"）后
+// 网关会向客户端返回写入前的旧值，直到 TTL 过期，是一个隐蔽的线性一致破坏点。
+func (s *Server) invalidateKeyCache(path string) {
+	for _, enc := range []string{"plain", "gzip"} {
+		k := "GET " + path + " " + enc
+		s.cacheMu.Lock()
+		if _, ok := s.cacheStore[k]; ok {
+			delete(s.cacheStore, k)
+			s.evictOrder(k)
+		}
+		s.cacheMu.Unlock()
+		s.etagMu.Lock()
+		delete(s.etagStore, k)
+		s.etagMu.Unlock()
+	}
+}
+
 // replayCache 把缓存响应原样回放给客户端（X-Request-ID 沿用本次请求，不被旧值覆盖），
 // 并补齐访问日志与基础指标，使缓存命中在观测面与真实请求一致。
 func (s *Server) replayCache(w http.ResponseWriter, cv *cacheVal, start time.Time, r *http.Request) {
@@ -1678,6 +1700,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, string(err), statusForErr(err))
 		return
 	}
+	s.invalidateKeyCache(r.URL.Path)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -1688,5 +1711,7 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, string(err), statusForErr(err))
 		return
 	}
+	// 失效的是该 key 的 GET 路径缓存（/kv/{key}），而非 /kv/{key}/append 自身。
+	s.invalidateKeyCache("/kv/" + key)
 	w.WriteHeader(http.StatusOK)
 }
