@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–202，共 154 轮交付；时间跨度 2026-07-19 ~ 2026-09-03。
+> 覆盖 cycle 39–203，共 155 轮交付；时间跨度 2026-07-19 ~ 2026-09-03。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -66,6 +66,7 @@
 - **[81] `shardkv_raft_status`** — ShardKV.RaftStatus() 透出底层 raft 只读健康快照（隐性：共识层健康封闭在 raft 包内，数据面/运维只能从分片态间接推测(脑裂/任期翻滚/apply落后无一手信号)；score=16）
 - **[90] `shardkv_migration_gauges`** — shardkv_pending_in/out/owned/total gauge(迁移积压可告警)（隐性：迁移卡死(pendingIn/pendingOut 长期非零)此前只能看 /debug/shards JSON,无时序指标,Prometheus 无法告警；score=17）
 - **[201] `I195-SHARDKV-READ-LINEARIZABLE`** — （隐性：；score=10）
+- **[203] `I197-LINEARIZABILITY-CHECKER`** — 建单写者每键线性一致金标准检查器（覆盖全键全时段），并附 chaos 复现器以复现 Lab4 配置归属发散 bug（隐性：chaos 下写者/读者 Clerk 对分片归属的配置视图不一致：写落『陈旧 owner 组』（其 kv.config 滞后，applyCmd 不返回 ErrWrongGroup 而直接应用并返回 OK），真正当前 owner 的对应分片恒空 → 读到空；score=10）
 
 ## shardmaster
 
