@@ -361,6 +361,13 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.lastIncludedIndex = lii
 	rf.lastIncludedTerm = lit
 	rf.commitIndex = commit
+	// 防御：恢复出的 commitIndex 不得越过恢复后的日志末尾 lastIndex
+	// （lii + len(logs)）。否则 applier 会把 lastApplied 推进到不存在的日志下标，
+	// 触发 index out of range 越界 panic（见 applier else 分支）。持久化瞬间的
+	// 不一致态在此一次性纠正，applier 启动前即拿到合法 commitIndex。
+	if li := lii + len(logs); rf.commitIndex > li {
+		rf.commitIndex = li
+	}
 	// 兼容旧格式：旧持久化数据不含 cfg 字段，Decode 在此返回 io.EOF，
 	// rf.cfg 保留 makeRaft 里设定的默认（全部 peer），不影响正确性。
 	var cfg []int
@@ -1421,6 +1428,20 @@ func (rf *Raft) applier() {
 			Metrics.Counter("snapshots_installed").Inc()
 		} else {
 			pos := idx - rf.lastIncludedIndex - 1
+			// 兜底防护：若 commitIndex/lastApplied 因任何记账路径（快照截断、持久化恢复、
+			// 网络分叉后重发等）越过了当前日志末尾 lastIndex，则不向下标越界、不 panic，
+			// 而是把 lastApplied 夹回 lastIndex 并（必要时）把 commitIndex 一并夹回，
+			// 然后回到循环顶部等待——待日志补齐或 commitIndex 被新的 LeaderCommit/快照
+			// 纠正后再继续。这是「commitIndex/lastApplied ≤ lastIndex」不变量的最后一道闸。
+			if pos < 0 || pos >= len(rf.log) {
+				lastIdx := rf.lastIncludedIndex + len(rf.log)
+				if rf.commitIndex > lastIdx {
+					rf.commitIndex = lastIdx
+				}
+				rf.lastApplied = lastIdx
+				rf.mu.Unlock()
+				continue
+			}
 			cmd := rf.log[pos].Command
 			// 成员变更条目是 raft 内部命令（I192）：不投递给上层状态机，仅原子切换
 			// 投票配置 cfg。pendingConf 同步清零，允许 leader 提议下一次变更。
