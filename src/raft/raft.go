@@ -472,6 +472,15 @@ type RaftStatus struct {
 	// leader 切换次数（每次切换必有且仅有一个副本赢得选举）。跨进程部署时 gateway
 	// 读不到远端节点内存，故必须随状态快照一起外传（I152）。
 	LeaderElections int
+	// 成员拓扑（I192 动态重配置运维可见性）：运维从 /status 与 Prometheus 一眼看清
+	// 「谁在投票集合、谁是见证者、完整节点清单」，确认 witness Join/Leave 已生效。
+	// 此前 RaftStatus 只暴露角色/任期/进度，成员配置是个黑盒——动态增删 witness 后
+	// 运维无法确认变更是否真落地，只能另查 /admin/reconfigure。统一在此暴露，使
+	// /status 成为成员变更观测的单一可信源。
+	Voters    []int // 当前已提交投票成员集合（== VoterConfig()）
+	Witnesses []int // 见证者：在 peers 内但不在 voters 内（参与投票/复制但不 apply）
+	Peers     []int // 全部 raft 节点编号（0..len(peers)-1）
+	IsWitness bool  // 本节点是否为见证者（不持状态机，只投票/复制）
 }
 
 // Status 返回当前节点的只读状态快照。仅在持锁下采集既有字段，不修改任何状态、
@@ -495,6 +504,19 @@ func (rf *Raft) Status() RaftStatus {
 	if rf.role == Leader {
 		st.LeaderID = rf.me
 	}
+	// 成员拓扑：默认以已提交配置为准（对外观测须反映已生效配置，与 VoterConfig 一致）。
+	st.Voters = append([]int(nil), rf.committedCfg...)
+	voterSet := make(map[int]bool, len(rf.committedCfg))
+	for _, v := range rf.committedCfg {
+		voterSet[v] = true
+	}
+	for i := 0; i < len(rf.peers); i++ {
+		st.Peers = append(st.Peers, i)
+		if !voterSet[i] {
+			st.Witnesses = append(st.Witnesses, i)
+		}
+	}
+	st.IsWitness = rf.isWitness
 	// 日志索引/任期经 lastLogIndex/lastLogTerm 统一计入快照偏移（与 Start 一致）。
 	st.LastLogIndex = rf.lastLogIndex()
 	st.LastLogTerm = rf.lastLogTerm()

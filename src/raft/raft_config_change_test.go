@@ -169,3 +169,66 @@ func TestConfChangeSingleInFlight(t *testing.T) {
 		t.Fatalf("第二次变更未提交")
 	}
 }
+
+// TestRaftStatusSurfacesMembership 验证 RaftStatus 现在携带成员拓扑（I192 运维可见性）：
+// 运维从 /status 与 Prometheus 能一眼看清「谁在投票集合、谁是见证者、完整节点清单」。
+// 修复前 RaftStatus 只暴露角色/任期/进度，成员配置对运维是黑盒——witness 动态 Join/Leave
+// 后无法确认变更是否真落地。
+func TestRaftStatusSurfacesMembership(t *testing.T) {
+	const w = 2 // 下标 2 为 witness
+	cfg := makeConfigWitness(t, 3, map[int]bool{w: true}, []int{0, 1})
+	defer cfg.cleanup()
+	l, _ := cfg.checkOneLeader()
+	if l < 0 {
+		t.Fatalf("初始未选出 leader")
+	}
+
+	// 初始：投票集合 [0,1]，node2 是见证者（不 apply）；拓扑上 node2 属于非投票（witness）列表。
+	st := cfg.rafts[l].Status()
+	if !sameVoters(st.Voters, []int{0, 1}) {
+		t.Fatalf("初始 Status().Voters 应为 [0,1]，实际 %v", st.Voters)
+	}
+	if !sameVoters(st.Peers, []int{0, 1, 2}) {
+		t.Fatalf("Status().Peers 应为 [0,1,2]，实际 %v", st.Peers)
+	}
+	if !cfg.rafts[w].Status().IsWitness {
+		t.Fatalf("node2 创建为见证者，Status().IsWitness 应为 true")
+	}
+	if !containsInt(st.Witnesses, w) {
+		t.Fatalf("初始 Status().Witnesses 应含非投票的 node2，实际 %v", st.Witnesses)
+	}
+
+	// 运行时 Join(2)：node2 进入投票集合。
+	if _, ok := cfg.rafts[l].ProposeConfChange([]int{0, 1, 2}); !ok {
+		t.Fatalf("leader 提议 Join(2) 失败")
+	}
+	if !waitVoterConfig(t, cfg.rafts[l], []int{0, 1, 2}, 6*time.Second) {
+		t.Fatalf("Join(2) 未在 leader 上提交：%v", cfg.rafts[l].VoterConfig())
+	}
+
+	// 所有节点 Status().Voters 必须反映新配置（与 VoterConfig() 一致）。
+	// 需逐节点轮询：applier 将 ConfChange 提交后才切换 committedCfg，follower/witness 有复制延迟。
+	for i := 0; i < 3; i++ {
+		if !waitVoterConfig(t, cfg.rafts[i], []int{0, 1, 2}, 6*time.Second) {
+			t.Fatalf("节点 %d 未应用 Join(2) 配置：%v", i, cfg.rafts[i].Status().Voters)
+		}
+	}
+	// Join 后 node2 已是投票成员，从「非投票（witness）列表」移除，但其 IsWitness（不 apply）不变。
+	st = cfg.rafts[l].Status()
+	if containsInt(st.Witnesses, w) {
+		t.Fatalf("Join(2) 后 node2 已入投票集合，Status().Witnesses 不应再含它，实际 %v", st.Witnesses)
+	}
+	if !cfg.rafts[w].Status().IsWitness {
+		t.Fatalf("node2 始终是见证者（不 apply），IsWitness 不应因 Join 改变")
+	}
+}
+
+// containsInt 判断 v 是否在小整数切片中（本文件内测试辅助）。
+func containsInt(s []int, v int) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
