@@ -6,7 +6,7 @@
 ## 总覆盖率
 
 ```
-total:  (statements)  74.2%
+total:  (statements)  81.4%
 ```
 
 > 说明：6.824 起始代码（尤其 `src/raft` 的选举/快照边界分支、`src/shardkv` 的迁移异常路径）存在大量防御性分支与难以触发的边界，是覆盖率未达更高的主要来源；核心读写与迁移主链路均已覆盖。
@@ -15,23 +15,25 @@ total:  (statements)  74.2%
 
 | 包 | 覆盖率 | 说明 |
 |----|-------:|------|
-| `src/cluster` | 93.2% | 可复用 in-process 集群 harness，路径少且全被测试/演示/网关覆盖 |
-| `src/demo` | 93.0% | 全栈演示，两条路径（Clerk + HTTP 网关）都被 `TestRunDemo` 跑通 |
-| `src/kvraft` | 84.4% | Lab 3 单组 KV，主链路 + 快照路径覆盖良好 |
-| `src/metrics` | 84.7% | 零依赖指标库，Counter/Histogram/Registry 均有单测 |
-| `src/shardmaster` | 76.5% | 配置服务，Join/Leave/Move/Query 主链路覆盖 |
-| `src/raft` | 77.8% | 共识核心，选举/复制/快照主链路覆盖；少数边界分支（脑裂恢复、快照截断）未触发 |
-| `src/shardkv` | 66.5% | 数据面最复杂：分片路由 + 迁移状态机 + ReadIndex；部分迁移异常/冻结路径（见 `lab4-shardkv-design.md §7`）未被测试覆盖 |
-| `src/gateway` | 66.7% | HTTP 网关，读写/健康检查/指标/调试端点均覆盖；错误分支（504/503 映射）有 `TestGatewayFailFast` |
-| `src/kvcli` | 54.1% | HTTP 客户端 + CLI；`bench` 子命令与错误路径覆盖较弱（CLI 参数解析分支多） |
+| `src/cluster` | 76.2% | 可复用 in-process 集群 harness，路径少且全被测试/演示/网关覆盖 |
+| `src/demo` | 74.5% | 全栈演示，两条路径（Clerk + HTTP 网关）都被 `TestRunDemo` 跑通 |
+| `src/kvraft` | 89.5% | Lab 3 单组 KV，主链路 + 快照路径覆盖良好 |
+| `src/metrics` | 86.5% | 零依赖指标库，Counter/Histogram/Registry 均有单测 |
+| `src/shardmaster` | 93.2% | 配置服务，Join/Leave/Move/Query 主链路覆盖 |
+| `src/raft` | 86.0% | 共识核心，选举/复制/快照主链路覆盖；少数边界分支（脑裂恢复、快照截断）未触发 |
+| `src/shardkv` | 74.3% | 数据面最复杂：分片路由 + 迁移状态机 + ReadIndex；部分迁移异常/冻结路径未被测试覆盖 |
+| `src/gateway` | 81.5% | HTTP 网关，读写/健康检查/指标/调试端点均覆盖；错误分支（504/503 映射）有 `TestGatewayFailFast` |
+| `src/kvcli` | 77.6% | HTTP 客户端 + CLI；`bench` 子命令与错误路径覆盖较弱 |
+| `src/transport` | 89.7% | 传输框架层（metrics 埋点单测覆盖）|
+| `src/util` | 91.8% | 通用工具库（WorkerPool 等 cluster-free 单测）|
+| `src/diagnostics` | 85.0% | 数据面自检（`RaftCheck` 不变量）|
+| `src/deploycheck` | 91.9% | 部署校验 |
+| `src/statusfmt` | 84.6% | 状态格式化 |
+| `src/kvnode` | 53.5% | 节点进程（部分路径未被单测）|
+| `src/version` | 79.4% | 版本信息 |
+| `src/kvadmin` | 0.0% | 管理工具（尚未补单测，见 §模块↔测试映射）|
 
-> 时效性说明：上表数值为较早一次全量快照（早于 #227–#234 的可观测/文档收口）。
-> #212–#226 推送为 `util.WorkerPool`(#217)、`kvcli` 批量扇出(#218)、`raft`/`shardkv` 健康快照(#219–#220)、
-> 网关 `/debug/raft`(#221)/`raft_min_health_score`(#222)、`kvraft` 状态机可观测(#223) 新增了大量
-> **cluster-free 单测**；#227–#234 又追加 `kvraft` 状态机可观测收口(#228，含 `kvraft_status_test.go`
-> 已于 #228 提交 `8e93ef7`)、`shardkv` 迁移积压 gauge(#229)、`diagnostics.ShardCheck` 数据面自检(#230)
-> 以及文档同步(#231–#234，含新增 `docs/observability.md` 统一指标总览）。故当前真实覆盖率应高于上表。
-> 重新生成请用 `make cover`。
+> 数值说明：下表于 **2026-09-03** 由 `go test -coverprofile=cover.out -covermode=atomic ./...` 全量实测、经 `go tool cover -func cover.out` 汇总得到（总覆盖率 **81.4%**）。`kvadmin` 暂无单测（0.0%），属已知缺口；其余 16 包均覆盖良好。重新生成请用 `make cover`。
 
 ## 免 Go 自检门禁（scripts/）
 
@@ -129,11 +131,11 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 
 | 模块 (包) | 源码文件 | 测试文件 | 有测试 | 高信号未覆盖导出符号 |
 |-----------|---------:|--------:|:------:|---------------------:|
-| `cluster` | 3 | 7 | ✅ | CrashNode, Diagnostics, LoadTCPConfig, ProposeConfChange, StartClusterFromConfig, ValidateConfChange, VoterConfig, NodeDiagnostics |
+| `cluster` | 3 | 7 | ✅ | CrashNode, Diagnostics, LoadTCPConfig, ProposeConfChange, SMClerk, StartClusterFromConfig, ValidateConfChange, VoterConfig …(+1) |
 | `demo` | 1 | 4 | ✅ | RunDemoPersistent, RunDemoTCP |
 | `deploycheck` | 1 | 1 | ✅ | DashboardPanel |
 | `diagnostics` | 2 | 3 | ✅ | — |
-| `gateway` | 6 | 20 | ✅ | Flush, LoadGatewayConfig, SetCORS, SetHTTPServer, GroupStatus, GroupView, RaftStatusView |
+| `gateway` | 7 | 21 | ✅ | Flush, LoadGatewayConfig, SetCORS, SetHTTPServer, GroupStatus, GroupView, RaftStatusView |
 | `kvadmin` | 1 | 0 | ❌ | — |
 | `kvcli` | 16 | 25 | ✅ | MSetCtx, BatchResult, BenchResult, MDelResult, MSetResult |
 | `kvnode` | 2 | 3 | ✅ | — |
@@ -147,6 +149,6 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 | `util` | 24 | 28 | ✅ | ExpBackoff, MarshalJSON, CbState |
 | `version` | 1 | 1 | ✅ | — |
 
-> 汇总：17 个包，1 个无测试；未引用导出符号 func=33 / type=19 / var=2 / const=0。「未覆盖符号」为软提示，可能含被间接覆盖的结果/视图类型。
+> 汇总：17 个包，1 个无测试；未引用导出符号 func=34 / type=19 / var=2 / const=0。「未覆盖符号」为软提示，可能含被间接覆盖的结果/视图类型。
 
 <!-- test-coverage-table:end -->

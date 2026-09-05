@@ -197,6 +197,14 @@ func (c *Cluster) Clerk() *shardkv.Clerk {
 	return shardkv.MakeClerk(c.SMNames, c.make_end)
 }
 
+// SMClerk 返回一个绑定到本集群 ShardMaster 的配置变更客户端（*shardmaster.Clerk）。
+// 与 Clerk()（ShardKV 数据面客户端）对称：供网关发起 Join/Leave/Move 等控制面配置变更，
+// 而无需关心集群内部的内存网络（make_end）实现细节。Join/Leave/Move 直接落到 shardmaster
+// 的 Raft 状态机，真正推进集群成员/分片配置。
+func (c *Cluster) SMClerk() *shardmaster.Clerk {
+	return shardmaster.MakeClerk(c.SMNames, c.make_end)
+}
+
 // Configs 返回 shardmaster 的完整配置历史（configs[0..latest]），供网关
 // /debug/configs 展示 rebalance 轨迹。经公开的 shardmaster.Clerk 查 leader 副本，
 // 逐号 Query 取回每段配置（调试用途，允许读到各副本已提交状态）。
