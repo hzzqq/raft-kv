@@ -71,6 +71,11 @@ type Server struct {
 	c     *cluster.Cluster
 	clerk *shardkv.Clerk
 
+	// sm 是 shardmaster 配置变更客户端（Join/Leave/Move）。由 NewServer 在有集群时
+	// 经 c.SMClerk() 注入；cluster-free 测试可注入 fake 客户端。未挂载时为 nil，
+	// 三个成员变更端点会返回 503（见 smClientOrErr）。
+	sm smClient
+
 	// I12：有界并发信号量；I13：在途请求计数，供优雅关闭等待。
 	sem *util.Semaphore
 	wg  sync.WaitGroup
@@ -784,6 +789,7 @@ func NewServer(c *cluster.Cluster) *Server {
 	if c != nil {
 		s.c = c
 		s.clerk = c.Clerk()
+		s.sm = c.SMClerk()
 	}
 	return s
 }
@@ -868,6 +874,11 @@ func (s *Server) Handler() http.Handler {
 	register("GET /kv/{key}", s.handleGet)
 	register("PUT /kv/{key}", s.handlePut)
 	register("POST /kv/{key}/append", s.handleAppend)
+	// 集群成员变更（控制面）：供 raft-kv-console 的「扩缩容」UI 调用，真正触发
+	// shardmaster 的配置变更（Join/Leave 改组成员，Move 触发表分片重分配）。
+	register("POST /join", s.handleJoin)
+	register("POST /leave", s.handleLeave)
+	register("POST /move", s.handleMove)
 	register("GET /healthz", s.handleHealthz)
 	// 就绪探针（I18）：集群可正常服务读写时 200，否则 503，供 k8s readinessProbe 直用。
 	register("GET /readyz", s.handleReadyz)
