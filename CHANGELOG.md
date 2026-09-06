@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–203，共 155 轮交付；时间跨度 2026-07-19 ~ 2026-09-03。
+> 覆盖 cycle 39–204，共 156 轮交付；时间跨度 2026-07-19 ~ 2026-09-05。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -23,6 +23,7 @@
 - **[165] `histogram_help_honest`** — 网关延迟/响应大小直方图补诚实 HELP（样本环形缓冲语义）（隐性：直方图按样本次数滑窗、非时间滑窗，故障期 p99 可能反而偏低被误读；Grafana 已注明但 /metrics 无 HELP；score=15）
 - **[199] `I193-GATEWAY-CACHE-INVALIDATE`** — （隐性：；score=9）
 - **[200] `I194-GATEWAY-CACHE-SCOPE`** — （隐性：；score=10）
+- **[204] `gateway-join-leave-move`** — 网关集群成员变更端点 POST /join /leave /move（控制面）（隐性：raft-kv-console(:8770) 扩缩容 UI 需真实触发 shardmaster 配置变更；score=19）
 
 ## kvcli
 

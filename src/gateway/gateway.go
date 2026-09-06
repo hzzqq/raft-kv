@@ -911,6 +911,10 @@ func (s *Server) Handler() http.Handler {
 	register("GET /debug/log", s.handleDebugLog)
 	// 当前生效配置（I52）：返回网关实际生效的配置快照（脱敏），便于确认配置加载结果。
 	register("GET /debug/config", s.handleDebugConfig)
+	// I197：线性一致自检端点——对嵌入金标准历史跑单写者每键检查器（复用
+	// src/linearizability），暴露是否线性一致、检查操作数与违规数，运维/测试可一键确认
+	// 系统线性一致正确性（详见 gateway_linearizability.go）。
+	register("GET /debug/linearizability", s.handleLinearizability)
 	// I58：已注册路由清单，便于确认网关路由面（含本端点自身）。
 	register("GET /debug/routes", s.handleDebugRoutes)
 	// I59：版本与 uptime，便于运行时透明与监控（不含任何敏感配置）。
