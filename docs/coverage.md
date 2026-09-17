@@ -135,7 +135,7 @@ _本表由 `scripts/check_test_coverage.py` 自动生成（免 Go 扫描），�
 | `demo` | 1 | 4 | ✅ | RunDemoPersistent, RunDemoTCP |
 | `deploycheck` | 1 | 1 | ✅ | DashboardPanel |
 | `diagnostics` | 2 | 3 | ✅ | — |
-| `gateway` | 8 | 22 | ✅ | Flush, LoadGatewayConfig, SetCORS, SetHTTPServer, GroupStatus, GroupView, RaftStatusView |
+| `gateway` | 8 | 23 | ✅ | Flush, LoadGatewayConfig, SetCORS, SetHTTPServer, GroupStatus, GroupView, RaftStatusView |
 | `kvadmin` | 1 | 0 | ❌ | — |
 | `kvcli` | 16 | 25 | ✅ | MSetCtx, BatchResult, BenchResult, MDelResult, MSetResult |
 | `kvnode` | 2 | 3 | ✅ | — |

@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"raftkv/src/cluster"
@@ -151,6 +152,15 @@ type Server struct {
 	cacheMax    int
 	cacheStore  map[string]*cacheEntry
 	cacheOrder  []string
+
+	// I208：写失效代数（全局原子计数）。invalidateKeyCache 每次写失效时 +1；GET 回源前
+	// 记录、落缓存前比对——回源期间发生过任何写失效（含无关 key）即放弃落缓存/落 ETag。
+	// 堵住 I193 的并发缺口：慢 GET（后端重试/迁移抖动拉长回源）若「写前开始、写后完成」，
+	// 其 cacheSet/etagSet 会把写前旧值与陈旧 ETag 重新写回缓存，使后续 GET 在整个 TTL 内
+	// 命中陈旧值、条件 GET 误得 304（read-your-writes 被隐蔽破坏）。选用单一全局计数而非
+	// per-key 计数的取舍：实现零锁、零内存泄漏、无「计数器清理破坏在途守卫」的洞；代价仅是
+	// 高写并发下个别无关 GET 少缓存一次响应（下一轮干净回源即恢复），demo 级完全可接受。
+	invalGen atomic.Uint64
 
 	// I69：ETag / 条件 GET。对 GET 200 响应计算 ETag（响应体 SHA256），回写 ETag 头；
 	// 客户端带 If-None-Match 且匹配时直接 304 不回源，省带宽。与响应缓存共用捕获路径。
@@ -714,6 +724,9 @@ func (s *Server) evictOrder(key string) {
 // 对 nil map 执行 delete 安全无副作用——故本方法在缓存关闭时零成本、零副作用。
 // 修复 I193：此前 handlePut/handleAppend 不失效缓存，开启缓存（SetCache 标注"生产可用"）后
 // 网关会向客户端返回写入前的旧值，直到 TTL 过期，是一个隐蔽的线性一致破坏点。
+// 修复 I208：末尾递增全局写失效代数，使「本写之前开始回源、之后才完成」的在途 GET
+// 落缓存前检测到代数变化而放弃写入——否则其 cacheSet/etagSet 会把写前旧值/陈旧 ETag
+// 重新写回缓存（删除发生在 GET 完成之前，拦不住它），陈旧值在 TTL 内复活。
 func (s *Server) invalidateKeyCache(path string) {
 	for _, enc := range []string{"plain", "gzip"} {
 		k := "GET " + path + " " + enc
@@ -727,6 +740,7 @@ func (s *Server) invalidateKeyCache(path string) {
 		delete(s.etagStore, k)
 		s.etagMu.Unlock()
 	}
+	s.invalGen.Add(1)
 }
 
 // replayCache 把缓存响应原样回放给客户端（X-Request-ID 沿用本次请求，不被旧值覆盖），
@@ -1068,6 +1082,10 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		if (s.cacheOn || s.etagOn) && s.isDataGET(r) {
 			// 缓存/ETag 路径（仅数据路径 /kv/{key} 生效，isDataGET）：crec 仅缓冲响应（不下发），handler 跑完后再统一 WriteHeader 下发，
 			// 确保 ETag 等头在首次 Write/WriteHeader（冻结响应头）之前已设置好。
+			// I208：回源前记录写失效代数，落缓存前比对——回源期间发生过写失效则本次
+			// 响应可能基于写前旧值，放弃落缓存/落 ETag（保守正确：宁可少缓存一次，
+			// 也不把陈旧值冻结进 TTL 窗口；下一轮干净回源自然恢复缓存）。
+			gen0 := s.invalGen.Load()
 			crec := &capturingRecorder{ResponseWriter: w, buf: &bytes.Buffer{}}
 			h(crec, r)
 			st = crec.status
@@ -1085,14 +1103,15 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 				gzw.Close()
 				storeBody = gb.Bytes()
 			}
-			if s.cacheOn {
+			fresh := s.invalGen.Load() == gen0
+			if s.cacheOn && fresh {
 				if st == http.StatusOK {
 					s.cacheSet(ck, &cacheVal{Status: st, Header: w.Header().Clone(), Body: storeBody})
 				} else if st >= 500 {
 					s.cacheSetNeg(ck, &cacheVal{Status: st, Header: w.Header().Clone(), Body: storeBody})
 				}
 			}
-			if s.etagOn && st == http.StatusOK {
+			if s.etagOn && st == http.StatusOK && fresh {
 				etag := computeETag(body)
 				s.etagSet(ck, etag)
 				w.Header().Set("ETag", etag)
@@ -1164,11 +1183,11 @@ func (s *Server) recordAccess(method, path string, status int, d time.Duration, 
 func (s *Server) recordRequestMetrics(method string, status int, latencyMs float64) {
 	Metrics.CounterVec("http_requests_total", "method").WithLabelValues(method).Inc()
 	Metrics.CounterVec("http_responses_total", "code", "method").WithLabelValues(strconv.Itoa(status), method).Inc()
-		// 直方图语义诚实化（R7）：见 gateway_response_bytes 注释——分位按时间滑窗
-		// （宽度默认 60s，可由 RAFTKV_HIST_WINDOW 覆盖），非按观测次数滑窗；故障期
-		// p99 不再因残留历史样本而「虚低」，可直接参考（但仍为单进程观测）。
-		Metrics.HistWithHelp("http_request_latency_ms",
-			fmt.Sprintf("网关请求延迟直方图（毫秒）。分位(p50/p95/p99)来自最近 %.0fs 时间滑窗内样本（窗口外已淘汰，故故障期流量骤降不会虚低，可参考）；内存上限 8192 样本（极端高 QPS 时丢最旧）；窗口内 0 样本时不导出分位序列（避免 Grafana 误显 0ms）。", metrics.DefaultHistWindow().Seconds())).Record(latencyMs)
+	// 直方图语义诚实化（R7）：见 gateway_response_bytes 注释——分位按时间滑窗
+	// （宽度默认 60s，可由 RAFTKV_HIST_WINDOW 覆盖），非按观测次数滑窗；故障期
+	// p99 不再因残留历史样本而「虚低」，可直接参考（但仍为单进程观测）。
+	Metrics.HistWithHelp("http_request_latency_ms",
+		fmt.Sprintf("网关请求延迟直方图（毫秒）。分位(p50/p95/p99)来自最近 %.0fs 时间滑窗内样本（窗口外已淘汰，故故障期流量骤降不会虚低，可参考）；内存上限 8192 样本（极端高 QPS 时丢最旧）；窗口内 0 样本时不导出分位序列（避免 Grafana 误显 0ms）。", metrics.DefaultHistWindow().Seconds())).Record(latencyMs)
 }
 
 // handleDebugAccessLog 返回进程内访问日志的最近 N 条（默认 50，可用 ?limit= 覆盖），

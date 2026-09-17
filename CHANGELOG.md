@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–206，共 158 轮交付；时间跨度 2026-07-19 ~ 2026-09-17。
+> 覆盖 cycle 39–207，共 159 轮交付；时间跨度 2026-07-19 ~ 2026-09-17。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -25,6 +25,7 @@
 - **[200] `I194-GATEWAY-CACHE-SCOPE`** — （隐性：；score=10）
 - **[204] `gateway-join-leave-move`** — 网关集群成员变更端点 POST /join /leave /move（控制面）（隐性：raft-kv-console(:8770) 扩缩容 UI 需真实触发 shardmaster 配置变更；score=19）
 - **[205] `gateway-membership-invalid-guard`** — 网关成员变更端点（/join /leave /move）派发前语义校验护栏：语义无效请求快速 400，不再派发给底层 Clerk（隐性：shardmaster.Clerk.Join/Leave/Move 对任何非 OK 回复（含 ErrInvalid，即服务端 validateJoin/validateLeave/validateMove 的确定性拒绝：重复 Join gid / Leave 不存在或重复 gid / Move 目标组不在配置）都会无限重试永不返回；网关三端点同步调用它们，语义无效请求会让 HTTP handler 永久挂起——客户端虽在 requestTimeout(30s) 后收到 TimeoutHandler 503，但 handler goroutine 与 wrap 已 TryAcquire 的并发信号量槽位永不释放，反复请求可耗尽并发预算（全网关 429 DoS）；score=20）
+- **[207] `gateway-cache-write-race`** — 网关响应缓存写失效代数护栏（I208）：GET 回源期间发生过写失效则放弃落缓存/落 ETag，堵住 I193 的并发缺口（隐性：I193 的写后失效只拦得住「写后开始的回源」：慢 GET（后端重试/迁移抖动拉长回源）若「写前开始、写后完成」，其 cacheSet/etagSet 在 invalidateKeyCache 的删除之后才执行，会把写前旧值重新写回缓存——后续 GET 在整个 TTL 内命中陈旧值（read-your-writes 被隐蔽破坏），陈旧 ETag 复活还会使条件 GET 误得 304；既有 I193 回归测试为顺序场景（写→读→写→读），覆盖不到该并发窗口；score=18）
 
 ## kvcli
 
