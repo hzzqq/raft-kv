@@ -761,6 +761,15 @@ func (s *Server) replayCache(w http.ResponseWriter, cv *cacheVal, start time.Tim
 	s.recordRequestMetrics(r.Method, cv.Status, float64(time.Since(start).Microseconds())/1000.0)
 }
 
+// serveNotModified 统一输出条件 GET 的 304 短路响应（无 body），并补齐访问日志与
+// 基础指标，使 304 短路与 200 回放在观测面口径一致。I209：缓存命中与 ETag 匹配
+// 两条短路路径共用本 helper，避免观测实现分叉。
+func (s *Server) serveNotModified(w http.ResponseWriter, r *http.Request, start time.Time, reqID string) {
+	w.WriteHeader(http.StatusNotModified)
+	s.recordAccess(r.Method, r.URL.Path, http.StatusNotModified, time.Since(start), reqID)
+	s.recordRequestMetrics(r.Method, http.StatusNotModified, float64(time.Since(start).Microseconds())/1000.0)
+}
+
 // SetETag 开启 ETag / 条件 GET（生产可用）。对 GET 200 响应计算 ETag 并回写，
 // 客户端带 If-None-Match 命中时返回 304 不回源。
 func (s *Server) SetETag(on bool) {
@@ -1027,8 +1036,21 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		s.setTraceHeaders(w, reqID)
 		// I68：GET 命中响应缓存则直接回放，跳过并发信号量与回源（限流/安全语义已于上方校验）。
 		// 仅数据路径 /kv/{key} 走缓存（isDataGET），诊断/指标端点不得缓存。
+		// I209：缓存命中路径同样服务条件 GET——此前命中即全量回放 200，生产 SetCache+SetETag
+		// 双开时 If-None-Match 永远得不到 304，条件 GET 退化为整包传输（浪费带宽）。
+		// 仅对缓存中的 200 正缓存比对（负缓存 5xx 无 ETag）；比对复用 etagMatches，与下方
+		// miss 路径同一语义（强 ETag 精确匹配，W/ 弱变体与 * 通配不匹配——误判只会回退
+		// 全量 200，保守安全）；键同为 cacheKey，plain/gzip 双编码变体各自独立匹配。
+		// 304 短路不落缓存/不落 ETag，与 I208 写失效代数护栏天然无交互。
+		ck := s.cacheKey(r)
 		if s.cacheOn && s.isDataGET(r) {
-			if cv := s.cacheGet(s.cacheKey(r)); cv != nil {
+			if cv := s.cacheGet(ck); cv != nil {
+				if s.etagOn && cv.Status == http.StatusOK {
+					if inm := r.Header.Get("If-None-Match"); inm != "" && s.etagMatches(ck, inm) {
+						s.serveNotModified(w, r, start, reqID)
+						return
+					}
+				}
 				s.replayCache(w, cv, start, r)
 				return
 			}
@@ -1036,10 +1058,8 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		// I69：条件 GET。客户端带 If-None-Match 且与该路径已记录 ETag 一致时直接 304，不回源。
 		// 同样仅数据路径生效（isDataGET），避免 /metrics 等实时端点被 304 冻结。
 		if s.etagOn && s.isDataGET(r) {
-			if inm := r.Header.Get("If-None-Match"); inm != "" && s.etagMatches(s.cacheKey(r), inm) {
-				w.WriteHeader(http.StatusNotModified)
-				s.recordAccess(r.Method, r.URL.Path, http.StatusNotModified, time.Since(start), reqID)
-				s.recordRequestMetrics(r.Method, http.StatusNotModified, float64(time.Since(start).Microseconds())/1000.0)
+			if inm := r.Header.Get("If-None-Match"); inm != "" && s.etagMatches(ck, inm) {
+				s.serveNotModified(w, r, start, reqID)
 				return
 			}
 		}
