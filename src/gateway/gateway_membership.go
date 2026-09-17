@@ -8,7 +8,7 @@ import (
 )
 
 // smClient 是 shardmaster 配置变更客户端接口。*shardmaster.Clerk 天然满足该接口
-// （Join/Leave/Move 签名与 shardmaster.Clerk 完全一致），抽象出来便于单测注入
+// （Join/Leave/Move/Query 签名与 shardmaster.Clerk 完全一致），抽象出来便于单测注入
 // fake 客户端、在 cluster-free 场景下量化验证「底层客户端调用被正确触发」，无需
 // 启动真实内存集群。
 type smClient interface {
@@ -18,7 +18,19 @@ type smClient interface {
 	Leave(gids []int)
 	// Move 把某个分片迁往指定 gid 的副本组。
 	Move(shard, gid int)
+	// Query 读取集群配置（num<0 取最新），供端点派发前做语义校验。
+	Query(num int) shardmaster.Config
 }
+
+// 语义校验护栏：shardmaster.Clerk 的 Join/Leave/Move 对任何非 OK 回复——包括
+// ErrInvalid（服务端 validateJoin/validateLeave/validateMove 对「重复 Join gid /
+// Leave 不存在或重复 gid / Move 目标组不在配置」的确定性拒绝）——都会无限重试、
+// 永不返回。若把语义无效请求直接派发给 Clerk，HTTP handler 将永久阻塞：客户端虽在
+// requestTimeout 后收到 TimeoutHandler 的 503，但 handler goroutine 及 wrap 已占用
+// 的并发信号量槽位永不释放，反复请求可耗尽并发预算（全网关 429）。因此三个端点都在
+// 派发前 Query(-1) 拉取最新配置做同口径校验，把语义无效请求映射为快速 400。
+// 残余边界：Query 与派发之间配置若被并发变更，仍可能触发底层 ErrInvalid 无限重试
+//（根治需 Clerk 暴露错误返回，波及面大，暂不做；控制面并发冲突属罕见场景）。
 
 // joinReq 是 POST /join 的请求体：把 gid 标识的副本组加入集群，
 // servers 为该组各副本的接入地址（与 shardmaster.Join 的 map[int][]string 对齐）。
@@ -72,7 +84,8 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 // handleJoin 实现 POST /join：把一个新副本组加入集群（对应 shardmaster.Join）。
 // 成功返回 200 + {"ok":true,"gid":N}；参数非法（gid<=0 或 servers 为空或 JSON 错误）
-// 返回 400；未挂载集群返回 503。调用经 s.sm.Join 真正写入 shardmaster 配置。
+// 或语义无效（gid 已存在于当前配置）返回 400；未挂载集群返回 503。调用经 s.sm.Join
+// 真正写入 shardmaster 配置。
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -96,12 +109,23 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, membershipResp{OK: false, Error: "servers must not be empty"})
 		return
 	}
+	// 语义校验：重复 Join 已存在的 gid 会被 validateJoin 确定性拒绝（ErrInvalid），
+	// 先行快速 400，避免派发后 Clerk 无限重试挂死 handler。
+	cfg := ck.Query(-1)
+	if _, exists := cfg.Groups[req.GID]; exists {
+		writeJSON(w, http.StatusBadRequest, membershipResp{
+			OK:    false,
+			Error: fmt.Sprintf("gid %d already exists in latest config (num %d)", req.GID, cfg.Num),
+		})
+		return
+	}
 	ck.Join(map[int][]string{req.GID: req.Servers})
 	writeJSON(w, http.StatusOK, membershipResp{OK: true, GID: req.GID})
 }
 
 // handleLeave 实现 POST /leave：把若干副本组移出集群（对应 shardmaster.Leave）。
-// 接受 gids 数组或单个 gid；二者皆空返回 400。成功返回 200 + {"ok":true,"gids":[...]}。
+// 接受 gids 数组或单个 gid；二者皆空、gid 非法、重复 gid 或 gid 不存在于当前配置
+// 返回 400。成功返回 200 + {"ok":true,"gids":[...]}。
 func (s *Server) handleLeave(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -131,12 +155,36 @@ func (s *Server) handleLeave(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 语义校验：重复 gid 或当前配置中不存在的 gid 都会被 validateLeave 确定性拒绝
+	//（ErrInvalid），先行快速 400，避免派发后 Clerk 无限重试挂死 handler。
+	seen := map[int]bool{}
+	for _, g := range gids {
+		if seen[g] {
+			writeJSON(w, http.StatusBadRequest, membershipResp{
+				OK:    false,
+				Error: fmt.Sprintf("duplicate gid %d", g),
+			})
+			return
+		}
+		seen[g] = true
+	}
+	cfg := ck.Query(-1)
+	for _, g := range gids {
+		if _, exists := cfg.Groups[g]; !exists {
+			writeJSON(w, http.StatusBadRequest, membershipResp{
+				OK:    false,
+				Error: fmt.Sprintf("gid %d not present in latest config (num %d)", g, cfg.Num),
+			})
+			return
+		}
+	}
 	ck.Leave(gids)
 	writeJSON(w, http.StatusOK, membershipResp{OK: true, GIDs: gids})
 }
 
 // handleMove 实现 POST /move：把某个分片迁往指定副本组（对应 shardmaster.Move），
-// 即控制台「重新平衡」的单步触发。shard 必须在 [0, NShards) 且 gid>0，否则 400。
+// 即控制台「重新平衡」的单步触发。shard 必须在 [0, NShards)、gid>0 且目标 gid 存在
+// 于当前配置，否则 400。
 func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -161,6 +209,16 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.GID <= 0 {
 		writeJSON(w, http.StatusBadRequest, membershipResp{OK: false, Error: "gid must be a positive integer"})
+		return
+	}
+	// 语义校验：目标 gid 不在当前配置中会被 validateMove 确定性拒绝（ErrInvalid），
+	// 先行快速 400，避免派发后 Clerk 无限重试挂死 handler。
+	cfg := ck.Query(-1)
+	if _, exists := cfg.Groups[req.GID]; !exists {
+		writeJSON(w, http.StatusBadRequest, membershipResp{
+			OK:    false,
+			Error: fmt.Sprintf("gid %d not present in latest config (num %d); join it first", req.GID, cfg.Num),
+		})
 		return
 	}
 	ck.Move(req.Shard, req.GID)
