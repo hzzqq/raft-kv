@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–205，共 157 轮交付；时间跨度 2026-07-19 ~ 2026-09-17。
+> 覆盖 cycle 39–206，共 158 轮交付；时间跨度 2026-07-19 ~ 2026-09-17。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -75,6 +75,7 @@
 - **[50] `sm_transition`** — Valid/IsValidTransition（隐性：配置演进无校验；score=15）
 - **[62] `sm_plan_preview`** — Plan(current,PlanOp) 配置变更预览器(dry-run)（隐性：此前无 dry-run 校验,运维直提交非法 Join/Leave/Move 易致 rebalance 卡死(R2 隐性)；score=14）
 - **[73] `sm_metrics`** — shardmaster 控制面可观测性(Metrics 注册表 + /metrics 暴露)（隐性：控制面 Join/Leave/Move/rebalance/配置版本对运维完全不可见；score=16）
+- **[206] `shardmaster-clerk-try-api`** — 根治 cycle 205 残余边界：shardmaster.Clerk 新增可观察错误的 TryJoin/TryLeave/TryMove 变体（ErrInvalid 确定性拒绝快速返回而非无限重试），网关 /join /leave /move 派发期 ErrInvalid → 409 快速失败（隐性：cycle 205 的派发前 Query 校验存在竞态残余：Query(-1) 校验通过后、派发前配置若被并发变更（如另一客户端抢先 Join 同一 gid / Leave 掉目标组），原 Clerk.Join/Leave/Move 对任何非 OK 回复（含服务端 validate* 的确定性 ErrInvalid）无限重试永不返回 → 网关 handler goroutine 与 wrap 已占用的并发信号量槽位永久泄漏（反复请求耗尽并发预算=全网关 429 DoS）；kvadmin join/leave/move/churn 同路径对无效输入永久挂死；score=20）
 
 ## kvraft
 

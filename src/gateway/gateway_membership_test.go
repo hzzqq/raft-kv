@@ -23,6 +23,11 @@ type fakeSMClient struct {
 	// base 是语义校验护栏 Query(-1) 时看到的初始集群组成（nil = 空集群）；
 	// 当前配置按已派发的 Join/Leave 动态推导，模拟真实 shardmaster。
 	base map[int][]string
+	// tryInvalid 模拟「语义校验通过后、派发前配置被并发变更」：对应 Try* 派发收到
+	// 服务端 validate* 的确定性拒绝（ErrInvalid），且变更不落盘（未进 Raft）。
+	tryJoinInvalid  bool
+	tryLeaveInvalid bool
+	tryMoveInvalid  bool
 }
 
 // Query 动态推导当前配置：base ∪ joins − leaves，供网关语义校验护栏消费。
@@ -46,27 +51,43 @@ func (f *fakeSMClient) Query(num int) shardmaster.Config {
 	return shardmaster.Config{Groups: groups}
 }
 
-func (f *fakeSMClient) Join(servers map[int][]string) {
+// TryJoin 模拟真实 shardmaster.Join 的派发：tryJoinInvalid 置位时确定性拒绝
+//（ErrInvalid，不落盘——被拒的 op 不会进入 Raft）；否则记录并返回 OK。
+func (f *fakeSMClient) TryJoin(servers map[int][]string) shardmaster.Err {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.tryJoinInvalid {
+		return shardmaster.ErrInvalid
+	}
 	// 拷贝，避免调用方后续修改影响断言
 	cp := make(map[int][]string, len(servers))
 	for g, s := range servers {
 		cp[g] = append([]string(nil), s...)
 	}
 	f.joins = append(f.joins, cp)
+	return shardmaster.OK
 }
 
-func (f *fakeSMClient) Leave(gids []int) {
+// TryLeave 模拟真实 shardmaster.Leave 的派发：tryLeaveInvalid 置位时确定性拒绝。
+func (f *fakeSMClient) TryLeave(gids []int) shardmaster.Err {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.tryLeaveInvalid {
+		return shardmaster.ErrInvalid
+	}
 	f.leaves = append(f.leaves, append([]int(nil), gids...))
+	return shardmaster.OK
 }
 
-func (f *fakeSMClient) Move(shard, gid int) {
+// TryMove 模拟真实 shardmaster.Move 的派发：tryMoveInvalid 置位时确定性拒绝。
+func (f *fakeSMClient) TryMove(shard, gid int) shardmaster.Err {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.tryMoveInvalid {
+		return shardmaster.ErrInvalid
+	}
 	f.moves = append(f.moves, [2]int{shard, gid})
+	return shardmaster.OK
 }
 
 func (f *fakeSMClient) snapshot() (joins []map[int][]string, leaves [][]int, moves [][2]int) {
@@ -422,4 +443,105 @@ func TestGatewayMembership_RealCluster_InvalidFastReject(t *testing.T) {
 		t.Fatalf("move to nonexistent gid status = %d, want 400", resp.StatusCode)
 	}
 	decodeMembership(t, resp)
+}
+
+// TestGatewayMembership_DispatchRaceConflict 验证派发期 ErrInvalid 快速 409（cycle 206
+// 根治 cycle 205 残余边界）：语义校验 Query(-1) 时请求有效（护栏放行），但派发瞬间
+// 配置被并发变更（Try* 收到服务端确定性拒绝 ErrInvalid）。修复前该路径会触发底层
+// Clerk 无限重试：HTTP handler 永久挂起、并发信号量槽位泄漏（全网关 429 DoS）；
+// 修复后端点立即 409 Conflict，如实报告冲突原因，被拒变更不落盘，冲突解除后同请求
+// 正常成功。客户端带 10s 超时——若回归为挂起，本测试以超时失败而非卡死整轮 go test。
+func TestGatewayMembership_DispatchRaceConflict(t *testing.T) {
+	s := NewServer(nil)
+	fake := &fakeSMClient{base: map[int][]string{1: {"g1s1"}}}
+	s.sm = fake
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	fast := &http.Client{Timeout: 10 * time.Second}
+	post := func(path string, body interface{}) *http.Response {
+		t.Helper()
+		var buf bytes.Buffer
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatalf("encode body: %v", err)
+		}
+		req, err := http.NewRequest(http.MethodPost, ts.URL+path, &buf)
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := fast.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s failed (likely hung instead of fast 409): %v", path, err)
+		}
+		return resp
+	}
+
+	// --- /join：Query 时 gid 7 不存在（护栏放行），TryJoin 模拟并发拒绝 -> 409 ---
+	fake.mu.Lock()
+	fake.tryJoinInvalid = true
+	fake.mu.Unlock()
+	start := time.Now()
+	resp := post("/join", joinReq{GID: 7, Servers: []string{"s1"}})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("join race status = %d, want 409", resp.StatusCode)
+	}
+	if el := time.Since(start); el > 5*time.Second {
+		t.Fatalf("join race took %v, want fast 409 (dispatch hang regression?)", el)
+	}
+	out := decodeMembership(t, resp)
+	if out.OK || out.Error == "" {
+		t.Fatalf("join race resp = %+v, want ok=false with error", out)
+	}
+	if joins, _, _ := fake.snapshot(); len(joins) != 0 {
+		t.Fatalf("rejected join must not be recorded, got %d", len(joins))
+	}
+	fake.mu.Lock()
+	fake.tryJoinInvalid = false
+	fake.mu.Unlock()
+
+	// --- /leave：同路径 ---
+	fake.mu.Lock()
+	fake.tryLeaveInvalid = true
+	fake.mu.Unlock()
+	resp = post("/leave", leaveReq{GID: 1})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("leave race status = %d, want 409", resp.StatusCode)
+	}
+	out = decodeMembership(t, resp)
+	if out.OK || out.Error == "" {
+		t.Fatalf("leave race resp = %+v, want ok=false with error", out)
+	}
+	if _, leaves, _ := fake.snapshot(); len(leaves) != 0 {
+		t.Fatalf("rejected leave must not be recorded, got %d", len(leaves))
+	}
+	fake.mu.Lock()
+	fake.tryLeaveInvalid = false
+	fake.mu.Unlock()
+
+	// --- /move：同路径 ---
+	fake.mu.Lock()
+	fake.tryMoveInvalid = true
+	fake.mu.Unlock()
+	resp = post("/move", moveReq{Shard: 0, GID: 1})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("move race status = %d, want 409", resp.StatusCode)
+	}
+	out = decodeMembership(t, resp)
+	if out.OK || out.Error == "" {
+		t.Fatalf("move race resp = %+v, want ok=false with error", out)
+	}
+	if _, _, moves := fake.snapshot(); len(moves) != 0 {
+		t.Fatalf("rejected move must not be recorded, got %d", len(moves))
+	}
+	fake.mu.Lock()
+	fake.tryMoveInvalid = false
+	fake.mu.Unlock()
+
+	// --- 冲突解除后同请求成功（409 是可重试的瞬时冲突，非终态拒绝）---
+	resp = post("/join", joinReq{GID: 7, Servers: []string{"s1"}})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("join after conflict cleared status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
 }

@@ -8,29 +8,34 @@ import (
 )
 
 // smClient 是 shardmaster 配置变更客户端接口。*shardmaster.Clerk 天然满足该接口
-// （Join/Leave/Move/Query 签名与 shardmaster.Clerk 完全一致），抽象出来便于单测注入
-// fake 客户端、在 cluster-free 场景下量化验证「底层客户端调用被正确触发」，无需
-// 启动真实内存集群。
+// （TryJoin/TryLeave/TryMove/Query 签名与 shardmaster.Clerk 完全一致），抽象出来便于
+// 单测注入 fake 客户端、在 cluster-free 场景下量化验证「底层客户端调用被正确触发」，
+// 无需启动真实内存集群。端点统一走 Try* 变体：对服务端确定性拒绝（ErrInvalid）快速
+// 返回错误而非无限重试（详见下方护栏说明与 tryOp 协议注释）。
 type smClient interface {
-	// Join 把一组副本（gid -> servers）加入集群配置。
-	Join(servers map[int][]string)
-	// Leave 把若干副本组移出集群配置。
-	Leave(gids []int)
-	// Move 把某个分片迁往指定 gid 的副本组。
-	Move(shard, gid int)
+	// TryJoin 把一组副本（gid -> servers）加入集群配置；确定性拒绝返回 ErrInvalid。
+	TryJoin(servers map[int][]string) shardmaster.Err
+	// TryLeave 把若干副本组移出集群配置；确定性拒绝返回 ErrInvalid。
+	TryLeave(gids []int) shardmaster.Err
+	// TryMove 把某个分片迁往指定 gid 的副本组；确定性拒绝返回 ErrInvalid。
+	TryMove(shard, gid int) shardmaster.Err
 	// Query 读取集群配置（num<0 取最新），供端点派发前做语义校验。
 	Query(num int) shardmaster.Config
 }
 
-// 语义校验护栏：shardmaster.Clerk 的 Join/Leave/Move 对任何非 OK 回复——包括
-// ErrInvalid（服务端 validateJoin/validateLeave/validateMove 对「重复 Join gid /
-// Leave 不存在或重复 gid / Move 目标组不在配置」的确定性拒绝）——都会无限重试、
-// 永不返回。若把语义无效请求直接派发给 Clerk，HTTP handler 将永久阻塞：客户端虽在
-// requestTimeout 后收到 TimeoutHandler 的 503，但 handler goroutine 及 wrap 已占用
-// 的并发信号量槽位永不释放，反复请求可耗尽并发预算（全网关 429）。因此三个端点都在
-// 派发前 Query(-1) 拉取最新配置做同口径校验，把语义无效请求映射为快速 400。
-// 残余边界：Query 与派发之间配置若被并发变更，仍可能触发底层 ErrInvalid 无限重试
-//（根治需 Clerk 暴露错误返回，波及面大，暂不做；控制面并发冲突属罕见场景）。
+// 语义校验护栏（cycle 205）+ Try* 派发（cycle 206）双层防护：shardmaster.Clerk 的
+// Join/Leave/Move 对任何非 OK 回复——包括 ErrInvalid（服务端 validateJoin/validateLeave/
+// validateMove 对「重复 Join gid / Leave 不存在或重复 gid / Move 目标组不在配置」的
+// 确定性拒绝）——都会无限重试、永不返回。若把语义无效请求直接派发给 Clerk，HTTP
+// handler 将永久阻塞：客户端虽在 requestTimeout 后收到 TimeoutHandler 的 503，但
+// handler goroutine 及 wrap 已占用的并发信号量槽位永不释放，反复请求可耗尽并发预算
+//（全网关 429 DoS）。因此：
+//  1. 第一层（cycle 205）：三端点派发前经 Query(-1) 拉取最新配置做与 validate* 同口径
+//     的语义校验，语义无效请求快速 400，根本不派发；
+//  2. 第二层（cycle 206）：派发走 TryJoin/TryLeave/TryMove——覆盖「校验通过后、派发前
+//     配置被并发变更」的竞态残余边界：Try* 对派发期 ErrInvalid 立即返回而非无限重试，
+//     端点以 409 Conflict 快速失败（见 dispatchErrStatus），handler 与并发槽位不再泄漏，
+//     客户端重查配置重试即可。
 
 // joinReq 是 POST /join 的请求体：把 gid 标识的副本组加入集群，
 // servers 为该组各副本的接入地址（与 shardmaster.Join 的 map[int][]string 对齐）。
@@ -73,6 +78,16 @@ func (s *Server) smClientOrErr() (smClient, error) {
 	return s.sm, nil
 }
 
+// dispatchErrStatus 把 Try* 派发期错误映射为 HTTP 状态码：ErrInvalid 属「语义校验时
+// 有效、派发时被并发配置变更击败」的冲突 → 409（客户端重查配置后重试即可成功）；
+// 其他错误按 tryOp 契约不应出现（Try* 只返回 OK 或 ErrInvalid），防御性映射 503。
+func dispatchErrStatus(e shardmaster.Err) int {
+	if e == shardmaster.ErrInvalid {
+		return http.StatusConflict
+	}
+	return http.StatusServiceUnavailable
+}
+
 // writeJSON 以 JSON 写出响应（统一 Content-Type），供三个端点的一致成功/错误输出。
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -84,7 +99,8 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 // handleJoin 实现 POST /join：把一个新副本组加入集群（对应 shardmaster.Join）。
 // 成功返回 200 + {"ok":true,"gid":N}；参数非法（gid<=0 或 servers 为空或 JSON 错误）
-// 或语义无效（gid 已存在于当前配置）返回 400；未挂载集群返回 503。调用经 s.sm.Join
+// 或语义无效（gid 已存在于当前配置）返回 400；校验通过但派发时配置被并发变更
+//（TryJoin 返回 ErrInvalid）返回 409；未挂载集群返回 503。调用经 s.sm.TryJoin
 // 真正写入 shardmaster 配置。
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -119,13 +135,23 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	ck.Join(map[int][]string{req.GID: req.Servers})
+	// 派发：TryJoin 在服务端确定性拒绝（ErrInvalid，即「校验通过后配置被并发变更」的
+	// 竞态窗口）时立即返回错误而非无限重试，以 409 快速失败，不再泄漏 handler 与槽位。
+	if err := ck.TryJoin(map[int][]string{req.GID: req.Servers}); err != shardmaster.OK {
+		writeJSON(w, dispatchErrStatus(err), membershipResp{
+			OK:    false,
+			GID:   req.GID,
+			Error: fmt.Sprintf("dispatch rejected by shardmaster: %v (config may have changed concurrently; re-query and retry)", err),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, membershipResp{OK: true, GID: req.GID})
 }
 
 // handleLeave 实现 POST /leave：把若干副本组移出集群（对应 shardmaster.Leave）。
 // 接受 gids 数组或单个 gid；二者皆空、gid 非法、重复 gid 或 gid 不存在于当前配置
-// 返回 400。成功返回 200 + {"ok":true,"gids":[...]}。
+// 返回 400；校验通过但派发时配置被并发变更（TryLeave 返回 ErrInvalid）返回 409。
+// 成功返回 200 + {"ok":true,"gids":[...]}。
 func (s *Server) handleLeave(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -178,13 +204,23 @@ func (s *Server) handleLeave(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	ck.Leave(gids)
+	// 派发：TryLeave 在服务端确定性拒绝（ErrInvalid，即「校验通过后配置被并发变更」的
+	// 竞态窗口）时立即返回错误而非无限重试，以 409 快速失败，不再泄漏 handler 与槽位。
+	if err := ck.TryLeave(gids); err != shardmaster.OK {
+		writeJSON(w, dispatchErrStatus(err), membershipResp{
+			OK:    false,
+			GIDs:  gids,
+			Error: fmt.Sprintf("dispatch rejected by shardmaster: %v (config may have changed concurrently; re-query and retry)", err),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, membershipResp{OK: true, GIDs: gids})
 }
 
 // handleMove 实现 POST /move：把某个分片迁往指定副本组（对应 shardmaster.Move），
 // 即控制台「重新平衡」的单步触发。shard 必须在 [0, NShards)、gid>0 且目标 gid 存在
-// 于当前配置，否则 400。
+// 于当前配置，否则 400；校验通过但派发时配置被并发变更（TryMove 返回 ErrInvalid）
+// 返回 409。
 func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -221,6 +257,16 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	ck.Move(req.Shard, req.GID)
+	// 派发：TryMove 在服务端确定性拒绝（ErrInvalid，即「校验通过后配置被并发变更」的
+	// 竞态窗口）时立即返回错误而非无限重试，以 409 快速失败，不再泄漏 handler 与槽位。
+	if err := ck.TryMove(req.Shard, req.GID); err != shardmaster.OK {
+		writeJSON(w, dispatchErrStatus(err), membershipResp{
+			OK:     false,
+			Shard:  req.Shard,
+			GID:    req.GID,
+			Error: fmt.Sprintf("dispatch rejected by shardmaster: %v (config may have changed concurrently; re-query and retry)", err),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, membershipResp{OK: true, Shard: req.Shard, GID: req.GID})
 }

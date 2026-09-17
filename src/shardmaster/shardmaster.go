@@ -521,61 +521,97 @@ func (ck *Clerk) Query(num int) Config {
 	}
 }
 
-// Join 提交 Join 配置变更。
+// tryOp 是 TryJoin/TryLeave/TryMove 共用的派发协议：以同一 (CkId,Seq) 轮询全部
+// server，任一返回 OK 即成功；某轮内见到 ErrInvalid（服务端 validate* 对当前配置的
+// 确定性拒绝）且无任何 server 接受时，立即返回 ErrInvalid 而非无限重试——这是
+// Join/Leave/Move（无限重试版）与 Try* 的唯一行为差异。轮内不提前返回，是容忍
+// 「陈旧 leader 拒绝、新鲜 leader 接受」的瞬态不一致窗口自然收敛。
+// 瞬态错误（ErrWrongLeader / ErrTimeout / RPC 不可达）仍按原协议以同一 (CkId,Seq)
+// 重试直到 OK：ErrTimeout 意味着 op 可能已提交，幂等去重会重放 OK；若改用新 seq
+// 重试，会因 validate* 的重复 gid 检查被永久拒绝，反而破坏「超时后重试」的安全性。
+// ErrInvalid 只会在 propose 之前的 validate* 预检产生（applyOp 不做二次校验），
+// 因此对「最新已知配置」是终态的：一轮内所有可达 leader 都拒绝 ⇒ 该请求按该配置
+// 永远不会成功，继续重试只会挂死调用方（网关 handler 泄漏并发槽位、CLI 永久阻塞）。
+func (ck *Clerk) tryOp(call func(seq int64, name string) Err) Err {
+	ck.mu.Lock()
+	ck.seq++
+	seq := ck.seq
+	ck.mu.Unlock()
+	for {
+		invalid := false
+		for _, name := range ck.sm {
+			if err := call(seq, name); err == OK {
+				return OK
+			} else if err == ErrInvalid {
+				invalid = true
+			}
+		}
+		if invalid {
+			return ErrInvalid
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TryJoin 提交 Join 配置变更，成功返回 OK。与 Join 的区别是可观察错误：服务端
+// validateJoin 确定性拒绝（ErrInvalid，如重复 Join 已存在的 gid）时立即返回该错误，
+// 供调用方（网关 /join 端点、kvadmin）向用户报错而非永久挂起。其余语义与 Join 一致。
+func (ck *Clerk) TryJoin(servers map[int][]string) Err {
+	return ck.tryOp(func(seq int64, name string) Err {
+		end := ck.make_end(name)
+		args := &JoinArgs{Servers: servers, CkId: ck.clientId, Seq: seq}
+		reply := &JoinReply{}
+		if end.Call("ShardMaster.Join", args, reply) {
+			return reply.Err
+		}
+		return ""
+	})
+}
+
+// TryLeave 提交 Leave 配置变更，成功返回 OK；服务端 validateLeave 确定性拒绝
+//（ErrInvalid，如移除不存在或重复的 gid）时立即返回该错误。其余语义与 Leave 一致。
+func (ck *Clerk) TryLeave(gids []int) Err {
+	return ck.tryOp(func(seq int64, name string) Err {
+		end := ck.make_end(name)
+		args := &LeaveArgs{Gids: gids, CkId: ck.clientId, Seq: seq}
+		reply := &LeaveReply{}
+		if end.Call("ShardMaster.Leave", args, reply) {
+			return reply.Err
+		}
+		return ""
+	})
+}
+
+// TryMove 提交 Move 配置变更，成功返回 OK；服务端 validateMove 确定性拒绝
+//（ErrInvalid，如目标 gid 不在当前配置）时立即返回该错误。其余语义与 Move 一致。
+func (ck *Clerk) TryMove(shard int, gid int) Err {
+	return ck.tryOp(func(seq int64, name string) Err {
+		end := ck.make_end(name)
+		args := &MoveArgs{Shard: shard, Gid: gid, CkId: ck.clientId, Seq: seq}
+		reply := &MoveReply{}
+		if end.Call("ShardMaster.Move", args, reply) {
+			return reply.Err
+		}
+		return ""
+	})
+}
+
+// Join 提交 Join 配置变更（阻塞直到成功；语义无效请求会无限重试）。
+// 新代码建议使用 TryJoin 以获得可观察的 ErrInvalid 返回。
 func (ck *Clerk) Join(servers map[int][]string) {
-	ck.mu.Lock()
-	ck.seq++
-	seq := ck.seq
-	ck.mu.Unlock()
-	for {
-		for _, name := range ck.sm {
-			end := ck.make_end(name)
-			args := &JoinArgs{Servers: servers, CkId: ck.clientId, Seq: seq}
-			reply := &JoinReply{}
-			if end.Call("ShardMaster.Join", args, reply) && reply.Err == OK {
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	ck.TryJoin(servers)
 }
 
-// Leave 提交 Leave 配置变更。
+// Leave 提交 Leave 配置变更（阻塞直到成功；语义无效请求会无限重试）。
+// 新代码建议使用 TryLeave 以获得可观察的 ErrInvalid 返回。
 func (ck *Clerk) Leave(gids []int) {
-	ck.mu.Lock()
-	ck.seq++
-	seq := ck.seq
-	ck.mu.Unlock()
-	for {
-		for _, name := range ck.sm {
-			end := ck.make_end(name)
-			args := &LeaveArgs{Gids: gids, CkId: ck.clientId, Seq: seq}
-			reply := &LeaveReply{}
-			if end.Call("ShardMaster.Leave", args, reply) && reply.Err == OK {
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	ck.TryLeave(gids)
 }
 
-// Move 提交 Move 配置变更。
+// Move 提交 Move 配置变更（阻塞直到成功；语义无效请求会无限重试）。
+// 新代码建议使用 TryMove 以获得可观察的 ErrInvalid 返回。
 func (ck *Clerk) Move(shard int, gid int) {
-	ck.mu.Lock()
-	ck.seq++
-	seq := ck.seq
-	ck.mu.Unlock()
-	for {
-		for _, name := range ck.sm {
-			end := ck.make_end(name)
-			args := &MoveArgs{Shard: shard, Gid: gid, CkId: ck.clientId, Seq: seq}
-			reply := &MoveReply{}
-			if end.Call("ShardMaster.Move", args, reply) && reply.Err == OK {
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	ck.TryMove(shard, gid)
 }
 
 // ============================== 小工具 ==============================

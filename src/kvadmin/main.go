@@ -143,7 +143,12 @@ func main() {
 		var shard, gid int
 		fmt.Sscanf(args[1], "%d", &shard)
 		fmt.Sscanf(args[2], "%d", &gid)
-		ck.Move(shard, gid)
+		// TryMove 对服务端确定性拒绝（ErrInvalid：目标组不在当前配置等）立即报错退出，
+		// 不再像 Move 的无限重试那样永久挂死 CLI。
+		if err := ck.TryMove(shard, gid); err != shardmaster.OK {
+			fmt.Fprintf(os.Stderr, "✗ Move(shard=%d → gid=%d) 被拒绝: %v（ErrInvalid 属确定性拒绝；可用 query 子命令查看最新配置）\n", shard, gid, err)
+			os.Exit(1)
+		}
 		fmt.Printf("✓ 已提交 Move(shard=%d → gid=%d)\n", shard, gid)
 
 	case "churn":
@@ -160,7 +165,10 @@ func main() {
 			// 部署路径 ShardMaster group id 从 1 起（gateway.Init 把组索引映射到 gid+1），
 			// 故 churn 在 1..ng 之间漂移，而非 0..ng-1。
 			gid := 1 + i%ng
-			ck.Move(shard, gid)
+			if err := ck.TryMove(shard, gid); err != shardmaster.OK {
+				fmt.Fprintf(os.Stderr, "✗ churn 第 %d 轮 Move(shard=%d → gid=%d) 被拒绝: %v\n", i+1, shard, gid, err)
+				os.Exit(1)
+			}
 			time.Sleep(150 * time.Millisecond)
 		}
 		fmt.Printf("✓ churn 完成：%d 轮，分片在 %d 组间漂移\n", rounds, ng)
@@ -188,7 +196,11 @@ func main() {
 				gid, len(servers[gid]), cfg.NReplicas, gidx)
 			os.Exit(1)
 		}
-		ck.Join(servers)
+		// TryJoin 对确定性拒绝（ErrInvalid：gid 已在配置中）立即报错退出，不再无限重试挂死。
+		if err := ck.TryJoin(servers); err != shardmaster.OK {
+			fmt.Fprintf(os.Stderr, "✗ Join(gid=%d) 被拒绝: %v（ErrInvalid 属确定性拒绝；可用 query 子命令查看最新配置）\n", gid, err)
+			os.Exit(1)
+		}
 		fmt.Printf("✓ 已提交 Join(gid=%d, %d 副本)\n", gid, cfg.NReplicas)
 
 	case "leave":
@@ -198,7 +210,11 @@ func main() {
 		}
 		var gid int
 		fmt.Sscanf(args[1], "%d", &gid)
-		ck.Leave([]int{gid})
+		// TryLeave 对确定性拒绝（ErrInvalid：gid 不在配置中）立即报错退出，不再无限重试挂死。
+		if err := ck.TryLeave([]int{gid}); err != shardmaster.OK {
+			fmt.Fprintf(os.Stderr, "✗ Leave(gid=%d) 被拒绝: %v（ErrInvalid 属确定性拒绝；可用 query 子命令查看最新配置）\n", gid, err)
+			os.Exit(1)
+		}
 		fmt.Printf("✓ 已提交 Leave(gid=%d)\n", gid)
 
 	default:

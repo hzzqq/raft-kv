@@ -97,9 +97,9 @@ go run ./src/gateway :9090           # 自定义地址
 | `GET /status` | 集群健康总览（JSON `ClusterStatus`）：每 group leader/config/持有/待收/待迁/孤儿中转计数 + 卡滞秒数 + 整体 `healthy` 标志（卡滞 >2s 判冻结），供监控/告警轮询 |
 | `GET /debug/migrate` | 纯文本迁移进度（每 group leader 副本的 pendingIn/pendingOut/incoming 分布 + 集群最新 config 号），供线下排障 |
 | `POST /debug/migrate-plan` | 配置变更 **dry-run** 预览：提交 `current` 配置 + `PlanOp`（Join/Leave/Move），返回目标配置/结构错误/演进错误/迁移步骤（`shardmaster.Plan` 在内存模拟，不触碰 Raft）。运维提交前安全评估迁移代价与风险 |
-| `POST /join` | 集群扩容：把 `gid` 标识的新副本组加入集群。body `{"gid":<int>,"servers":["addr",...]}` → 调用 shardmaster `Join(map[int][]string{gid: servers})` 真正推进配置。成功 `200 {"ok":true,"gid":N}`；`gid<=0`、`servers` 空、或 `gid` 已存在于当前配置（重复 Join，派发前语义校验快速拒绝，防底层 Clerk 对 ErrInvalid 无限重试挂死 handler）→ `400` |
-| `POST /leave` | 集群缩容：把若干副本组移出集群。body `{"gids":[<int>,...]}`（或兼容单值 `{"gid":<int>}`）→ 调用 shardmaster `Leave(gids)`。成功 `200 {"ok":true,"gids":[...]}`；缺参、`gid<=0`、`gids` 含重复项或含当前配置中不存在的组（派发前语义校验快速拒绝）→ `400` |
-| `POST /move` | 分片重分配（重新平衡单步）：把 `shard` 编号的分片迁往 `gid` 标识的副本组。body `{"shard":<int>,"gid":<int>}` → 调用 shardmaster `Move(shard, gid)`。成功 `200 {"ok":true,"shard":S,"gid":N}`；`shard` 越界、`gid<=0`、或目标 `gid` 不在当前配置中（须先 Join，派发前语义校验快速拒绝）→ `400` |
+| `POST /join` | 集群扩容：把 `gid` 标识的新副本组加入集群。body `{"gid":<int>,"servers":["addr",...]}` → 调用 shardmaster `TryJoin(map[int][]string{gid: servers})` 真正推进配置。成功 `200 {"ok":true,"gid":N}`；`gid<=0`、`servers` 空、或 `gid` 已存在于当前配置（重复 Join，派发前语义校验快速拒绝，防底层 Clerk 对 ErrInvalid 无限重试挂死 handler）→ `400`；校验通过但派发瞬间配置被并发变更（派发走 `TryJoin`，ErrInvalid 立即返回而非无限重试，重查配置重试即可）→ `409` |
+| `POST /leave` | 集群缩容：把若干副本组移出集群。body `{"gids":[<int>,...]}`（或兼容单值 `{"gid":<int>}`）→ 调用 shardmaster `TryLeave(gids)`。成功 `200 {"ok":true,"gids":[...]}`；缺参、`gid<=0`、`gids` 含重复项或含当前配置中不存在的组（派发前语义校验快速拒绝）→ `400`；派发瞬间配置被并发变更（`TryLeave` 确定性拒绝立即返回）→ `409` |
+| `POST /move` | 分片重分配（重新平衡单步）：把 `shard` 编号的分片迁往 `gid` 标识的副本组。body `{"shard":<int>,"gid":<int>}` → 调用 shardmaster `TryMove(shard, gid)`。成功 `200 {"ok":true,"shard":S,"gid":N}`；`shard` 越界、`gid<=0`、或目标 `gid` 不在当前配置中（须先 Join，派发前语义校验快速拒绝）→ `400`；派发瞬间配置被并发变更（`TryMove` 确定性拒绝立即返回）→ `409` |
 
 > 三个成员变更端点供 **raft-kv-console（:8770 图形化控制台）** 的「集群扩缩容」UI 调用，
 > 全部走真实 shardmaster 配置变更（非 dry-run）。请求/响应均为 `application/json`；

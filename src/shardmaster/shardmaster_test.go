@@ -377,3 +377,64 @@ func TestRebalanceKeepsBalance(t *testing.T) {
 		t.Fatalf("imbalance max-min=%d (>1), loads=%v", max-min, load)
 	}
 }
+
+// cycle 206：Clerk 的 TryJoin/TryLeave/TryMove 对服务端确定性拒绝（ErrInvalid）必须
+// 快速返回而非无限重试——这是网关成员变更端点与 kvadmin 摆脱「语义无效请求永久挂起」
+// 的根治方案（此前 Join/Leave/Move 对 ErrInvalid 也无限重试）。每个确定性拒绝调用都
+// 挂 8s 看门狗：若回归为无限重试，以超时失败而非卡死整轮 go test。
+func TestClerkTryInvalidFastReturn(t *testing.T) {
+	cfg := makeSMConfig(t, 3)
+	defer cfg.cleanup()
+	if cfg.leader() < 0 {
+		t.Fatal("no leader elected")
+	}
+	ck := cfg.makeClerk()
+
+	// 有效请求：TryJoin 返回 OK（与 Join 等价的成功路径）。
+	if err := ck.TryJoin(map[int][]string{1: {"g1s1", "g1s2"}}); err != OK {
+		t.Fatalf("TryJoin new gid = %v, want OK", err)
+	}
+
+	// tryOnce 在独立 goroutine 里跑一次 Try* 并回传结果，8s 看门狗兜底。
+	tryOnce := func(name string, f func() Err) Err {
+		done := make(chan Err, 1)
+		go func() { done <- f() }()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(8 * time.Second):
+			t.Fatalf("%s hung (regression to infinite retry on ErrInvalid?)", name)
+			return ""
+		}
+	}
+
+	// 重复 Join 已存在的 gid 1 → ErrInvalid 快速返回（修复前无限重试挂死）。
+	if err := tryOnce("TryJoin(dup)", func() Err {
+		return ck.TryJoin(map[int][]string{1: {"dup"}})
+	}); err != ErrInvalid {
+		t.Fatalf("TryJoin duplicate gid = %v, want ErrInvalid", err)
+	}
+	// Leave 不存在的 gid → ErrInvalid 快速返回。
+	if err := tryOnce("TryLeave(nonexistent)", func() Err {
+		return ck.TryLeave([]int{777})
+	}); err != ErrInvalid {
+		t.Fatalf("TryLeave nonexistent gid = %v, want ErrInvalid", err)
+	}
+	// Move 目标 gid 不在当前配置 → ErrInvalid 快速返回。
+	if err := tryOnce("TryMove(nonexistent)", func() Err {
+		return ck.TryMove(0, 99)
+	}); err != ErrInvalid {
+		t.Fatalf("TryMove to nonexistent gid = %v, want ErrInvalid", err)
+	}
+
+	// 有效路径不受影响：TryMove 到已存在 gid、TryLeave 已存在 gid 均成功。
+	if err := ck.TryMove(0, 1); err != OK {
+		t.Fatalf("TryMove to existing gid = %v, want OK", err)
+	}
+	if err := ck.TryLeave([]int{1}); err != OK {
+		t.Fatalf("TryLeave existing gid = %v, want OK", err)
+	}
+	if c := ck.Query(-1); len(c.Groups) != 0 {
+		t.Fatalf("after leaving the only group, config groups = %v, want empty", c.Groups)
+	}
+}
