@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–213，共 165 轮交付；时间跨度 2026-07-19 ~ 2026-09-18。
+> 覆盖 cycle 39–214，共 166 轮交付；时间跨度 2026-07-19 ~ 2026-09-18。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -32,6 +32,7 @@
 - **[211] `gateway-accept-encoding-qzero`** — 网关 Accept-Encoding 语义修正（I212）：解析 coding;q=weight 列表，客户端显式拒绝 gzip（q=0）不再被误判为接受，不向其发送不可解码的压缩响应（隐性：cacheKey（缓存键编码变体维度）与 wrap 压缩判定两处均用 strings.Contains(Accept-Encoding, "gzip") 子串匹配：RFC 9110 §12.5.3 的 q=0 显式拒绝语义未实现——"gzip;q=0"（客户端明确不可接受 gzip，常见于禁压缩代理链/HTTP 客户端库）照样命中子串，网关对这类客户端发送 Content-Encoding: gzip 的压缩响应体，客户端无法解码（静默坏：JSON API 客户端把压缩字节当明文解析直接失败，且无任何 4xx 提示）；同时 cacheKey 把 q=0 客户端归入 gzip 编码变体键，plain/gzip 双变体缓存维度被污染（q=0 与真实 gzip 客户端共享条目，编码协商错乱被缓存放大固化整个 TTL）；score=15）
 - **[212] `gateway-gzip-etag-variant`** — 网关 ETag 表示一致性修正（I213）：ETag 按实际传输表示计算——gzip 变体对压缩字节取哈希、plain 变体对明文取哈希，同一资源不同编码变体不再共享同一 ETag（隐性：缓存/ETag 路径恒用压缩前明文缓冲 body 计算 ETag（computeETag(body)），而 gzip 变体实际发出的响应体是压缩字节：同一资源 gzip 与 plain 两个表示拿到完全相同的 ETag（同为明文哈希），违背 RFC 9110 §8.8.1「强 ETag 标识特定表示（含内容编码）」——ETag 与传输表示不对应，一旦压缩参数变化（压缩字节变、明文不变），客户端/中间层凭旧 ETag 的条件 GET 会错误命中 304，继续复用已失效的压缩表示；缓存快照同样固化该明文哈希 ETag，回放路径把不一致的观测口径放大到整个 TTL；score=15）
 - **[213] `gateway-304-validators`** — 网关 304 验证器头复现（I214）：两条条件 GET 短路路径（缓存命中 I209 / ETag miss I69）的 304 响应必须复现同请求 200 本应发送的缓存验证器头 ETag 与 Vary（RFC 9110 §15.4.5 MUST）（隐性：serveNotModified 只写状态码、不回写任何验证器头：①凭 If-None-Match: *（I211 存在性语义）命中 304 的客户端手里没有任何标签，304 又不带 ETag——客户端永远拿不到当前验证器，条件 GET 链路静默退化；②W/ 弱形态命中（I211 弱比较）的客户端无法把存储的标签校正为服务端规范形态；③gzip 变体的 304 不复现 Vary: Accept-Encoding，中间共享缓存无法区分 gzip/plain 双表示，与同变体 200（wrap 时 Add Vary）口径分叉；score=15）
+- **[214] `gateway-body-limit-413`** — 网关写路径请求体限额语义修正（I215）：PUT /kv/{key} 与 POST /kv/{key}/append 对超限请求体必须 413 拒绝、不得静默截断写入；SetMaxBodySize(0)（文档语义「<=0 表示不限制」）必须读全量而非空体（隐性：handlePut/handleAppend 用 io.ReadAll(io.LimitReader(r.Body, s.maxBodySize)) 读体，产生三处静默失败：①未知长度（chunked/流式）超发时 LimitReader 在限额处提前 EOF，wrap 已包的 MaxBytesReader 兜底（I54 设计意图：413 拒绝）永不触发——截断后的部分数据被当作完整值写入存储并返回 200（实测客户端发 128 字节入库 64 字节且响应谎报成功），数据完整性静默破坏且无任何错误信号；②SetMaxBodySize(0)（注释明确「<=0 表示不限制」）时 LimitReader(0) 读出空体——所有 PUT 写空串、Append 追加空串，配置语义与实现完全背离；③读体错误被 _ 丢弃，客户端断连时的部分读取数据同样静默入库；score=15）
 
 ## kvcli
 

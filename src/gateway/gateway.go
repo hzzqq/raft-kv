@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -253,7 +254,8 @@ func (b *tokenBucket) inspect(now time.Time) (limit, remaining, resetUnix int64)
 func (s *Server) SetRequestTimeout(d time.Duration) { s.requestTimeout = d }
 
 // SetMaxBodySize 配置单请求最大请求体字节数（生产可用）。<=0 表示不限制。
-// 经 wrap 的 413 拒绝 + MaxBytesReader 兜底生效。
+// 经 wrap 的 413 拒绝 + MaxBytesReader 兜底生效（I215：写 handler 内 ReadAll
+// 感知 MaxBytesError 回 413，不再用 LimitReader 静默截断；<=0 时读全量）。
 func (s *Server) SetMaxBodySize(n int64) { s.maxBodySize = n }
 
 // SetCompress 配置是否对响应启用 gzip 压缩（生产可用）。仅当客户端接受 gzip
@@ -1901,9 +1903,41 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, v)
 }
 
+// readBodyFull 读取整个请求体并统一限额语义（I215）。此前 handlePut/handleAppend
+// 用 io.ReadAll(io.LimitReader(r.Body, s.maxBodySize)) 读体，产生两个静默失败：
+//   - 未知长度（chunked/流式）超发时 LimitReader 在限额处提前 EOF，wrap 套上的
+//     MaxBytesReader 兜底（本应 413 拒绝，见 I54 注释）永远不触发——截断后的部分
+//     数据被当作完整值写入存储并返回 200，数据完整性静默破坏；
+//   - SetMaxBodySize(0)（文档语义「<=0 表示不限制」）时 LimitReader(0) 读出空体，
+//     所有 PUT 写空串、Append 追加空串。
+//
+// 现改为直接 ReadAll(r.Body)：限额 >0 时 wrap 已包 MaxBytesReader，超发返回
+// *http.MaxBytesError → 413 拒绝（响应格式与 wrap 预检路径一致）；其余读错误
+// → 400 拒绝（部分读取的数据不得静默写入）；限额 <=0 时读全量（不限制）。
+// 返回 ok=false 表示响应已写出，调用方直接 return。
+func (s *Server) readBodyFull(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	val, err := io.ReadAll(r.Body)
+	if err == nil {
+		return val, true
+	}
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		io.WriteString(w, `{"error":"request body too large","code":413}`)
+		s.logf(levelWarn, "request body too large", map[string]string{"method": r.Method, "path": r.URL.Path, "request_id": w.Header().Get("X-Request-ID")})
+		return nil, false
+	}
+	http.Error(w, "read request body failed", http.StatusBadRequest)
+	return nil, false
+}
+
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	val, _ := io.ReadAll(io.LimitReader(r.Body, s.maxBodySize))
+	val, ok := s.readBodyFull(w, r)
+	if !ok {
+		return
+	}
 	if err := s.clerk.PutE(key, string(val)); err != shardkv.OK {
 		http.Error(w, string(err), statusForErr(err))
 		return
@@ -1914,12 +1948,15 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	val, _ := io.ReadAll(io.LimitReader(r.Body, s.maxBodySize))
+	val, ok := s.readBodyFull(w, r)
+	if !ok {
+		return
+	}
+	// 失效的是该 key 的 GET 路径缓存（/kv/{key}），而非 /kv/{key}/append 自身。
 	if err := s.clerk.AppendE(key, string(val)); err != shardkv.OK {
 		http.Error(w, string(err), statusForErr(err))
 		return
 	}
-	// 失效的是该 key 的 GET 路径缓存（/kv/{key}），而非 /kv/{key}/append 自身。
 	s.invalidateKeyCache("/kv/" + key)
 	w.WriteHeader(http.StatusOK)
 }
