@@ -134,8 +134,9 @@ type Server struct {
 	// 默认 1MB（与历史 handler 内 1<<20 限额一致），可由配置 max_body_size 覆盖。
 	maxBodySize int64
 
-	// I55：响应 gzip 压缩开关。开启且客户端 Accept-Encoding 含 gzip 时，对响应体压缩
-	// （省带宽）；同时写 Vary: Accept-Encoding 避免共享缓存按错误编码缓存。默认开启。
+	// I55：响应 gzip 压缩开关。开启且客户端接受 gzip（acceptsGzip：显式 gzip 条目且
+	// q>0；I212 修复 q=0 显式拒绝不再误判）时，对响应体压缩（省带宽）；同时写
+	// Vary: Accept-Encoding 避免共享缓存按错误编码缓存。默认开启。
 	compress bool
 
 	// I56：安全响应头开关。开启时 wrap 注入 X-Content-Type-Options / X-Frame-Options /
@@ -255,8 +256,8 @@ func (s *Server) SetRequestTimeout(d time.Duration) { s.requestTimeout = d }
 // 经 wrap 的 413 拒绝 + MaxBytesReader 兜底生效。
 func (s *Server) SetMaxBodySize(n int64) { s.maxBodySize = n }
 
-// SetCompress 配置是否对响应启用 gzip 压缩（生产可用）。仅当客户端 Accept-Encoding
-// 含 gzip 时压缩，并自动加 Vary: Accept-Encoding。
+// SetCompress 配置是否对响应启用 gzip 压缩（生产可用）。仅当客户端接受 gzip
+// （acceptsGzip，I212：q=0 显式拒绝不压缩）时压缩，并自动加 Vary: Accept-Encoding。
 func (s *Server) SetCompress(on bool) { s.compress = on }
 
 // SetSecurityHeaders 配置是否注入基线安全响应头（生产可用）。默认开启。
@@ -648,10 +649,45 @@ func (s *Server) SetCacheEnabled(on bool) {
 	s.cacheOn = on
 }
 
+// acceptsGzip 解析 Accept-Encoding（RFC 9110 §12.5.3 逗号分隔的 coding;q=weight 列表），
+// 报告客户端是否接受 gzip 编码。仅当存在显式 "gzip" 条目且其权重 q>0（缺省 q=1）时
+// 返回 true。修复 I212：此前用 strings.Contains 子串匹配，"gzip;q=0"（客户端显式拒绝
+// gzip）也命中子串——网关向明确不可接受压缩的客户端发送 gzip 响应（Content-Encoding:
+// gzip 的字节流客户端无法解码，静默坏），且 cacheKey 把该客户端归入 gzip 编码变体键。
+// 保守取舍：仅识别显式 "gzip" 条目（大小写敏感，与既有 Contains 口径一致），通配 "*"
+// 不触发压缩（宁可少压缩，不错发不可接受编码）；q 值非法时按缺省 1 处理（与既有
+// 可压缩行为同向），q<=0（含 q=0 显式拒绝）一律不可接受。
+// cacheKey 与 wrap 压缩判定必须共用本函数：若两处口径分叉，会出现「q=0 客户端以 gzip
+// 变体键缓存明文体、真实 gzip 客户端命中后回放明文却带 Content-Encoding: gzip 头」
+// 的交叉污染。
+func acceptsGzip(ae string) bool {
+	for _, part := range strings.Split(ae, ",") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		coding := p
+		q := 1.0
+		if i := strings.Index(p, ";"); i >= 0 {
+			coding = strings.TrimSpace(p[:i])
+			if kv := strings.TrimSpace(p[i+1:]); strings.HasPrefix(kv, "q=") {
+				if v, err := strconv.ParseFloat(strings.TrimSpace(kv[2:]), 64); err == nil {
+					q = v
+				}
+			}
+		}
+		if coding == "gzip" {
+			return q > 0
+		}
+	}
+	return false
+}
+
 // cacheKey 以 method+path+Accept-Encoding 维度生成缓存键（gzip 与明文分开存储/回放）。
+// gzip 判定用 acceptsGzip（I212）：q=0 显式拒绝 gzip 的客户端归入 plain 变体键。
 func (s *Server) cacheKey(r *http.Request) string {
 	enc := "plain"
-	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+	if acceptsGzip(r.Header.Get("Accept-Encoding")) {
 		enc = "gzip"
 	}
 	return r.Method + " " + r.URL.Path + " " + enc
@@ -1153,10 +1189,10 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		if s.testDelay > 0 {
 			time.Sleep(s.testDelay)
 		}
-		// I55：响应 gzip 压缩。仅当开启且客户端 Accept-Encoding 含 gzip 时压缩，
-		// 并写 Vary: Accept-Encoding 避免共享缓存错乱。错误响应走的早期 return 已先
-		// 于此处返回，不会被压缩。
-		if s.compress && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		// I55：响应 gzip 压缩。仅当开启且客户端接受 gzip（acceptsGzip，I212：q=0
+		// 显式拒绝不压缩）时压缩，并写 Vary: Accept-Encoding 避免共享缓存错乱。
+		// 错误响应走的早期 return 已先于此处返回，不会被压缩。
+		if s.compress && acceptsGzip(r.Header.Get("Accept-Encoding")) {
 			w.Header().Set("Content-Encoding", "gzip")
 			w.Header().Add("Vary", "Accept-Encoding")
 			gz := gzip.NewWriter(w)

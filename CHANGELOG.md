@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–210，共 162 轮交付；时间跨度 2026-07-19 ~ 2026-09-18。
+> 覆盖 cycle 39–211，共 163 轮交付；时间跨度 2026-07-19 ~ 2026-09-18。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -29,6 +29,7 @@
 - **[208] `gateway-cache-etag-304`** — 网关缓存命中路径服务条件 GET（I209）：SetCache+SetETag 双开时，缓存命中后比对 If-None-Match 与已存 ETag，匹配回 304 不回放（隐性：wrap 中缓存命中检查先于 If-None-Match 检查且命中即 return：生产 main.go SetCache+SetETag 双开时，缓存条目一旦落盘，条件 GET 一律 200 全量回放而非 304——I69 的条件 GET 短路只服务缓存 miss 路径，缓存命中反而吞掉 304，带宽节省恰好在最需要的热路径（缓存命中=重复读取）上失效；既有 TestETagConditionalGet 用 newCacheServer（不开缓存）全程 miss 路径，覆盖不到该缺口（cycle 207 测试注释已显式预告此根因）；score=15）
 - **[209] `gateway-cache-replay-etag`** — 网关缓存命中回放的 200 补齐 ETag 头（I210）：ETag 与响应体冻结进同一份缓存快照，回放路径与回源路径 ETag 观测口径一致（隐性：cacheSet 克隆响应头先于 w.Header().Set("ETag") 执行：缓存快照头不含 ETag，replayCache 原样回放——生产 main.go SetCache+SetETag 双开时，客户端自第二次 GET 起的 200 全部没有 ETag，无从发起条件 GET，I209 的 304 短路在真实流量中永远等不到 If-None-Match（条件 GET 恰在缓存最热路径上静默退化）；既有覆盖缺口：TestETagConditionalGetOnCacheHit 断言 ETag 的两次响应与 scope 测试的「cached GET 带 ETag」实为 miss 路径（首取/PUT 失效后首次 GET），纯命中回放从未被断言过带 ETag；score=15）
 - **[210] `gateway-inm-star-weak-etag`** — 网关 If-None-Match 支持 RFC 7232 实体标签通配与弱比较（I211）：* 存在性通配、W/ 弱标签、多标签列表任一命中（隐性：etagMatches 对 If-None-Match 头值做强比较整串精确匹配（==）：RFC 7232 §3.2 的 * 存在性通配、§2.3.2 的弱比较（W/ 前缀）与多标签列表语义全部未实现——* 永不等于强 ETag 形态的已存值、W/ 形态标签与列表头值一律不命中，携带此类合法条件头的客户端/中间层条件 GET 全部静默退化为全量 200 传输（带宽浪费，无正确性风险）；即 cycle 209 log 残余边界显式声明的缺口，本轮补齐；score=15）
+- **[211] `gateway-accept-encoding-qzero`** — 网关 Accept-Encoding 语义修正（I212）：解析 coding;q=weight 列表，客户端显式拒绝 gzip（q=0）不再被误判为接受，不向其发送不可解码的压缩响应（隐性：cacheKey（缓存键编码变体维度）与 wrap 压缩判定两处均用 strings.Contains(Accept-Encoding, "gzip") 子串匹配：RFC 9110 §12.5.3 的 q=0 显式拒绝语义未实现——"gzip;q=0"（客户端明确不可接受 gzip，常见于禁压缩代理链/HTTP 客户端库）照样命中子串，网关对这类客户端发送 Content-Encoding: gzip 的压缩响应体，客户端无法解码（静默坏：JSON API 客户端把压缩字节当明文解析直接失败，且无任何 4xx 提示）；同时 cacheKey 把 q=0 客户端归入 gzip 编码变体键，plain/gzip 双变体缓存维度被污染（q=0 与真实 gzip 客户端共享条目，编码协商错乱被缓存放大固化整个 TTL）；score=15）
 
 ## kvcli
 
