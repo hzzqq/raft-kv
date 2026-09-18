@@ -470,3 +470,68 @@ func TestCacheHitReplayCarriesETag(t *testing.T) {
 		t.Fatalf("conditional GET with replayed ETag = %d, want 304", r3.Code)
 	}
 }
+
+// TestETagGzipVariantMatchesTransferredRepresentation 证明 I213：gzip 变体的 ETag
+// 必须对"实际传输表示"（压缩后字节）计算，而非压缩前明文。RFC 9110 §8.8.1：强 ETag
+// 标识特定表示（含内容编码）——同一资源的 gzip 与 plain 是两个表示，修复前两者
+// ETag 同为 SHA256(明文) 完全相同，且与线上传输的压缩字节不对应：压缩参数一旦变化
+// （压缩字节变、明文不变），条件 GET 凭旧 ETag 错误命中 304，客户端继续复用已失效
+// 的压缩表示。
+//
+// 复现路径（修复前必失败）：
+//  1. 同值分别以 gzip / plain 变体 GET：两变体 ETag 相同（修复前均为明文哈希）
+//  2. gzip 变体 ETag ≠ SHA256(实际收到的压缩字节)
+//  对照：plain 变体 ETag == SHA256(明文字节)，修复前后均过，证明测试抓的是
+//  gzip 变体口径而非哈希方向写反。
+func TestETagGzipVariantMatchesTransferredRepresentation(t *testing.T) {
+	s := NewServer(nil)
+	s.SetSecurityHeaders(false) // compress 保持默认开启
+	s.SetETag(true)
+
+	h := s.Wrap(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		io.WriteString(w, "v1")
+	})
+
+	do := func(acceptGzip bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/kv/k", nil)
+		if acceptGzip {
+			req.Header.Set("Accept-Encoding", "gzip")
+		}
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		return rec
+	}
+
+	rg := do(true)
+	rp := do(false)
+	if rg.Code != http.StatusOK || rp.Code != http.StatusOK {
+		t.Fatalf("GET status gzip=%d plain=%d, want 200/200", rg.Code, rp.Code)
+	}
+	if ce := rg.Header().Get("Content-Encoding"); ce != "gzip" {
+		t.Fatalf("gzip variant Content-Encoding = %q, want gzip", ce)
+	}
+	if body := rp.Body.String(); body != "v1" {
+		t.Fatalf("plain variant body = %q, want plaintext v1", body)
+	}
+	etagG := rg.Header().Get("ETag")
+	etagP := rp.Header().Get("ETag")
+	if etagG == "" || etagP == "" {
+		t.Fatalf("both variants should carry ETag, got gzip=%q plain=%q", etagG, etagP)
+	}
+
+	// 1. 两个编码变体是两个表示，强 ETag 必须互不相同（修复前同为明文哈希）
+	if etagG == etagP {
+		t.Fatalf("gzip and plain variants must carry distinct ETags (RFC 9110 §8.8.1), both %q", etagG)
+	}
+
+	// 2. gzip 变体 ETag 必须等于实际传输字节（压缩体）的哈希
+	if want := computeETag(rg.Body.Bytes()); etagG != want {
+		t.Fatalf("gzip variant ETag = %q, want hash of transferred (compressed) bytes %q", etagG, want)
+	}
+
+	// 3. 对照：plain 变体 ETag 等于实际传输字节（明文）的哈希（既有行为不变）
+	if want := computeETag(rp.Body.Bytes()); etagP != want {
+		t.Fatalf("plain variant ETag = %q, want hash of transferred (plain) bytes %q", etagP, want)
+	}
+}

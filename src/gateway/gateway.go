@@ -816,6 +816,8 @@ func (s *Server) SetETag(on bool) {
 }
 
 // computeETag 由响应体计算弱校验外的强 ETag（SHA256，包成双引号形式）。
+// 调用方须传入实际传输表示的字节（gzip 变体=压缩字节，plain=明文，I213）——
+// 强 ETag 标识特定表示（RFC 9110 §8.8.1），不是明文资源的指纹。
 func computeETag(body []byte) string {
 	sum := sha256.Sum256(body)
 	return `"` + fmt.Sprintf("%x", sum) + `"`
@@ -1230,9 +1232,15 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			// 使 replayCache 回放的 200 与回源路径观测口径一致（客户端能凭回放得的 ETag
 			// 发起条件 GET）。此前 cacheSet 先于 Set("ETag")，快照头缺 ETag，命中回放静默丢头，
 			// I209 的 304 短路在真实流量中永远等不到 If-None-Match（条件 GET 链路静默退化）。
+			// I213：ETag 必须对实际传输表示计算（RFC 9110 §8.8.1——强 ETag 标识特定表示，
+			// 含内容编码）。此前恒用压缩前明文 body：gzip 变体发出的响应体是压缩字节，
+			// ETag 却是明文哈希——同一资源 gzip 与 plain 两个表示拿到相同 ETag，且压缩
+			// 参数一旦变化（压缩字节变、明文不变），条件 GET 凭旧 ETag 错误命中 304，
+			// 客户端继续复用已失效的压缩表示。storeBody 恰为实际传输形式（gzip 变体=
+			// 压缩字节，plain=明文），恒用它计算即可，plain 变体行为不变。
 			var etag string
 			if s.etagOn && st == http.StatusOK && fresh {
-				etag = computeETag(body)
+				etag = computeETag(storeBody)
 				w.Header().Set("ETag", etag)
 			}
 			if s.cacheOn && fresh {
