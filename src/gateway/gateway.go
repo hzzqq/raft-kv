@@ -800,7 +800,19 @@ func (s *Server) replayCache(w http.ResponseWriter, cv *cacheVal, start time.Tim
 // serveNotModified 统一输出条件 GET 的 304 短路响应（无 body），并补齐访问日志与
 // 基础指标，使 304 短路与 200 回放在观测面口径一致。I209：缓存命中与 ETag 匹配
 // 两条短路路径共用本 helper，避免观测实现分叉。
-func (s *Server) serveNotModified(w http.ResponseWriter, r *http.Request, start time.Time, reqID string) {
+// I214：RFC 9110 §15.4.5 要求 304 生成 200 同请求本应发送的缓存验证器头。
+// ETag 取该 cacheKey 维度已存标签（304 短路前提是 etagMatches 命中，etagStore 必有值）——
+// 若缺失，凭 If-None-Match: *（I211 存在性语义）命中 304 的客户端手里没有任何标签，
+// 永远拿不到当前验证器，条件 GET 链路静默退化；W/ 弱形态命中的客户端也无法校正标签。
+// Vary 复现条件与 200 gzip wrap 完全一致（compress && acceptsGzip），使中间共享缓存
+// 能区分 gzip/plain 双表示；plain 变体 200 本就不带 Vary，304 同口径不凭空加头。
+func (s *Server) serveNotModified(w http.ResponseWriter, r *http.Request, start time.Time, reqID string, ck string) {
+	if etag := s.etagGet(ck); etag != "" {
+		w.Header().Set("ETag", etag)
+	}
+	if s.compress && acceptsGzip(r.Header.Get("Accept-Encoding")) {
+		w.Header().Add("Vary", "Accept-Encoding")
+	}
 	w.WriteHeader(http.StatusNotModified)
 	s.recordAccess(r.Method, r.URL.Path, http.StatusNotModified, time.Since(start), reqID)
 	s.recordRequestMetrics(r.Method, http.StatusNotModified, float64(time.Since(start).Microseconds())/1000.0)
@@ -901,6 +913,13 @@ func (s *Server) etagSet(key, etag string) {
 	s.etagMu.Lock()
 	defer s.etagMu.Unlock()
 	s.etagStore[key] = etag
+}
+
+// etagGet 读取该请求维度的已存 ETag（I214：304 短路复现验证器头用）。
+func (s *Server) etagGet(key string) string {
+	s.etagMu.Lock()
+	defer s.etagMu.Unlock()
+	return s.etagStore[key]
 }
 
 // SetTestDelay 仅供单测注入人为延迟，使 429 路径可被稳定复现。生产不可用。
@@ -1151,7 +1170,7 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			if cv := s.cacheGet(ck); cv != nil {
 				if s.etagOn && cv.Status == http.StatusOK {
 					if inm := r.Header.Get("If-None-Match"); inm != "" && s.etagMatches(ck, inm) {
-						s.serveNotModified(w, r, start, reqID)
+						s.serveNotModified(w, r, start, reqID, ck)
 						return
 					}
 				}
@@ -1163,7 +1182,7 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		// 同样仅数据路径生效（isDataGET），避免 /metrics 等实时端点被 304 冻结。
 		if s.etagOn && s.isDataGET(r) {
 			if inm := r.Header.Get("If-None-Match"); inm != "" && s.etagMatches(ck, inm) {
-				s.serveNotModified(w, r, start, reqID)
+				s.serveNotModified(w, r, start, reqID, ck)
 				return
 			}
 		}

@@ -535,3 +535,141 @@ func TestETagGzipVariantMatchesTransferredRepresentation(t *testing.T) {
 		t.Fatalf("plain variant ETag = %q, want hash of transferred (plain) bytes %q", etagP, want)
 	}
 }
+
+// TestNotModifiedCarriesETagAndVary 证明 I214：ETag 短路路径（miss→304）的 304 响应
+// 必须复现 200 同请求本应发送的缓存验证器头（RFC 9110 §15.4.5 MUST：ETag/Vary 等）。
+// 修复前 serveNotModified 只写状态码——
+//  1. 带 If-None-Match 命中的 304 不带 ETag：弱比较（W/ 形态）命中的客户端无法把
+//     存储的标签校正为服务端规范形态；
+//  2. If-None-Match: *（I211 存在性命中）时客户端手里没有任何标签，304 又不带
+//     ETag，客户端永远拿不到当前验证器，条件 GET 链路静默退化；
+//  3. gzip 变体的 304 不复现 Vary: Accept-Encoding，中间共享缓存无法区分 gzip/plain
+//     双表示（与 200 口径分叉）。
+func TestNotModifiedCarriesETagAndVary(t *testing.T) {
+	s := newCacheServer() // 不开缓存：走 miss 路径 304
+	s.SetETag(true)
+	s.SetCompress(true)
+
+	h := s.Wrap(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		io.WriteString(w, "v1")
+	})
+
+	do := func(inm string, acceptGzip bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/kv/k", nil)
+		if inm != "" {
+			req.Header.Set("If-None-Match", inm)
+		}
+		if acceptGzip {
+			req.Header.Set("Accept-Encoding", "gzip")
+		}
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		return rec
+	}
+
+	// 各编码变体先 200 一次，落各自维度的 ETag（etagStore 按 cacheKey 分变体存储）
+	rp := do("", false)
+	rg2 := do("", true)
+	if rp.Code != http.StatusOK || rg2.Code != http.StatusOK {
+		t.Fatalf("first GETs = %d/%d, want all 200", rp.Code, rg2.Code)
+	}
+	etagP := rp.Header().Get("ETag")
+	etagG := rg2.Header().Get("ETag")
+	if etagP == "" || etagG == "" {
+		t.Fatalf("first GETs must carry ETag, got plain=%q gzip=%q", etagP, etagG)
+	}
+	if ce := rg2.Header().Get("Content-Encoding"); ce != "gzip" {
+		t.Fatalf("gzip variant Content-Encoding = %q, want gzip", ce)
+	}
+	if v := rg2.Header().Get("Vary"); v != "Accept-Encoding" {
+		t.Fatalf("gzip 200 Vary = %q, want Accept-Encoding (对照：200 口径)", v)
+	}
+
+	// 1. plain 变体条件 GET：304 必须带当前 ETag
+	r1 := do(etagP, false)
+	if r1.Code != http.StatusNotModified {
+		t.Fatalf("conditional GET = %d, want 304", r1.Code)
+	}
+	if got := r1.Header().Get("ETag"); got != etagP {
+		t.Fatalf("304 ETag = %q, want %q (RFC 9110 §15.4.5：304 必须复现 200 会发的 ETag)", got, etagP)
+	}
+
+	// 2. If-None-Match: *：客户端不持标签，只能从 304 的 ETag 头拿到当前验证器
+	r2 := do("*", false)
+	if r2.Code != http.StatusNotModified {
+		t.Fatalf("If-None-Match: * = %d, want 304", r2.Code)
+	}
+	if got := r2.Header().Get("ETag"); got != etagP {
+		t.Fatalf("304 ETag on * = %q, want %q (客户端不持标签时 304 是唯一获取验证器的途径)", got, etagP)
+	}
+
+	// 3. gzip 变体条件 GET：304 必须带该表示自身的 ETag + Vary: Accept-Encoding
+	r3 := do(etagG, true)
+	if r3.Code != http.StatusNotModified {
+		t.Fatalf("gzip conditional GET = %d, want 304", r3.Code)
+	}
+	if got := r3.Header().Get("ETag"); got != etagG {
+		t.Fatalf("gzip 304 ETag = %q, want %q (ETag 按表示维度，I213)", got, etagG)
+	}
+	if got := r3.Header().Values("Vary"); len(got) == 0 {
+		t.Fatalf("gzip 304 must carry Vary: Accept-Encoding (RFC 9110 §15.4.5)")
+	}
+
+	// 4. plain 变体的 304 不应凭空出现 Vary（同变体 200 也不带，口径一致）
+	if got := r1.Header().Values("Vary"); len(got) != 0 {
+		t.Fatalf("plain 304 Vary = %v, want empty (与 plain 200 口径一致)", got)
+	}
+}
+
+// TestNotModifiedOnCacheHitCarriesETag 证明 I214 在缓存命中短路路径（I209）同样成立：
+// 同一缓存条目，回放 200 带 ETag（cycle 209），命中 If-None-Match 的 304 却不带——
+// 观测口径分叉，客户端在缓存命中窗口内拿不到验证器复现。
+func TestNotModifiedOnCacheHitCarriesETag(t *testing.T) {
+	s := newCacheServer()
+	s.SetCache(time.Hour, 8)
+	s.SetETag(true)
+
+	h := s.Wrap(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		io.WriteString(w, "v1")
+	})
+
+	do := func(inm string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/kv/k", nil)
+		if inm != "" {
+			req.Header.Set("If-None-Match", inm)
+		}
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		return rec
+	}
+
+	// 首次 GET：回源 200，落缓存 + 落 ETag
+	r1 := do("")
+	if r1.Code != http.StatusOK {
+		t.Fatalf("first GET = %d, want 200", r1.Code)
+	}
+	etag := r1.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("first GET should carry ETag")
+	}
+
+	// 缓存命中 + If-None-Match 命中：304 必须带当前 ETag（与回放 200 同源同值）
+	r2 := do(etag)
+	if r2.Code != http.StatusNotModified {
+		t.Fatalf("conditional GET on cache hit = %d, want 304", r2.Code)
+	}
+	if got := r2.Header().Get("ETag"); got != etag {
+		t.Fatalf("cache-hit 304 ETag = %q, want %q (I214：缓存命中路径同口径复现)", got, etag)
+	}
+
+	// 缓存命中 + If-None-Match: *：304 也必须带 ETag（客户端无标签的场景）
+	r3 := do("*")
+	if r3.Code != http.StatusNotModified {
+		t.Fatalf("cache-hit If-None-Match: * = %d, want 304", r3.Code)
+	}
+	if got := r3.Header().Get("ETag"); got != etag {
+		t.Fatalf("cache-hit 304 ETag on * = %q, want %q", got, etag)
+	}
+}
