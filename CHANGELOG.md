@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–214，共 166 轮交付；时间跨度 2026-07-19 ~ 2026-09-18。
+> 覆盖 cycle 39–215，共 167 轮交付；时间跨度 2026-07-19 ~ 2026-09-18。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -44,6 +44,7 @@
 - **[63] `kvcli_max_concurrent`** — SetMaxConcurrent(n) 限制 MGet/MSet 并发回源 goroutine 数（隐性：MGet/MSet 每 key 起 goroutine 且无上限,超大批量打爆客户端/后端(R2 隐性)；score=14）
 - **[67] `kvcli_semaphore_reuse`** — 批量并发收敛复用 util.Semaphore + ctx 取消语义（隐性：#203 手搓 batchSem 裸 channel 重复造轮子,且满信号量+ctx取消会挂死；score=13）
 - **[79] `kvcli_batch_workerpool`** — WorkerPool(SubmitCtx) 落地 kvcli MGet/MSet 批量扇出（隐性：批量此前手搓 goroutine+util.Semaphore 样板(Acquire/Release 易漏、goroutine 生命周期分散);maxConcurrent<=0 仍按 key 数开池保留历史无限制语义；score=16）
+- **[215] `kvcli-del-body-close`** — kvcli Del 的任意 HTTP 出径（成功 200 与业务错误非 200）都必须关闭响应体，使连接可归还连接池复用（资源泄漏族缺陷修复）（隐性：deleteCtx 仅在 503/504 重试路径 resp.Body.Close()：成功路径 return nil 前、业务错误路径 return respErr(...) 前均不 Close——未关闭响应体的连接无法归还 http.Transport 连接池，每调用一次 Del/MDel 泄漏一个连接，fd 累积只能等 GC finalizer 兜底，长跑进程（批量 MDel / 周期清理任务）可耗尽 fd；与包内 fetchGet/putCtx/appendCtx/Ping/Healthy/Ready「每条出径必 Close」纪律不一致；score=15）
 
 ## util
 

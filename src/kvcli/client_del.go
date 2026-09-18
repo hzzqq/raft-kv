@@ -33,9 +33,16 @@ func (c *Client) deleteCtx(ctx context.Context, key string) error {
 			lastErr = fmt.Errorf("retryable status %d for DELETE /kv/%s", resp.StatusCode, key)
 			continue
 		}
+		// 修复：成功（200）与业务错误（非 503/504 的非 200）两条出径都必须 Close 响应体，
+		// 与 putCtx/appendCtx/fetchGet 同口径。此前仅 503/504 重试路径 Close，其余出径
+		// 未关闭——未关闭响应体的连接无法归还连接池复用，每调用一次 Del/MDel 泄漏一个
+		// 连接（fd 累积至 GC finalizer 兜底，长跑进程可耗尽 fd）。
 		if resp.StatusCode != http.StatusOK {
-			return respErr("DELETE", key, resp)
+			err := respErr("DELETE", key, resp)
+			resp.Body.Close()
+			return err
 		}
+		resp.Body.Close()
 		return nil
 	}
 	return lastErr
