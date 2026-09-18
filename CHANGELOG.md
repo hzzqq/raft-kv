@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–215，共 167 轮交付；时间跨度 2026-07-19 ~ 2026-09-18。
+> 覆盖 cycle 39–216，共 168 轮交付；时间跨度 2026-07-19 ~ 2026-09-18。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -45,6 +45,7 @@
 - **[67] `kvcli_semaphore_reuse`** — 批量并发收敛复用 util.Semaphore + ctx 取消语义（隐性：#203 手搓 batchSem 裸 channel 重复造轮子,且满信号量+ctx取消会挂死；score=13）
 - **[79] `kvcli_batch_workerpool`** — WorkerPool(SubmitCtx) 落地 kvcli MGet/MSet 批量扇出（隐性：批量此前手搓 goroutine+util.Semaphore 样板(Acquire/Release 易漏、goroutine 生命周期分散);maxConcurrent<=0 仍按 key 数开池保留历史无限制语义；score=16）
 - **[215] `kvcli-del-body-close`** — kvcli Del 的任意 HTTP 出径（成功 200 与业务错误非 200）都必须关闭响应体，使连接可归还连接池复用（资源泄漏族缺陷修复）（隐性：deleteCtx 仅在 503/504 重试路径 resp.Body.Close()：成功路径 return nil 前、业务错误路径 return respErr(...) 前均不 Close——未关闭响应体的连接无法归还 http.Transport 连接池，每调用一次 Del/MDel 泄漏一个连接，fd 累积只能等 GC finalizer 兜底，长跑进程（批量 MDel / 周期清理任务）可耗尽 fd；与包内 fetchGet/putCtx/appendCtx/Ping/Healthy/Ready「每条出径必 Close」纪律不一致；score=15）
+- **[216] `kvcli-append-retry-idempotent`** — kvcli 非幂等 Append 的自动重试必须区分「确定未应用」与「结果模糊」两类失败：仅前者可重试，后者 fail-closed 立即返回错误（重复追加族静默数据损坏缺陷修复）（隐性：appendCtx 对网络错误与 503/504 一律自动重试，但 POST /kv/{key}/append 非幂等——网关对每个 HTTP 请求分配新 shardkv seq、无请求级去重：①网络错误=请求可能已被服务端处理只是响应丢失；②504（ErrTimeout）=shardkv 等待器超时返回时 op 仍可能已被提交应用（tryOp select 超时即返回，applier 不受影响照常执行入日志）。两类模糊失败后重试都会把同一值追加两次，静默数据损坏。GET/PUT/DELETE 均幂等（读/覆盖写/按键删除终态一致）不受影响，Incr 为 Get+Put 两步覆盖写亦幂等；网关 wrap 的 X-Request-ID 仅链路追踪透传无去重；score=15）
 
 ## util
 

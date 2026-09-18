@@ -9,7 +9,8 @@ import (
 )
 
 // deleteCtx 是 Del 的纯回源逻辑（含重试），向网关发 DELETE /kv/{key}。
-// 重试语义与 putCtx/appendCtx 一致：网络错误与 503/504 瞬态可重试；
+// Del 幂等（重复删除终态一致），可安全重试：网络错误与 503/504 瞬态均自动重试
+// （非幂等的 appendCtx 是例外，fail-closed，见其注释）；
 // 其它非 200 视为业务错误并携带响应体（便于排障）。
 func (c *Client) deleteCtx(ctx context.Context, key string) error {
 	var lastErr error

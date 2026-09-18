@@ -663,6 +663,11 @@ func (c *Client) putCtx(ctx context.Context, key, value string) error {
 }
 
 // Append 把 value 追加到 key 的当前值之后。网关返回非 200 时返回错误（含响应体）。
+//
+// 重试安全边界（fail-closed）：Append 非幂等——网关对每个请求分配新 seq、无请求级
+// 去重，故仅 503（ErrWrongLeader，确定未应用）自动重试；网络错误与 504（ErrTimeout，
+// op 可能已应用）立即返回错误不重试，避免同一值被追加两次。需要至少一次语义的
+// 调用方应在确认安全后自行重试。
 func (c *Client) Append(key, value string) error {
 	return c.appendCtx(context.Background(), key, value)
 }
@@ -683,13 +688,16 @@ func (c *Client) appendCtx(ctx context.Context, key, value string) error {
 		}
 		resp, err := c.http.Do(req)
 		if err != nil {
+			// Append 是非幂等 POST：网络错误意味着「请求可能已被服务端处理但响应丢失」，
+			// 自动重试会把同一值追加两次（静默数据损坏）。与可安全重试的 GET/PUT/DELETE
+			// 不同，这里 fail-closed：立即返回错误，是否补偿由调用方显式决定。
 			lastErr = err
-			if attempt < c.maxRetries {
-				time.Sleep(c.backoffFor(attempt + 1))
-			}
-			continue
+			break
 		}
-		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
+		// 仅 503（ErrWrongLeader）可重试：网关在 propose 前明确拒绝，确定未应用。
+		// 504（ErrTimeout）不重试：shardkv 等待器超时返回时 op 仍可能已被提交应用
+		// （applier 不受等待器影响），重试同样会重复追加。
+		if resp.StatusCode == http.StatusServiceUnavailable {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("retryable status %d for POST /kv/%s/append", resp.StatusCode, key)
 			if attempt < c.maxRetries {
