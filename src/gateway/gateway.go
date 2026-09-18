@@ -785,11 +785,77 @@ func computeETag(body []byte) string {
 	return `"` + fmt.Sprintf("%x", sum) + `"`
 }
 
-// etagMatches 判断该请求维度的已存 ETag 是否与客户端携带值一致。
+// etagCandidate 是按 RFC 7232 grammar 解析出的单个实体标签：
+// star=true 为 "*" 通配；否则 opaque 为引号内不透明串，weak 标记 W/ 弱前缀
+//（弱比较下 weak 与否不影响等价性，仅保留解析信息备查）。
+type etagCandidate struct {
+	star   bool
+	weak   bool
+	opaque string
+}
+
+// parseETagList 解析 If-None-Match 头值（逗号分隔实体标签列表，RFC 7232 §2.3/§3.2）。
+// 元素形态：* / "opaque" / W/"opaque"；容忍元素两侧空白与空元素，非法片段（未闭合
+// 引号等）忽略不参与匹配。opaque-tag 本身不含引号，按首尾引号剥壳安全。
+func parseETagList(v string) []etagCandidate {
+	var out []etagCandidate
+	for _, part := range strings.Split(v, ",") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		if p == "*" {
+			out = append(out, etagCandidate{star: true})
+			continue
+		}
+		weak := false
+		if strings.HasPrefix(p, "W/") {
+			weak = true
+			p = p[2:]
+		}
+		if len(p) < 2 || p[0] != '"' || p[len(p)-1] != '"' {
+			continue
+		}
+		out = append(out, etagCandidate{weak: weak, opaque: p[1 : len(p)-1]})
+	}
+	return out
+}
+
+// etagTagOpaque 把已存 ETag 归一化为弱比较口径的 opaque 串（去 W/ 前缀与两侧引号）。
+// 网关自产 ETag 恒为强标签（computeETag 双引号包裹），此处防御性兼容弱形态。
+func etagTagOpaque(tag string) string {
+	tag = strings.TrimSpace(tag)
+	tag = strings.TrimPrefix(tag, "W/")
+	tag = strings.TrimSpace(tag)
+	if len(tag) >= 2 && tag[0] == '"' && tag[len(tag)-1] == '"' {
+		tag = tag[1 : len(tag)-1]
+	}
+	return tag
+}
+
+// etagMatches 按 RFC 7232 判断该请求维度的条件请求（If-None-Match）是否命中：
+//   - "*"：该 cacheKey 已有已存 ETag（即存在已知当前表示）即命中；
+//   - 标签列表：弱比较（opaque 串一致即等价，忽略 W/ 前缀，§2.3.2 规定 If-None-Match
+//     一律弱比较）任一命中即 true。
+//
+// 该维度无已存 ETag（从未回源成功/已被写失效清除）一律不命中——保守回退全量 200，
+// 误判方向只会多传数据不会错发 304，与 I209 既有保守口径一致。
+// If-Match（强比较 + 写前 412 预检）不实现：网关条件请求面仅 If-None-Match，
+// 且无服务端 CAS 支撑的 If-Match 预检存在 check-then-write 竞态，不安全。
 func (s *Server) etagMatches(key, inm string) bool {
 	s.etagMu.Lock()
-	defer s.etagMu.Unlock()
-	return s.etagStore[key] == inm
+	stored, ok := s.etagStore[key]
+	s.etagMu.Unlock()
+	if !ok {
+		return false
+	}
+	storedOpaque := etagTagOpaque(stored)
+	for _, c := range parseETagList(inm) {
+		if c.star || c.opaque == storedOpaque {
+			return true
+		}
+	}
+	return false
 }
 
 // etagSet 记录该请求维度的 ETag。
@@ -1039,8 +1105,8 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		// I209：缓存命中路径同样服务条件 GET——此前命中即全量回放 200，生产 SetCache+SetETag
 		// 双开时 If-None-Match 永远得不到 304，条件 GET 退化为整包传输（浪费带宽）。
 		// 仅对缓存中的 200 正缓存比对（负缓存 5xx 无 ETag）；比对复用 etagMatches，与下方
-		// miss 路径同一语义（强 ETag 精确匹配，W/ 弱变体与 * 通配不匹配——误判只会回退
-		// 全量 200，保守安全）；键同为 cacheKey，plain/gzip 双编码变体各自独立匹配。
+		// miss 路径同一语义（I211：RFC 7232 弱比较 + * 通配；无已存 ETag 一律不命中，
+		// 保守回退全量 200）；键同为 cacheKey，plain/gzip 双编码变体各自独立匹配。
 		// 304 短路不落缓存/不落 ETag，与 I208 写失效代数护栏天然无交互。
 		ck := s.cacheKey(r)
 		if s.cacheOn && s.isDataGET(r) {

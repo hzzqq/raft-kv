@@ -230,6 +230,189 @@ func TestETagConditionalGetOnCacheHitGzip(t *testing.T) {
 	}
 }
 
+// TestETagIfNoneMatchStarWildcard 证明 I211：If-None-Match: * 按 RFC 7232 §3.2 语义
+// 匹配"存在任意当前表示"，而非字面量字符串比对。修复前网关对 * 做强比较精确匹配，
+// * 永不等于已存强 ETag——携带 * 的条件 GET 全部退化为全量 200。
+// 保守边界：该维度无已存 ETag（从未回源/已被写失效清除）时 * 不命中，回退 200
+// （多传数据不会错发 304，与 I209 既有保守口径一致）。
+//
+// 复现路径（修复前必失败）：
+//  1. 首次 GET 落 ETag 后，带 If-None-Match: * 的 GET：修复前 200 全量回源（应 304）
+//  2. invalidateKeyCache 清除已存 ETag 后，带 * 的 GET：200（无当前表示可证，保守不命中）
+func TestETagIfNoneMatchStarWildcard(t *testing.T) {
+	s := newCacheServer()
+	s.SetETag(true)
+	var calls atomic.Int32
+	stub := func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		io.WriteString(w, `{"hello":"world"}`)
+	}
+	ts := httptest.NewServer(s.Wrap(stub))
+	defer ts.Close()
+
+	// 0. 未回源过的 key：无已存 ETag 可证当前表示存在 → * 不命中，保守 200 回源
+	req0, _ := http.NewRequest("GET", ts.URL+"/kv/star", nil)
+	req0.Header.Set("If-None-Match", "*")
+	resp0, err := http.DefaultClient.Do(req0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp0.Body.Close()
+	if resp0.StatusCode != 200 {
+		t.Fatalf("star on unknown key = %d, want 200 (conservative)", resp0.StatusCode)
+	}
+	if c := calls.Load(); c != 1 {
+		t.Fatalf("star on unknown key should hit backend once, got %d", c)
+	}
+
+	// 1. 首次普通 GET：落 ETag
+	req1, _ := http.NewRequest("GET", ts.URL+"/kv/star", nil)
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp1.Body.Close()
+	if resp1.StatusCode != 200 || resp1.Header.Get("ETag") == "" {
+		t.Fatalf("first GET = %d etag=%q, want 200 with ETag", resp1.StatusCode, resp1.Header.Get("ETag"))
+	}
+
+	// 2. If-None-Match: *：命中当前表示 → 304 不回源（修复前：* 与强 ETag 字面不等，200 回源）
+	req2, _ := http.NewRequest("GET", ts.URL+"/kv/star", nil)
+	req2.Header.Set("If-None-Match", "*")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNotModified {
+		t.Fatalf("If-None-Match: * = %d, want 304 (I211：* 应按存在性语义匹配)", resp2.StatusCode)
+	}
+	if c := calls.Load(); c != 2 {
+		t.Fatalf("star hit must short-circuit (calls=2), got %d", c)
+	}
+
+	// 3. 写失效清除已存 ETag 后：无当前表示可证 → * 不命中，回源 200
+	s.invalidateKeyCache("/kv/star")
+	req3, _ := http.NewRequest("GET", ts.URL+"/kv/star", nil)
+	req3.Header.Set("If-None-Match", "*")
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != 200 {
+		t.Fatalf("star after invalidation = %d, want 200 (no known representation)", resp3.StatusCode)
+	}
+}
+
+// TestETagIfNoneMatchWeakComparison 证明 I211：RFC 7232 §2.3.2 要求 If-None-Match
+// 一律用弱比较（opaque 串一致即等价，忽略 W/ 弱前缀）。修复前网关对整个头值做强
+// 比较精确匹配，W/"<opaque>" 永不命中强 ETag——客户端/中间层以弱标签形态回传的
+// 条件 GET 全部退化为全量 200；多标签列表（"a", W/"b"）同样整串比对永不命中。
+//
+// 复现路径（修复前必失败）：
+//  1. INM: W/"<已存强 ETag 的 opaque>" → 修复前 200（应 304）
+//  2. INM: "other", W/"<opaque>" 列表任一命中 → 修复前 200（应 304）
+//  3. INM: W/"nope" → 200（不命中，正确行为对照）
+//  4. INM: "unterminated 非法片段 → 200（忽略不 panic，不误命中）
+func TestETagIfNoneMatchWeakComparison(t *testing.T) {
+	s := newCacheServer()
+	s.SetETag(true)
+	stub := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		io.WriteString(w, `{"hello":"world"}`)
+	}
+	ts := httptest.NewServer(s.Wrap(stub))
+	defer ts.Close()
+
+	req1, _ := http.NewRequest("GET", ts.URL+"/kv/w", nil)
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp1.Body.Close()
+	etag := resp1.Header.Get("ETag")
+	if etag == "" || etag[0] != '"' {
+		t.Fatalf("first GET should carry strong ETag, got %q", etag)
+	}
+	opaque := etag[1 : len(etag)-1]
+
+	cases := []struct {
+		name string
+		inm  string
+		want int
+	}{
+		{"weak tag of stored strong etag", `W/` + etag, http.StatusNotModified},
+		{"list any-match", `"other", W/"` + opaque + `"`, http.StatusNotModified},
+		{"weak mismatch", `W/"nope"`, 200},
+		{"malformed fragment ignored", `"unterminated`, 200},
+		{"strong mismatch", `"deadbeef"`, 200},
+	}
+	for _, tc := range cases {
+		req, _ := http.NewRequest("GET", ts.URL+"/kv/w", nil)
+		req.Header.Set("If-None-Match", tc.inm)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("INM %q = %d, want %d (I211 弱比较)", tc.inm, resp.StatusCode, tc.want)
+		}
+	}
+}
+
+// TestETagStarAndWeakOnCacheHit 证明 I211 在缓存命中短路路径（I209）同样成立：
+// * 与 W/ 标签在命中路径也得 304，而非退化为全量回放 200——两处条件请求比对
+// 共用 etagMatches，语义必须同口径。
+func TestETagStarAndWeakOnCacheHit(t *testing.T) {
+	s := newCacheServer() // compress/security headers 关：缓存键固定为 "GET /kv/k plain"
+	s.SetCache(time.Hour, 8)
+	s.SetETag(true)
+
+	h := s.Wrap(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		io.WriteString(w, "v1")
+	})
+	do := func(inm string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/kv/k", nil)
+		if inm != "" {
+			req.Header.Set("If-None-Match", inm)
+		}
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		return rec
+	}
+
+	// 首次 GET（miss 回源）：200 + 强 ETag，值落缓存
+	r1 := do("")
+	if r1.Code != http.StatusOK {
+		t.Fatalf("first GET = %d, want 200", r1.Code)
+	}
+	etag := r1.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("first GET should carry ETag")
+	}
+
+	// 命中缓存 + If-None-Match: *：304（修复前：* 精确匹配失败 → 200 整包回放）
+	if r2 := do("*"); r2.Code != http.StatusNotModified {
+		t.Fatalf("star on cache hit = %d, want 304 (I211)", r2.Code)
+	}
+
+	// 命中缓存 + W/ 弱标签：304（修复前：同上退化为 200 回放）
+	if r3 := do(`W/` + etag); r3.Code != http.StatusNotModified {
+		t.Fatalf("weak tag on cache hit = %d, want 304 (I211)", r3.Code)
+	}
+
+	// 不匹配的弱标签：仍 200 回放
+	if r4 := do(`W/"wrong"`); r4.Code != http.StatusOK || r4.Body.String() != "v1" {
+		t.Fatalf("weak mismatch on cache hit = %d body=%q, want 200 v1", r4.Code, r4.Body.String())
+	}
+}
+
 // TestCacheHitReplayCarriesETag 证明 cycle 209：缓存命中回放的 200 必须带 ETag 头，
 // 与回源路径观测口径一致。修复前 cacheSet（克隆响应头）先于 w.Header().Set("ETag")
 // 执行，缓存快照头不含 ETag，replayCache 原样回放——生产 SetCache+SetETag 双开时
