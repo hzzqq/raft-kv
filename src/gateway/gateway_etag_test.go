@@ -229,3 +229,61 @@ func TestETagConditionalGetOnCacheHitGzip(t *testing.T) {
 		t.Fatalf("conditional GET on uncached plain variant = %d, want 200 (per-variant ETag isolation)", r3.Code)
 	}
 }
+
+// TestCacheHitReplayCarriesETag 证明 cycle 209：缓存命中回放的 200 必须带 ETag 头，
+// 与回源路径观测口径一致。修复前 cacheSet（克隆响应头）先于 w.Header().Set("ETag")
+// 执行，缓存快照头不含 ETag，replayCache 原样回放——生产 SetCache+SetETag 双开时
+// 客户端自第二次 GET 起拿到的 200 全部没有 ETag，无从发起条件 GET，I209 的 304
+// 短路在真实流量中永远等不到 If-None-Match（条件 GET 链路静默退化）。
+// 既有覆盖缺口：TestETagConditionalGetOnCacheHit 断言 ETag 的两次响应（第 1/5 步）
+// 与 scope 测试里「cached GET 带 ETag」实为 miss 路径（PUT 失效后/首次 GET），
+// 纯命中回放的 200 从未被断言过带 ETag。
+//
+// 复现路径（修复前必失败）：
+//  1. GET /kv/k -> 200 + ETag（回源落缓存，快照头缺 ETag）
+//  2. 普通 GET -> 缓存命中回放 200：必须带同一 ETag（修复前静默丢失）
+//  3. 用回放得到的 ETag 发条件 GET -> 304（端到端闭环，依赖第 2 步补齐）
+func TestCacheHitReplayCarriesETag(t *testing.T) {
+	s := newCacheServer() // compress/security headers 关：缓存键固定为 "GET /kv/k plain"
+	s.SetCache(time.Hour, 8)
+	s.SetETag(true)
+
+	h := s.Wrap(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		io.WriteString(w, "v1")
+	})
+	do := func(inm string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/kv/k", nil)
+		if inm != "" {
+			req.Header.Set("If-None-Match", inm)
+		}
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		return rec
+	}
+
+	// 1. 首次 GET（miss 回源）：200 + ETag
+	r1 := do("")
+	if r1.Code != http.StatusOK || r1.Body.String() != "v1" {
+		t.Fatalf("first GET = %d body=%q, want 200 v1", r1.Code, r1.Body.String())
+	}
+	etag := r1.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("first GET should carry ETag")
+	}
+
+	// 2. 纯缓存命中回放：200 必须带同一 ETag（修复前：快照头缺 ETag，静默丢失）
+	r2 := do("")
+	if r2.Code != http.StatusOK || r2.Body.String() != "v1" {
+		t.Fatalf("cache-hit GET = %d body=%q, want 200 v1", r2.Code, r2.Body.String())
+	}
+	if got := r2.Header().Get("ETag"); got != etag {
+		t.Fatalf("cache-hit replay ETag = %q, want %q (回放路径 ETag 观测口径必须与回源一致)", got, etag)
+	}
+
+	// 3. 端到端闭环：客户端用回放得到的 ETag 发条件 GET 应 304 不回放
+	r3 := do(r2.Header().Get("ETag"))
+	if r3.Code != http.StatusNotModified {
+		t.Fatalf("conditional GET with replayed ETag = %d, want 304", r3.Code)
+	}
+}

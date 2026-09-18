@@ -1124,6 +1124,15 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 				storeBody = gb.Bytes()
 			}
 			fresh := s.invalGen.Load() == gen0
+			// I210：先计算并回写 ETag 头，再 cacheSet 克隆响应头——确保缓存快照含 ETag，
+			// 使 replayCache 回放的 200 与回源路径观测口径一致（客户端能凭回放得的 ETag
+			// 发起条件 GET）。此前 cacheSet 先于 Set("ETag")，快照头缺 ETag，命中回放静默丢头，
+			// I209 的 304 短路在真实流量中永远等不到 If-None-Match（条件 GET 链路静默退化）。
+			var etag string
+			if s.etagOn && st == http.StatusOK && fresh {
+				etag = computeETag(body)
+				w.Header().Set("ETag", etag)
+			}
 			if s.cacheOn && fresh {
 				if st == http.StatusOK {
 					s.cacheSet(ck, &cacheVal{Status: st, Header: w.Header().Clone(), Body: storeBody})
@@ -1131,10 +1140,8 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 					s.cacheSetNeg(ck, &cacheVal{Status: st, Header: w.Header().Clone(), Body: storeBody})
 				}
 			}
-			if s.etagOn && st == http.StatusOK && fresh {
-				etag := computeETag(body)
+			if etag != "" {
 				s.etagSet(ck, etag)
-				w.Header().Set("ETag", etag)
 			}
 			w.WriteHeader(st)
 			w.Write(body)

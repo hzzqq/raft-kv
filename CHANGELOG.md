@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–208，共 160 轮交付；时间跨度 2026-07-19 ~ 2026-09-17。
+> 覆盖 cycle 39–209，共 161 轮交付；时间跨度 2026-07-19 ~ 2026-09-18。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -27,6 +27,7 @@
 - **[205] `gateway-membership-invalid-guard`** — 网关成员变更端点（/join /leave /move）派发前语义校验护栏：语义无效请求快速 400，不再派发给底层 Clerk（隐性：shardmaster.Clerk.Join/Leave/Move 对任何非 OK 回复（含 ErrInvalid，即服务端 validateJoin/validateLeave/validateMove 的确定性拒绝：重复 Join gid / Leave 不存在或重复 gid / Move 目标组不在配置）都会无限重试永不返回；网关三端点同步调用它们，语义无效请求会让 HTTP handler 永久挂起——客户端虽在 requestTimeout(30s) 后收到 TimeoutHandler 503，但 handler goroutine 与 wrap 已 TryAcquire 的并发信号量槽位永不释放，反复请求可耗尽并发预算（全网关 429 DoS）；score=20）
 - **[207] `gateway-cache-write-race`** — 网关响应缓存写失效代数护栏（I208）：GET 回源期间发生过写失效则放弃落缓存/落 ETag，堵住 I193 的并发缺口（隐性：I193 的写后失效只拦得住「写后开始的回源」：慢 GET（后端重试/迁移抖动拉长回源）若「写前开始、写后完成」，其 cacheSet/etagSet 在 invalidateKeyCache 的删除之后才执行，会把写前旧值重新写回缓存——后续 GET 在整个 TTL 内命中陈旧值（read-your-writes 被隐蔽破坏），陈旧 ETag 复活还会使条件 GET 误得 304；既有 I193 回归测试为顺序场景（写→读→写→读），覆盖不到该并发窗口；score=18）
 - **[208] `gateway-cache-etag-304`** — 网关缓存命中路径服务条件 GET（I209）：SetCache+SetETag 双开时，缓存命中后比对 If-None-Match 与已存 ETag，匹配回 304 不回放（隐性：wrap 中缓存命中检查先于 If-None-Match 检查且命中即 return：生产 main.go SetCache+SetETag 双开时，缓存条目一旦落盘，条件 GET 一律 200 全量回放而非 304——I69 的条件 GET 短路只服务缓存 miss 路径，缓存命中反而吞掉 304，带宽节省恰好在最需要的热路径（缓存命中=重复读取）上失效；既有 TestETagConditionalGet 用 newCacheServer（不开缓存）全程 miss 路径，覆盖不到该缺口（cycle 207 测试注释已显式预告此根因）；score=15）
+- **[209] `gateway-cache-replay-etag`** — 网关缓存命中回放的 200 补齐 ETag 头（I210）：ETag 与响应体冻结进同一份缓存快照，回放路径与回源路径 ETag 观测口径一致（隐性：cacheSet 克隆响应头先于 w.Header().Set("ETag") 执行：缓存快照头不含 ETag，replayCache 原样回放——生产 main.go SetCache+SetETag 双开时，客户端自第二次 GET 起的 200 全部没有 ETag，无从发起条件 GET，I209 的 304 短路在真实流量中永远等不到 If-None-Match（条件 GET 恰在缓存最热路径上静默退化）；既有覆盖缺口：TestETagConditionalGetOnCacheHit 断言 ETag 的两次响应与 scope 测试的「cached GET 带 ETag」实为 miss 路径（首取/PUT 失效后首次 GET），纯命中回放从未被断言过带 ETag；score=15）
 
 ## kvcli
 
