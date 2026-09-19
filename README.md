@@ -52,7 +52,8 @@ raft-kv/
 > 上层组件（cluster / gateway / kvcli / demo / metrics）的运行与压测方式见
 > [`docs/usage.md`](docs/usage.md)；系统整体架构地图见
 > [`docs/architecture.md`](docs/architecture.md)；测试覆盖率快照见
-> [`docs/coverage.md`](docs/coverage.md)；ShardKV 数据面深层设计笔记见
+> [`docs/coverage.md`](docs/coverage.md)；性能基准、基线与对比方法见
+> [`docs/benchmarks.md`](docs/benchmarks.md)；ShardKV 数据面深层设计笔记见
 > [`docs/lab4-shardkv-design.md`](docs/lab4-shardkv-design.md)；线上排障与可观测性手册见
 > [`docs/runbook.md`](docs/runbook.md)；端到端演示（进程内集群 + 全栈 HTTP）说明见
 > [`docs/demo.md`](docs/demo.md)。新贡献者零基础 5 分钟上手见

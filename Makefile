@@ -121,9 +121,11 @@ fmt:
 smoke:
 	./scripts/smoke.sh
 
-# 基准 + 回归门禁：跑全包热点路径基准（metrics/util/transport/raft 共 9 个），
-# 产出 bench.out 并经 scripts/check_bench_regression.py 与 scripts/bench-baseline.json
-# 比对，回退超 10% 即失败（守护 #116 建立的性能基线不被静默拉回）。
+# 基准 + 回归门禁：跑全包基准（metrics/util/transport/raft/shardkv 微基准 +
+# gateway 数据面/端到端集群，三层对照结构见 docs/benchmarks.md），产出 bench.out
+# 并经 scripts/check_bench_regression.py 与 scripts/bench-baseline.json 比对。
+# 基线 JSON 刻意保持空（report-only：绝对 ns/op 绑定采集机器，硬阈值跨机器必 flaky），
+# 性能对比走 docs/benchmarks.md §4 的同机前后对照方法，判断依据见该文 §5。
 # bench.out 已被 .gitignore 的 *.out 忽略。
 bench:
 	$(GO) test -run='^$$' -bench=. -benchtime=1x ./src/... > bench.out 2>&1 || true
