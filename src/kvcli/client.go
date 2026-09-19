@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -343,6 +344,23 @@ func respErr(method, key string, resp *http.Response) error {
 	return fmt.Errorf("%s /kv/%s: status %d: %s", method, key, resp.StatusCode, msg)
 }
 
+// statusError 是携带 HTTP 状态码的错误类型：让 Cas/SetNX 等基于"读取→比较→写入"
+// 的调用方能区分 404（key 确实不存在）与网络/服务端故障，避免把读故障误判为
+// "不存在"而错误写入。Error() 透传底层 respErr 文本，错误消息格式不变。
+type statusError struct {
+	code int
+	err  error
+}
+
+func (e *statusError) Error() string { return e.err.Error() }
+func (e *statusError) Unwrap() error { return e.err }
+
+// IsNotFound 判断 err 是否为网关对 GET 返回 404（key 不存在）。
+func IsNotFound(err error) bool {
+	var se *statusError
+	return errors.As(err, &se) && se.code == http.StatusNotFound
+}
+
 // Get 读取 key 的当前值。网关返回非 200 时返回错误（含响应体），而非静默返回空串。
 func (c *Client) Get(key string) (string, error) {
 	return c.getCtx(context.Background(), key)
@@ -394,6 +412,11 @@ func (c *Client) fetchGet(ctx context.Context, key string) (string, error) {
 		}
 		if resp.StatusCode != http.StatusOK {
 			err = respErr("GET", key, resp)
+			if resp.StatusCode == http.StatusNotFound {
+				// 404 是"key 确实不存在"的明确答复，包装为类型化错误供
+				// Cas/SetNX 判别；网络/服务端故障保持普通 error，不得混淆。
+				err = &statusError{code: resp.StatusCode, err: err}
+			}
 			resp.Body.Close()
 			c.recordCall(start, err)
 			c.breakerRecord(err)
