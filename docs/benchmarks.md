@@ -93,10 +93,17 @@ HTTP 全栈 vs 内存直写）；读路径（免提交）与写路径相差一�
 
 ### 3.4 基线即发现的优化机会
 
-1. **gzip 压缩税（明确优化方向）**：`GatewayGetCacheMissGzip` 290µs / 1.63MB allocs 每
-   请求——wrap 对每个 gzip 请求新建两个 `gzip.Writer`（响应压缩 + 缓存落存重压缩，
-   见 `gateway.go` wrap 内 `gzip.NewWriter` 两处），无池化复用。`sync.Pool` 复用
-   压缩器是量化收益最直接的第一刀。
+1. **gzip 压缩税（已落地优化，T-149 2026-09-19）**：`GatewayGetCacheMissGzip` 基线
+   290µs / 1.63MB allocs 每请求——wrap 对每个 gzip 请求新建两个 `gzip.Writer`（响应
+   压缩 + 缓存落存重压缩，见 `gateway.go` wrap 内 `gzip.NewWriter` 两处），无池化复用。
+   **T-149 已用 `sync.Pool` 池化落地**（两处共用一池，压缩级别不变；仅 Close 成功后
+   `Reset(io.Discard)` 回池，失败丢弃——脏 writer 复用会产出损坏 gzip 流，复用完整性
+   由 `TestGzipPooledWriterStreamIntegrity` 锁住）。同机同口径 `-count=5` 中位数对比：
+   ns/op 572,942 → 68,225（**-88%**），B/op 1,643,440 → 15,381（-99.1%），allocs/op
+   115 → 76（每请求省去两个压缩器全套分配共 39 次）。说明：本轮 before 各轮 469–739µs
+   波动（背景负载漂移），与 T-148 落档单次 290µs 同为无池化口径，B/op 与 allocs 两轮
+   完全一致（1,643,422/115 vs 1,643,440/115），稳定指标口径下提升幅度无歧义；不触发
+   压缩的 `GatewayGetCacheHitGzip` 13,524 → 12,629 ns/op、allocs 持平 54，无连带退化。
 2. **Clerk 配置查询**：`SKVPutGet` 慢于 `GatewayClusterPut`（同为单客户端 PUT 共识）
    即源于此既有已知低效（见 `src/shardkv/bench_test.go` 注记），优化时以二者差值为准绳。
 3. **kvcli 不单列 RTT 基准（决策）**：HTTP 往返口径已由 ClusterPut/ClusterGet 端到端

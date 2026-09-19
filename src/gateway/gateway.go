@@ -574,6 +574,18 @@ type gzipResponseWriter struct {
 
 func (g *gzipResponseWriter) Write(p []byte) (int, error) { return g.gz.Write(p) }
 
+// gzipWriterPool 池化 gzip.Writer（T-149，2026-09-19）。wrap 对每个 gzip 请求新建两个
+// gzip.Writer（响应压缩 + cache/ETag 落存重压缩），基准测得 290µs/1.63MB allocs 每请求，
+// 池化复用消除这两处每次分配。两处压缩参数相同（默认压缩级别），共用同一池。
+// 复用纪律（sync.Pool 池化 gzip.Writer 的已知陷阱）：
+//   - Get 后必须 Reset(目标 writer) 再用——Reset 换绑底层 writer 并清空压缩状态；
+//   - 仅在 Close() 成功（完整 gzip 流已写出、压缩状态干净）后才 Reset(io.Discard)
+//     回池；Close 失败（底层写错误，如客户端断连 / 流不完整）一律丢弃不回池——
+//     脏 writer 复用会产出损坏的 gzip 流，静默数据损坏远比一次分配昂贵。
+var gzipWriterPool = sync.Pool{
+	New: func() interface{} { return gzip.NewWriter(io.Discard) },
+}
+
 // ---- I68：响应缓存 ----
 
 // cacheVal 是一份可被直接回放的缓存响应（状态码 + 响应头 + 响应体字节）。
@@ -1218,8 +1230,17 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 		if s.compress && acceptsGzip(r.Header.Get("Accept-Encoding")) {
 			w.Header().Set("Content-Encoding", "gzip")
 			w.Header().Add("Vary", "Accept-Encoding")
-			gz := gzip.NewWriter(w)
-			defer gz.Close()
+			// T-149：gzip.Writer 池化。Get 后 Reset 到底层数据面；defer Close——仅
+			// Close 成功才 Reset(io.Discard) 回池，失败丢弃（提前 return / panic 等
+			// 任何退出路径都会走本 defer，Close 语义与池化前 `defer gz.Close()` 等价）。
+			gz := gzipWriterPool.Get().(*gzip.Writer)
+			gz.Reset(w)
+			defer func() {
+				if err := gz.Close(); err == nil {
+					gz.Reset(io.Discard)
+					gzipWriterPool.Put(gz)
+				}
+			}()
 			w = &gzipResponseWriter{ResponseWriter: w, gz: gz}
 		}
 		rec := &statusRecorder{ResponseWriter: w}
@@ -1240,12 +1261,18 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 			body := append([]byte(nil), crec.buf.Bytes()...)
 			ck := s.cacheKey(r)
 			// 若本次响应走 gzip，则缓存体也存压缩后的字节，使回放与 Content-Encoding 一致。
+			// T-149：落存重压缩同样走池（与响应压缩参数相同共用一池）。Write/Close
+			// 错误口径与池化前一致（忽略）；仅 Close 成功回池，失败丢弃。
 			storeBody := body
 			if _, gz := w.(*gzipResponseWriter); gz {
 				var gb bytes.Buffer
-				gzw := gzip.NewWriter(&gb)
+				gzw := gzipWriterPool.Get().(*gzip.Writer)
+				gzw.Reset(&gb)
 				gzw.Write(body)
-				gzw.Close()
+				if err := gzw.Close(); err == nil {
+					gzw.Reset(io.Discard)
+					gzipWriterPool.Put(gzw)
+				}
 				storeBody = gb.Bytes()
 			}
 			fresh := s.invalGen.Load() == gen0
