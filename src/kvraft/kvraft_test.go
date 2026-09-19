@@ -427,3 +427,73 @@ func TestKVReadLease(t *testing.T) {
 		t.Fatalf("read_leases counter = %d, want > 0 (ReadIndex fast-path not exercised on stable cluster)", before)
 	}
 }
+
+// TestKVLeaderChangeStaleRead 复现"杀主重选窗口读到陈旧值"的线性一致读缺陷
+//（与 shardkv Get/GetShard 的 I195 守卫同族，此前 kvraft 快路径漏修）：
+//
+// 旧 leader 已把写 W 复制到多数派并提交、ack 客户端，但 advanceCommit 只在收到
+// 复制回复时本地推进 commitIndex，携带 leaderCommit=W 的心跳要等下一轮 tick
+//（HeartbeatInterval=110ms）才会广播。在 ack 后立即杀旧 leader 即可确定性拦截
+// 这次广播——多数派成员持有 W 的日志条目，但 commitIndex 停在 W 之前。
+//
+// 新 leader 当选瞬间 HasLeaderLease() 即为 true（选举得票即算多数派接触），而
+// 本任期 no-op 尚未提交（CommittedCurrentTerm=false）。若 ReadIndex 快路径不检查
+// HasCommittedCurrentTerm()，就会以落后的 commitIndex 为一致性点直接读本地状态机：
+// W 尚未 apply，已 ack 的写被漏掉，Get 返回陈旧空值——线性一致性被破坏。
+// 修复后：本任期未提交条目前一律回退 propose 路径，Get op 自身作为本任期条目被
+// 提交时顺带"拉动"W 提交（Raft 提交规则），读到正确值。
+func TestKVLeaderChangeStaleRead(t *testing.T) {
+	ck := makeKVConfig(t, 3)
+	defer ck.cleanup()
+
+	ck.clerks[0].Put("gk0", "v0")
+	oldLeader := ck.leader()
+	if oldLeader < 0 {
+		t.Fatal("no leader elected")
+	}
+	// 等待超过一轮心跳，确保 v0 的 leaderCommit 已广播到所有副本（对照组稳定）。
+	time.Sleep(150 * time.Millisecond)
+
+	// 写 W2 并等待 ack：W2 已提交（多数派复制 + 旧 leader apply 后 notify）。
+	ck.clerks[0].Put("gk2", "v2")
+
+	// ack 后立即杀旧 leader：携带 leaderCommit=W2 的下一轮心跳（≤110ms）被打断，
+	// 将当选的新 leader（多数派成员）持有 W2 日志但 commitIndex 落后于 W2。
+	ck.kill(oldLeader)
+
+	// 轮询发现"新 leader 已当选且本任期 no-op 尚未提交"的窗口。no-op 提交需要
+	// 当选后的首个心跳 tick（≤110ms），发现循环毫秒级命中，窗口内裕量充足。
+	newLeader := -1
+	for iters := 0; iters < 3000 && newLeader < 0; iters++ {
+		for i := 0; i < ck.n; i++ {
+			if i == oldLeader {
+				continue
+			}
+			st := ck.kvs[i].rf.Status()
+			if st.Role == raft.Leader && !st.CommittedCurrentTerm {
+				newLeader = i
+				break
+			}
+		}
+		if newLeader < 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if newLeader < 0 {
+		t.Fatal("new leader not elected within committed-current-term window")
+	}
+	st := ck.kvs[newLeader].rf.Status()
+	t.Logf("window hit: nl=%d Role=%v CommittedCurrentTerm=%v HasLeaderLease=%v CommitIndex=%d LastApplied=%d",
+		newLeader, st.Role, st.CommittedCurrentTerm, st.HasLeaderLease, st.CommitIndex, st.LastApplied)
+
+	// 窗口内直连新 leader 读 gk2（绕过 Clerk，避免轮询落到其他副本）：
+	// 缺陷版走 ReadIndex 快路径以落后 commitIndex 为一致性点，漏掉已 ack 的 W2，
+	// 返回 ""；修复版回退 propose，Get op 提交顺带拉动 W2，返回 "v2"。
+	reply := &GetReply{}
+	ck.kvs[newLeader].Get(&GetArgs{Key: "gk2", ClientId: 987654321, Seq: 1}, reply)
+	t.Logf("reply: value=%q wrongLeader=%v err=%q", reply.Value, reply.WrongLeader, reply.Err)
+	if reply.Value != "v2" {
+		t.Fatalf("stale read after leader change: Get(gk2)=%q (WrongLeader=%v), want \"v2\" (linearizability violated)",
+			reply.Value, reply.WrongLeader)
+	}
+}

@@ -348,7 +348,19 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// 状态机。租约保证该 leader 期间无更新任期产生、commitIndex 不会被回滚，故等待
 	// 本服务器 apply 到 commitIndex 后本地读是线性一致的。租约失效（分区/刚上任）
 	// 时一律回退 propose 路径，绝不牺牲正确性。mirror shardkv 的同类优化。
-	if kv.rf.HasLeaderLease() {
+	//
+	// 关键正确性守卫（I195 同族：换主窗口陈旧读，mirror shardkv Get/GetShard 判据）：
+	// 快路径必须额外要求 HasCommittedCurrentTerm()。新当选 leader 在"重新提交本任期
+	// no-op"提交之前，committedCurrentTerm 恒为 false，此时其 commitIndex 仍落后于旧
+	// leader 已提交位置——旧 leader 已复制到多数派并 ack 客户端的写，其 leaderCommit
+	// 广播若被杀主打断，多数派的 commitIndex 便停在 该写之前，该写既未被 commitIndex
+	// 覆盖也未 apply。而 followers 的 lastContact 残留旧主近期心跳（选举快路径完成
+	// 时距最后心跳 < ElectionTimeoutMin），新 leader 上任瞬间 HasLeaderLease() 即为
+	// true，若仅凭租约走快路径，会以偏低的 commitIndex 为一致性点读到陈旧状态机、
+	// 返回空值（TestKVLeaderChangeStaleRead 场景）。必须等本任期 no-op 提交（committed
+	// CurrentTerm 转 true，commitIndex 随之"拉动"覆盖所有先前已提交写）后，快路径读
+	// 到的才是线性一致快照；否则一律回退 propose。
+	if kv.rf.HasLeaderLease() && kv.rf.HasCommittedCurrentTerm() {
 		if commitIdx, isLeader := kv.rf.ReadIndex(); isLeader {
 			if kv.waitAppliedIndex(commitIdx) {
 				kv.mu.Lock()

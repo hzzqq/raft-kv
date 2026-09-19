@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–216，共 168 轮交付；时间跨度 2026-07-19 ~ 2026-09-18。
+> 覆盖 cycle 39–217，共 169 轮交付；时间跨度 2026-07-19 ~ 2026-09-19。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -91,6 +91,7 @@
 
 - **[58] `kvraft_snapshot_fix`** — installSnapshot 持锁 + 拒绝陈旧快照 + nil map 归一（隐性：applier 对 appliedIndex 无锁写(竞态) + 陈旧快照会回滚状态机破坏线性一致；score=18）
 - **[89] `kvraft_status_finalize`** — KVStatus GCTTL/GCInterval 派生 + 注册表登记断言单测(防 Help 静默 no-op)（隐性：KVStatus.Role 类型错配(raft.Role 赋 string)致全量构建失败,该部分长期以'未验证'滞留工作树；score=19）
+- **[217] `kvraft-read-committed-term-guard`** — kvraft.Get 的 ReadIndex 快路径必须额外要求 HasCommittedCurrentTerm（与 shardkv Get/GetShard 的 I195 守卫同判据）：新 leader 本任期 no-op 提交前一律回退 propose 路径，修复换主窗口内已 ack 写对客户端丢失的陈旧读缺陷（隐性：kvraft.Get 快路径仅判 HasLeaderLease。hasLeaderLeaseLocked 按 lastContact 朴素多数判定「多数派近期接触」，而 lastContact[旧leaderId] 残留旧主被杀前 ≤110ms（HeartbeatInterval）的心跳记录、租约时长 ElectionTimeoutMin=260ms——旧主被杀后选举快速完成时（选票往返毫秒级，距最后心跳可 <260ms）新 leader 上任瞬间 HasLeaderLease() 即为 true；但其作为 follower 时的 commitIndex 停在旧主最后广播位置（携带 leaderCommit=W 的心跳被杀主打断），旧主已复制多数派并 ack 客户端的写 W 既未被 commitIndex 覆盖也未 apply。快路径 ReadIndex 返回偏低 commitIndex、waitAppliedIndex 立即满足后直读本地状态机，Get 返回空值——线性一致性被破坏。shardkv 同族位置（Get/GetShard）已在 I195 修复为 HasLeaderLease && HasCommittedCurrentTerm 双守卫，kvraft 快路径漏修。cycle 216 勘测注记「窗口命中时租约必为 false（lastContact 与 advanceCommit 同临界区同步更新）」只覆盖了心跳回复驱动的接触建立路径，遗漏了被杀旧主残留接触路径，本轮以探针实证推翻；score=15）
 
 ## transport
 
