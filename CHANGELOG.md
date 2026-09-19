@@ -1,7 +1,7 @@
 # CHANGELOG（自驱开发迭代交付记录）
 
 > 由 `scripts/gen_changelog.py` 从 `.workbuddy/self-driving/state.json` 自动生成。
-> 覆盖 cycle 39–218，共 170 轮交付；时间跨度 2026-07-19 ~ 2026-09-19。
+> 覆盖 cycle 39–219，共 171 轮交付；时间跨度 2026-07-19 ~ 2026-09-19。
 
 按模块聚合；每条含 `task_id`、新增需求（`new_requirement`）、隐性问题（`implicit`）、自评分（`score`）。隐性问题为本轮主动挖掘的非显性缺陷/技术债。
 
@@ -47,6 +47,7 @@
 - **[215] `kvcli-del-body-close`** — kvcli Del 的任意 HTTP 出径（成功 200 与业务错误非 200）都必须关闭响应体，使连接可归还连接池复用（资源泄漏族缺陷修复）（隐性：deleteCtx 仅在 503/504 重试路径 resp.Body.Close()：成功路径 return nil 前、业务错误路径 return respErr(...) 前均不 Close——未关闭响应体的连接无法归还 http.Transport 连接池，每调用一次 Del/MDel 泄漏一个连接，fd 累积只能等 GC finalizer 兜底，长跑进程（批量 MDel / 周期清理任务）可耗尽 fd；与包内 fetchGet/putCtx/appendCtx/Ping/Healthy/Ready「每条出径必 Close」纪律不一致；score=15）
 - **[216] `kvcli-append-retry-idempotent`** — kvcli 非幂等 Append 的自动重试必须区分「确定未应用」与「结果模糊」两类失败：仅前者可重试，后者 fail-closed 立即返回错误（重复追加族静默数据损坏缺陷修复）（隐性：appendCtx 对网络错误与 503/504 一律自动重试，但 POST /kv/{key}/append 非幂等——网关对每个 HTTP 请求分配新 shardkv seq、无请求级去重：①网络错误=请求可能已被服务端处理只是响应丢失；②504（ErrTimeout）=shardkv 等待器超时返回时 op 仍可能已被提交应用（tryOp select 超时即返回，applier 不受影响照常执行入日志）。两类模糊失败后重试都会把同一值追加两次，静默数据损坏。GET/PUT/DELETE 均幂等（读/覆盖写/按键删除终态一致）不受影响，Incr 为 Get+Put 两步覆盖写亦幂等；网关 wrap 的 X-Request-ID 仅链路追踪透传无去重；score=15）
 - **[218] `kvcli-cas-setnx-notfound-guard`** — kvcli Cas/SetNX 的读取阶段遇非 404 错误（网络故障/熔断 fast-fail/5xx 重试耗尽）必须 fail-closed 向上返回，仅网关明确答复 404 才视作「key 不存在」参与比较（静默失败缺陷修复）（隐性：client_cas.go 与 client_setnx.go 把 Get 的任何错误一律当作「key 不存在」（Cas: cur=""；SetNX: 仅 err==nil 且 cur 非空才放弃），而 fetchGet 非 200 一律返回 respErr 的无类型 fmt.Errorf，调用方无法判别 404 与读故障：①Cas(expect 非空) 读故障被伪装成「期望不匹配」静默返回 (false,nil)，调用方无从感知后端不可用；②Cas(expect 空串)/SetNX 读故障被当成「不存在」而执行写入——读故障瞬态而 Put 重试成功时假 CAS 成功覆盖真实值、SetNX（分布式锁初始化语义）被重复抢占破坏互斥。两文件注释均声称「非 404 的读取错误会直接向上返回」「保留真实网络错误」，实现从未兑现（文档-实现背离型静默失败）；score=15）
+- **[219] `kvcli-incr-read-failclosed`** — kvcli Incr 的读取阶段遇非 404 错误（网络故障/熔断 fast-fail/5xx 重试耗尽）必须 fail-closed 向上返回，仅网关明确答复 404（key 确实不存在）才从 0 起自增（静默失败缺陷修复，218 轮 Cas/SetNX 同族收尾）（隐性：client_incr.go 以 `err == nil && cur != ""` 判定当前值：Get 返回任何错误（网络故障/熔断/5xx 重试耗尽）都静默落回 n=0 再 n++ 写回 1——读路径故障而 Put 正常（读重试耗尽/读路径 5xx、写已恢复）时，已有计数被重置为 1 且返回 (1,nil) 假成功，计数器静默清零审计无感；218 轮勘测注记「Incr/MGet 均构建于 Get/Put 幂等原语之上无同族风险」系误判，本轮以代码证据推翻：Incr 恰在 Get 错误分支绕过了 218 轮为幂等原语补上的错误语义；score=15）
 
 ## util
 
