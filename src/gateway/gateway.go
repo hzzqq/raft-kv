@@ -731,22 +731,6 @@ func (s *Server) cacheGet(key string) *cacheVal {
 	return e.val
 }
 
-// cacheSet 写入成功响应（TTL=cacheTTL），容量满时 FIFO 淘汰最旧。
-func (s *Server) cacheSet(key string, v *cacheVal) {
-	s.cacheMu.Lock()
-	defer s.cacheMu.Unlock()
-	s.cacheStore[key] = &cacheEntry{val: v, exp: time.Now().Add(s.cacheTTL)}
-	s.pushOrder(key)
-}
-
-// cacheSetNeg 写入负缓存（TTL=cacheNegTTL），容量满时同样 FIFO 淘汰。
-func (s *Server) cacheSetNeg(key string, v *cacheVal) {
-	s.cacheMu.Lock()
-	defer s.cacheMu.Unlock()
-	s.cacheStore[key] = &cacheEntry{val: v, exp: time.Now().Add(s.cacheNegTTL)}
-	s.pushOrder(key)
-}
-
 // pushOrder 维护 FIFO 顺序，超出容量则淘汰最旧条目。
 func (s *Server) pushOrder(key string) {
 	s.cacheOrder = append(s.cacheOrder, key)
@@ -767,6 +751,62 @@ func (s *Server) evictOrder(key string) {
 	}
 }
 
+// storeFresh 承接 wrap 数据 GET 回源后的落存序列：写失效代数复检（I208）→ ETag
+// 计算与设头（I210/I213）→ 正/负缓存落存 → etagStore 写回。
+// fresh（回源以来无任何写失效）才落存；放弃时三项全部不执行、响应头不带 ETag。
+//
+// I221：复检与全部落存动作必须同处一个 cacheMu 临界区。此前复检（fresh := Load）
+// 与 cacheSet/etagSet 是三个独立步骤，invalidateKeyCache 恰好插在复检之后、落存
+// 之前时（其 invalGen 递增原本还在锁外末尾，删除与递增本身也非原子），写前旧值
+// 与陈旧 ETag 复活进 cacheStore/etagStore——TTL 内后续 GET 返回旧值、条件 GET 凭
+// 复活 ETag 误得 304（read-your-writes 静默破坏，I193/I208 同族缺口）。临界区化后：
+//   - invalidate 先拿锁：删除 + invalGen 递增（已挪入其 cacheMu 段）先于复检可见
+//     → 复检失败，全放弃；
+//   - storeFresh 先拿锁：旧值短暂落存，invalidate 随后拿锁删除 + 递增 → 等价于
+//     「失效发生在落存完成之后」的正常语义，窗口内无第三方读者（cacheGet 同持 cacheMu）。
+//
+// 锁序：cacheMu → etagMu（etagStore 写回内嵌获取）；invalidateKeyCache 两段分离
+// 不嵌套，无反向获取，无死锁。cacheSet/cacheSetNeg 的写入逻辑已内联（sync.Mutex
+// 不可重入），语义不变：200 正缓存 TTL=cacheTTL，5xx 负缓存 TTL=cacheNegTTL，
+// FIFO 淘汰（pushOrder）。
+// I210：先计算并回写 ETag 头，再克隆响应头——确保缓存快照含 ETag，使 replayCache
+// 回放的 200 与回源路径观测口径一致（客户端能凭回放得的 ETag 发起条件 GET）。此前
+// cacheSet 先于 Set("ETag")，快照头缺 ETag，命中回放静默丢头，I209 的 304 短路在
+// 真实流量中永远等不到 If-None-Match（条件 GET 链路静默退化）。
+// I213：ETag 必须对实际传输表示计算（RFC 9110 §8.8.1——强 ETag 标识特定表示，
+// 含内容编码）。此前恒用压缩前明文 body：gzip 变体发出的响应体是压缩字节，ETag
+// 却是明文哈希——同一资源 gzip 与 plain 两个表示拿到相同 ETag，且压缩参数一旦变化
+// （压缩字节变、明文不变），条件 GET 凭旧 ETag 错误命中 304，客户端继续复用已失效
+// 的压缩表示。body 恰为实际传输形式（gzip 变体=压缩字节，plain=明文），恒用它计算
+// 即可，plain 变体行为不变。
+func (s *Server) storeFresh(w http.ResponseWriter, ck string, gen0 uint64, st int, body []byte) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if s.invalGen.Load() != gen0 {
+		return
+	}
+	var etag string
+	if s.etagOn && st == http.StatusOK {
+		etag = computeETag(body)
+		w.Header().Set("ETag", etag)
+	}
+	if s.cacheOn {
+		cv := &cacheVal{Status: st, Header: w.Header().Clone(), Body: body}
+		if st == http.StatusOK {
+			s.cacheStore[ck] = &cacheEntry{val: cv, exp: time.Now().Add(s.cacheTTL)}
+			s.pushOrder(ck)
+		} else if st >= 500 {
+			s.cacheStore[ck] = &cacheEntry{val: cv, exp: time.Now().Add(s.cacheNegTTL)}
+			s.pushOrder(ck)
+		}
+	}
+	if etag != "" {
+		s.etagMu.Lock()
+		s.etagStore[ck] = etag
+		s.etagMu.Unlock()
+	}
+}
+
 // invalidateKeyCache 在写操作（PUT/Append）成功后清除该 key 的 GET 响应缓存与 ETag，
 // 保证"写后读"立即看到新值（read-your-writes），避免开启响应缓存时返回陈旧值（违反线性一致）。
 // 同时清理该路径的正缓存与 5xx 负缓存（二者共用同一 cacheKey），以及 plain/gzip 两种编码变体；
@@ -774,23 +814,33 @@ func (s *Server) evictOrder(key string) {
 // 对 nil map 执行 delete 安全无副作用——故本方法在缓存关闭时零成本、零副作用。
 // 修复 I193：此前 handlePut/handleAppend 不失效缓存，开启缓存（SetCache 标注"生产可用"）后
 // 网关会向客户端返回写入前的旧值，直到 TTL 过期，是一个隐蔽的线性一致破坏点。
-// 修复 I208：末尾递增全局写失效代数，使「本写之前开始回源、之后才完成」的在途 GET
+// 修复 I208：递增全局写失效代数，使「本写之前开始回源、之后才完成」的在途 GET
 // 落缓存前检测到代数变化而放弃写入——否则其 cacheSet/etagSet 会把写前旧值/陈旧 ETag
 // 重新写回缓存（删除发生在 GET 完成之前，拦不住它），陈旧值在 TTL 内复活。
+// 修复 I221：invalGen 递增挪入 cacheMu 临界区，与 storeFresh 的「复检+落存」（同持
+// cacheMu）串行化——否则「删除与递增之间」或「复检与落存之间」的交错仍会让写前
+// 旧值/陈旧 ETag 复活（I208 只拦「复检时已见失效」的 GET，复检通过后的插缝拦不住）。
+// 递增与缓存删除同临界区后，两者对落存方表现为一个不可分割的失效事件：落存方要么
+// 在其之前完整落存（随后被本函数删除），要么复检到新代数全放弃，无第三种结局。
 func (s *Server) invalidateKeyCache(path string) {
+	s.cacheMu.Lock()
 	for _, enc := range []string{"plain", "gzip"} {
 		k := "GET " + path + " " + enc
-		s.cacheMu.Lock()
 		if _, ok := s.cacheStore[k]; ok {
 			delete(s.cacheStore, k)
 			s.evictOrder(k)
 		}
-		s.cacheMu.Unlock()
+	}
+	s.invalGen.Add(1)
+	s.cacheMu.Unlock()
+	// ETag 删除与 storeFresh 的 etagStore 写回无交错风险：写回在 cacheMu 临界区内
+	// （嵌套 etagMu），必然先于本函数释放 cacheMu（否则复检已失败、不写回）。
+	for _, enc := range []string{"plain", "gzip"} {
+		k := "GET " + path + " " + enc
 		s.etagMu.Lock()
 		delete(s.etagStore, k)
 		s.etagMu.Unlock()
 	}
-	s.invalGen.Add(1)
 }
 
 // replayCache 把缓存响应原样回放给客户端（X-Request-ID 沿用本次请求，不被旧值覆盖），
@@ -851,7 +901,7 @@ func computeETag(body []byte) string {
 
 // etagCandidate 是按 RFC 7232 grammar 解析出的单个实体标签：
 // star=true 为 "*" 通配；否则 opaque 为引号内不透明串，weak 标记 W/ 弱前缀
-//（弱比较下 weak 与否不影响等价性，仅保留解析信息备查）。
+// （弱比较下 weak 与否不影响等价性，仅保留解析信息备查）。
 type etagCandidate struct {
 	star   bool
 	weak   bool
@@ -1275,32 +1325,9 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) func(http.Resp
 				}
 				storeBody = gb.Bytes()
 			}
-			fresh := s.invalGen.Load() == gen0
-			// I210：先计算并回写 ETag 头，再 cacheSet 克隆响应头——确保缓存快照含 ETag，
-			// 使 replayCache 回放的 200 与回源路径观测口径一致（客户端能凭回放得的 ETag
-			// 发起条件 GET）。此前 cacheSet 先于 Set("ETag")，快照头缺 ETag，命中回放静默丢头，
-			// I209 的 304 短路在真实流量中永远等不到 If-None-Match（条件 GET 链路静默退化）。
-			// I213：ETag 必须对实际传输表示计算（RFC 9110 §8.8.1——强 ETag 标识特定表示，
-			// 含内容编码）。此前恒用压缩前明文 body：gzip 变体发出的响应体是压缩字节，
-			// ETag 却是明文哈希——同一资源 gzip 与 plain 两个表示拿到相同 ETag，且压缩
-			// 参数一旦变化（压缩字节变、明文不变），条件 GET 凭旧 ETag 错误命中 304，
-			// 客户端继续复用已失效的压缩表示。storeBody 恰为实际传输形式（gzip 变体=
-			// 压缩字节，plain=明文），恒用它计算即可，plain 变体行为不变。
-			var etag string
-			if s.etagOn && st == http.StatusOK && fresh {
-				etag = computeETag(storeBody)
-				w.Header().Set("ETag", etag)
-			}
-			if s.cacheOn && fresh {
-				if st == http.StatusOK {
-					s.cacheSet(ck, &cacheVal{Status: st, Header: w.Header().Clone(), Body: storeBody})
-				} else if st >= 500 {
-					s.cacheSetNeg(ck, &cacheVal{Status: st, Header: w.Header().Clone(), Body: storeBody})
-				}
-			}
-			if etag != "" {
-				s.etagSet(ck, etag)
-			}
+			// I210：ETag 先于快照克隆、I213：对实际传输表示（storeBody）计算——语义
+			// 注释随实现移入 storeFresh（本调用点传参即实际传输形式）。
+			s.storeFresh(w, ck, gen0, st, storeBody)
 			w.WriteHeader(st)
 			w.Write(body)
 		} else {

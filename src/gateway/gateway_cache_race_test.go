@@ -118,3 +118,130 @@ func TestGatewayCacheNoStaleAcrossConcurrentWrite(t *testing.T) {
 		t.Fatalf("后续 GET 应命中缓存不再回源（calls 应为 2），got %d", c)
 	}
 }
+
+// TestStoreFreshAtomicAgainstInvalidate 证明 I221：数据 GET 的落存动作
+// （ETag 设头/落存、正/负缓存落存、etagStore 写回）与写失效 invalidateKeyCache
+// 必须对写失效代数（invalGen）原子——复检与落存之间不得给 invalidate 留插缝窗口。
+//
+// 复现路径（修复前必失败；I208 测试拦不住本场景）：
+//  1. GET 回源完成，wrap 记 gen0 后做唯一一次 fresh 复检（此刻 PUT 尚未发生 → 通过）
+//  2. PUT /kv/k = v2 成功 → invalidateKeyCache：删缓存 + 删 ETag + invalGen++（拦不住步骤 3）
+//  3. GET 的 cacheSet/etagSet 随后无条件执行 —— 写前旧值 v1 与陈旧 ETag 复活进
+//     cacheStore/etagStore：TTL 内后续 GET 返回旧值；条件 GET 凭复活 ETag 误得 304，
+//     客户端继续持有写前旧表示（read-your-writes 静默破坏，I193/I208 同族缺口）。
+//
+// 确定性白盒探针：storeFresh 的复检（invalGen.Load）与落存之间恰有一次 w.Header()
+// 调用（ETag 头 Set），探针 writer 在该调用点同步触发 invalidateKeyCache——
+// 修复前（无锁）invalidate 即刻完成、cacheSet/etagSet 照常执行 → 复活必现；
+// 修复后（落存段整体持 cacheMu）invalidate 阻塞在锁上，探针超时回退防死锁，
+// invalidate 改在落存段释放锁后完成删除+递增 → 复活值被清 → 绿。两条路径均由
+// 同步/锁序保证，不依赖调度运气。
+func TestStoreFreshAtomicAgainstInvalidate(t *testing.T) {
+	s := NewServer(nil)
+	s.SetCache(time.Hour, 16) // 长 TTL：确保若复活，测试窗口内必然可观测
+	s.SetETag(true)
+	ck := "GET /kv/k plain"
+
+	gen0 := s.invalGen.Load() // 模拟 wrap 回源前的代数记录（此刻该 gen 注定复检通过）
+	done := make(chan struct{})
+	var injectOnce sync.Once
+	pw := &probeHeaderWriter{ResponseWriter: httptest.NewRecorder()}
+	pw.onFirstHeader = func() {
+		injectOnce.Do(func() {
+			// 竞态注入：invalidateKeyCache 恰好插在「复检之后、落存之前」。
+			go func() {
+				s.invalidateKeyCache("/kv/k")
+				close(done)
+			}()
+			// 修复前：无锁竞争，invalidate 即刻完成（等价于「删除+递增」先于落存）；
+			// 修复后：invalidate 阻塞在落存段的 cacheMu 上，超时回退让落存先行完成，
+			// invalidate 随后拿锁清场（与「失效发生在落存完成之后」的正常语义等价）。
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+			}
+		})
+	}
+
+	s.storeFresh(pw, ck, gen0, http.StatusOK, []byte("v1"))
+	<-done // 修复后路径：等 invalidate 清场完成再断言最终态
+
+	if _, ok := s.cacheStore[ck]; ok {
+		t.Fatal("写失效后落存仍把写前旧值复活进缓存（I221：复检与落存必须对 gen 原子）")
+	}
+	if got := s.etagGet(ck); got != "" {
+		t.Fatalf("陈旧 ETag %s 复活进 etagStore（I221：后续条件 GET 将凭它误得 304）", got)
+	}
+}
+
+// probeHeaderWriter 首次 Header() 调用时触发一次注入回调（一次性），用于在
+// storeFresh 的复检与落存之间的确定性位置插入写失效。
+type probeHeaderWriter struct {
+	http.ResponseWriter
+	onFirstHeader func()
+	once          sync.Once
+}
+
+func (p *probeHeaderWriter) Header() http.Header {
+	p.once.Do(func() {
+		if p.onFirstHeader != nil {
+			p.onFirstHeader()
+		}
+	})
+	return p.ResponseWriter.Header()
+}
+
+// TestStoreFreshNormalPathStillStores 回归护栏：I221 修复不得把正常路径改坏——
+// gen 未变（无并发写）时 storeFresh 行为与原 wrap 内联序列逐项一致：
+// 200 正缓存落存（TTL/快照头含 ETag，I210）、ETag 设头与 etagStore 写回（I213 表示口径
+// 由调用方保证传入实际传输形式 body）、5xx 负缓存落存、非 fresh 全放弃。
+func TestStoreFreshNormalPathStillStores(t *testing.T) {
+	s := NewServer(nil)
+	s.SetCache(time.Hour, 16)
+	s.SetETag(true)
+	ck := "GET /kv/k plain"
+
+	// 1. gen 未变 + 200：正缓存 + ETag 双落
+	gen0 := s.invalGen.Load()
+	rec := httptest.NewRecorder()
+	s.storeFresh(rec, ck, gen0, http.StatusOK, []byte("v1"))
+	cv := s.cacheGet(ck)
+	if cv == nil || string(cv.Body) != "v1" {
+		t.Fatalf("正常落存应写入正缓存，got %+v", cv)
+	}
+	etag := s.etagGet(ck)
+	if etag == "" {
+		t.Fatal("正常落存应写回 etagStore")
+	}
+	if rec.Header().Get("ETag") != etag {
+		t.Fatalf("ETag 头应与落存值一致，头=%q store=%q", rec.Header().Get("ETag"), etag)
+	}
+	if cv.Header.Get("ETag") != etag {
+		t.Fatal("缓存快照头缺 ETag（I210 回归：快照必须含 ETag）")
+	}
+
+	// 2. 5xx：负缓存落存、无 ETag
+	s2ck := "GET /kv/e plain"
+	genE := s.invalGen.Load()
+	recE := httptest.NewRecorder()
+	s.storeFresh(recE, s2ck, genE, http.StatusBadGateway, []byte("boom"))
+	cvE := s.cacheGet(s2ck)
+	if cvE == nil || cvE.Status != http.StatusBadGateway {
+		t.Fatalf("5xx 应落负缓存，got %+v", cvE)
+	}
+	if s.etagGet(s2ck) != "" || recE.Header().Get("ETag") != "" {
+		t.Fatal("5xx 不得落 ETag（负缓存无验证器，I209 语义）")
+	}
+
+	// 3. gen 已变（回源期间发生写失效）：全放弃（I208 既有语义不变）
+	genOld := s.invalGen.Load()
+	s.invalGen.Add(1)
+	rec3 := httptest.NewRecorder()
+	s.storeFresh(rec3, "GET /kv/z plain", genOld, http.StatusOK, []byte("stale"))
+	if cv := s.cacheGet("GET /kv/z plain"); cv != nil {
+		t.Fatalf("非 fresh 落存应被放弃，got %+v", cv)
+	}
+	if s.etagGet("GET /kv/z plain") != "" || rec3.Header().Get("ETag") != "" {
+		t.Fatal("非 fresh 时 ETag 不得落存/设头（I208 语义）")
+	}
+}
